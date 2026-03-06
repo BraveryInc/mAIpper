@@ -1,2 +1,2 @@
 # mAIpper
-parse nmap into obsidian and analyze with ollama.
+Takes input from tools, analyze with ollama and create note cards / canvas in obsidian.
