@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+
+"""
+mAIpper - Pentest Tool Analysis & Obsidian Export Tool
+
+Features:
+- Parses Nmap XML output
+- Generates structured host and scan notes
+- Optionally performs AI-assisted analysis via Ollama
+- Builds/updates an Obsidian Canvas visualization
+
+Designed for offensive security workflow documentation.
+
+Author: Zachary Levine
+"""
+
+
 from __future__ import annotations
 
 import argparse
