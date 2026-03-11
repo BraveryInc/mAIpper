@@ -14,21 +14,18 @@ Designed for offensive security workflow documentation.
 Author: Zachary Levine
 """
 
-
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import json
-import os
+import logging
 import re
 import uuid
 from pathlib import Path
 import xml.etree.ElementTree as ET
-import logging
 
 import requests
-from dotenv import load_dotenv
 
 
 # ============================================================
@@ -60,6 +57,106 @@ def is_probable_fqdn(value: str) -> bool:
 
 def ensure_md_suffix(name: str) -> str:
     return name if name.lower().endswith(".md") else f"{name}.md"
+
+
+def get_port_hints(
+    port: int,
+    service_name: str,
+    product: str = "",
+    extrainfo: str = "",
+) -> list[str]:
+    svc = (service_name or "").lower()
+    prod = (product or "").lower()
+    extra = (extrainfo or "").lower()
+
+    hints: list[str] = []
+
+    if port in (80, 81, 443, 8000, 8080, 8443) or svc in ("http", "https", "http-proxy"):
+        hints.append("Web service detected; consider whatweb, nikto, gobuster/feroxbuster/ffuf, curl, and manual browsing.")
+        hints.append("Check for default credentials, admin panels, exposed APIs, virtual hosts, and interesting headers.")
+
+    if port == 445 or svc in ("microsoft-ds", "smb", "netbios-ssn"):
+        hints.append("SMB detected; consider netexec smb, smbclient, smbmap, and enum4linux-ng.")
+        hints.append("Check share access, null sessions, SMB signing, local admin reuse, and domain membership clues.")
+
+    if port in (88, 464) or "kerberos" in svc or "kerberos" in prod:
+        hints.append("Kerberos-related service detected; consider kerbrute, netexec, GetUserSPNs, and AS-REP roast checks.")
+        hints.append("Look for domain naming clues, valid usernames, SPNs, and clock skew issues.")
+
+    if port in (389, 636, 3268, 3269) or svc in ("ldap", "ldaps", "globalcatldap", "globalcatldapssl"):
+        hints.append("LDAP detected; consider ldapsearch, netexec ldap, and directory enumeration.")
+        hints.append("Look for anonymous bind, naming contexts, domain structure, users, groups, and password policy info.")
+
+    if port == 135 or svc == "msrpc":
+        hints.append("MSRPC detected; consider rpcclient, netexec, and enumerate Windows service exposure and domain clues.")
+
+    if port == 139 or svc == "netbios-ssn":
+        hints.append("NetBIOS detected; enumerate shares, names, and Windows host information.")
+
+    if port in (5985, 5986) or "winrm" in svc:
+        hints.append("WinRM detected; consider netexec winrm and evil-winrm if credentials are obtained.")
+
+    if port in (1433, 1434) or "mssql" in svc or "sql server" in prod:
+        hints.append("MSSQL detected; consider impacket-mssqlclient, netexec mssql, and SQL login enumeration.")
+
+    if port == 3306 or "mysql" in svc:
+        hints.append("MySQL detected; test authentication paths and enumerate version-specific exposure carefully.")
+
+    if port == 5432 or "postgres" in svc:
+        hints.append("PostgreSQL detected; test for weak/default credentials and accessible databases.")
+
+    if port == 27017 or "mongodb" in svc:
+        hints.append("MongoDB detected; verify whether authentication is required and whether remote access is overly exposed.")
+
+    if port == 22 or svc == "ssh":
+        hints.append("SSH detected; consider ssh-audit, banner review, key-based auth checks, and cautious credential testing.")
+
+    if port == 21 or svc == "ftp":
+        hints.append("FTP detected; check for anonymous access, writable locations, and plaintext credential exposure.")
+
+    if port in (25, 465, 587) or svc in ("smtp", "smtps", "submission"):
+        hints.append("SMTP detected; consider smtp-user-enum or swaks and look for open relay or user enumeration behavior.")
+
+    if port == 53 or svc == "domain":
+        hints.append("DNS detected; consider dig, nslookup, dnsrecon, and zone transfer testing where appropriate.")
+
+    if port == 69 or svc == "tftp":
+        hints.append("TFTP detected; check for unauthenticated file retrieval or upload opportunities.")
+
+    if port == 111 or svc == "rpcbind":
+        hints.append("RPCbind detected; consider rpcinfo and follow-on enumeration for NFS and related services.")
+
+    if port == 2049 or svc == "nfs":
+        hints.append("NFS detected; use showmount and test for accessible exports and weak export permissions.")
+
+    if port in (161, 162) or svc == "snmp":
+        hints.append("SNMP detected; try snmpwalk/onesixtyone and test common community strings carefully.")
+
+    if port == 3389 or svc == "ms-wbt-server":
+        hints.append("RDP detected; consider netexec rdp, xfreerdp, and review NLA / domain clues.")
+
+    if port in (5900, 5901, 5902) or svc == "vnc":
+        hints.append("VNC detected; verify authentication requirements and assess screenshot or password attack viability.")
+
+    if port == 6379 or "redis" in svc:
+        hints.append("Redis detected; verify bind/auth configuration and whether dangerous commands are exposed remotely.")
+
+    if port == 11211 or "memcached" in svc:
+        hints.append("Memcached detected; check whether it is exposed beyond localhost and assess information disclosure risk.")
+
+    if port in (9200, 9300) or "elasticsearch" in svc:
+        hints.append("Elasticsearch detected; check for unauthenticated cluster or index access.")
+
+    if port in (2375, 2376) or "docker" in svc:
+        hints.append("Docker API exposure may be high risk; verify remote daemon access and authentication/TLS posture.")
+
+    if port == 6443 or "kubernetes" in svc:
+        hints.append("Kubernetes-related service detected; look for exposed API endpoints and auth configuration issues.")
+
+    if "ssl" in extra or "tls" in extra:
+        hints.append("TLS-related context detected; review certificate details, protocol support, and any weak crypto indicators.")
+
+    return hints
 
 
 # ============================================================
@@ -193,6 +290,8 @@ def render_service_string(port_info: dict) -> str:
         parts.append(svc["version"])
     if svc.get("extrainfo"):
         parts.append(f"({svc['extrainfo']})")
+    if svc.get("tunnel"):
+        parts.append(f"[tunnel: {svc['tunnel']}]")
     return " ".join([p for p in parts if p]).strip() or "—"
 
 
@@ -209,16 +308,136 @@ def summarize_open_ports(host: dict, max_ports: int = 8) -> list[str]:
 
 def build_ollama_prompt(scan_data: dict) -> str:
     hosts = scan_data.get("hosts", [])
+
+    instructions = """
+You are an experienced penetration tester analyzing Nmap scan results.
+
+Your job is to produce practical, concise, operator-focused analysis.
+
+Priorities:
+- Identify notable exposed services and likely attack surface
+- Suggest useful follow-up enumeration tools for discovered services
+- Suggest practical next-step commands or techniques where appropriate
+- Highlight likely misconfigurations, risky exposures, or common weaknesses
+- Infer likely technology stacks when reasonable, but clearly separate facts from assumptions
+- Prefer real-world offensive security workflow recommendations over generic security advice
+
+When suggesting tools, favor practical enumeration tools such as:
+- SMB: netexec, smbclient, smbmap, enum4linux-ng
+- LDAP: ldapsearch, netexec, bloodyAD
+- Kerberos: kerbrute, impacket tools, netexec
+- MSSQL: impacket-mssqlclient, netexec
+- WinRM: evil-winrm, netexec
+- RDP: netexec, xfreerdp
+- SSH: ssh-audit, hydra
+- Web: whatweb, nikto, gobuster, feroxbuster, ffuf, curl
+- SNMP: snmpwalk, onesixtyone
+- DNS: dig, nslookup, dnsrecon
+- NFS: showmount, mount
+- SMTP: swaks, smtp-user-enum
+- FTP: ftp, Nmap NSE scripts
+- RPC: rpcclient, netexec
+- VNC: vncsnapshot, hydra
+
+Be specific when the evidence supports it.
+Do not invent vulnerabilities that are not supported by the scan.
+If service detection is weak or uncertain, say so.
+""".strip()
+
     lines = [
         f"Nmap args: {scan_data.get('nmap_args', '')}",
-        f"Hosts count: {len(hosts)}"
+        f"Nmap version: {scan_data.get('nmap_version', '')}",
+        f"Hosts count: {len(hosts)}",
+        "",
+        "Host details:",
     ]
-    for h in hosts:
-        name = choose_host_display_name(h)
-        ports = ", ".join(f"{p['protocol']}/{p['port']}" for p in h["open_ports"]) or "none"
-        lines.append(f"- {name} ({h['state']}): open={ports}")
 
-    prompt = "Analyze the following Nmap summary:\n\n" + "\n".join(lines)
+    for host in hosts:
+        name = choose_host_display_name(host)
+        state = host.get("state", "unknown")
+        ip = get_primary_ipv4(host) or "unknown"
+
+        lines.append(f"- Host: {name}")
+        lines.append(f"  State: {state}")
+        lines.append(f"  IP: {ip}")
+
+        open_ports = host.get("open_ports", [])
+        if not open_ports:
+            lines.append("  Open ports: none")
+            lines.append("")
+            continue
+
+        lines.append("  Open ports:")
+
+        for p in open_ports:
+            proto = p.get("protocol", "")
+            port = p.get("port", "")
+            svc = p.get("service", {})
+            svc_name = svc.get("name", "") or "unknown"
+            product = svc.get("product", "")
+            version = svc.get("version", "")
+            extrainfo = svc.get("extrainfo", "")
+            tunnel = svc.get("tunnel", "")
+
+            service_parts = [svc_name]
+            if product:
+                service_parts.append(product)
+            if version:
+                service_parts.append(version)
+            if extrainfo:
+                service_parts.append(f"({extrainfo})")
+            if tunnel:
+                service_parts.append(f"[tunnel: {tunnel}]")
+
+            service_str = " ".join(service_parts).strip()
+            lines.append(f"    - {proto}/{port}: {service_str}")
+
+            scripts = p.get("scripts", [])
+            for script in scripts[:3]:
+                sid = script.get("id", "").strip()
+                out = (script.get("output", "") or "").strip()
+                if out:
+                    out = " ".join(out.split())
+                    if len(out) > 220:
+                        out = out[:217] + "..."
+                    lines.append(f"      script:{sid} -> {out}")
+
+            hints = get_port_hints(port, svc_name, product, extrainfo)
+            for hint in hints:
+                lines.append(f"      hint: {hint}")
+
+        lines.append("")
+
+    scan_summary = "\n".join(lines)
+
+    output_format = """
+Return your response in markdown using exactly these sections:
+
+## Key Observations
+- Brief bullets of the most important findings
+
+## Enumeration Suggestions
+- Group suggestions by service or host
+- Include relevant tools and useful follow-up ideas
+
+## Potential Attack Paths
+- Mention realistic next steps or attack paths suggested by the scan
+- Distinguish confirmed findings from assumptions
+
+## Notable Risks or Misconfigurations
+- Mention anything unusually exposed or high value
+""".strip()
+
+    prompt = f"""
+{instructions}
+
+Nmap Scan Summary
+=================
+{scan_summary}
+
+{output_format}
+""".strip()
+
     logging.debug(f"Built Ollama prompt ({len(prompt)} chars)")
     return prompt
 
@@ -406,12 +625,10 @@ def make_canvas(
 # ============================================================
 
 def main():
-    load_dotenv()
-
     ap = argparse.ArgumentParser()
-    ap.add_argument("--xml", default=os.getenv("XML_PATH"))
-    ap.add_argument("--scans-dir", default=os.getenv("SCANS_DIR"))
-    ap.add_argument("--vault", default=os.getenv("VAULT_PATH", "Vault"))
+    ap.add_argument("--xml", default=None, help="Process a single Nmap XML file")
+    ap.add_argument("--scans-dir", default="scans", help="Base scans directory (default: ./scans)")
+    ap.add_argument("--vault", default="Obsidian", help="Obsidian vault directory (default: ./Obsidian)")
     ap.add_argument("--tool-name", default="Nmap")
     ap.add_argument("--model", default="qwen2.5:14b-instruct-q5_K_M")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
@@ -431,17 +648,16 @@ def main():
         "-v",
         "--verbose",
         action="count",
-        default=0,
-        help="Increase verbosity (-v, -vv for more detail)"
+        default=1,
+        help="Increase verbosity (-v=debug, default=info)"
     )
 
     args = ap.parse_args()
 
-    if args.verbose == 0:
-        level = logging.WARNING
-    elif args.verbose == 1:
+    level = logging.WARNING
+    if args.verbose >= 1:
         level = logging.INFO
-    else:
+    if args.verbose >= 2:
         level = logging.DEBUG
 
     logging.basicConfig(
@@ -454,24 +670,25 @@ def main():
     vault_dir = Path(args.vault).resolve()
     logging.debug(f"Resolved vault dir: {vault_dir}")
 
-    xml_files = []
+    xml_files: list[Path] = []
 
-    if args.scans_dir:
-        base = Path(args.scans_dir)
+    if args.xml:
+        xml_path = Path(args.xml).resolve()
+        logging.debug(f"Using single XML file: {xml_path}")
+
+        if not xml_path.exists():
+            logging.error(f"XML file does not exist: {xml_path}")
+            return
+
+        xml_files = [xml_path]
+    else:
+        base = Path(args.scans_dir).resolve()
         nmap_dir = base / "nmap"
         if not nmap_dir.exists():
             nmap_dir = base / "Nmap"
 
         logging.debug(f"Looking for XML files in: {nmap_dir}")
         xml_files = sorted(nmap_dir.glob("*.xml"))
-
-    elif args.xml:
-        xml_files = [Path(args.xml)]
-        logging.debug(f"Using single XML file: {xml_files[0]}")
-
-    else:
-        logging.error("Provide --scans-dir or --xml")
-        return
 
     if not xml_files:
         logging.warning("No XML files found to process")
