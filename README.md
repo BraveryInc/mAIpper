@@ -264,18 +264,3 @@ mAIpper helps by:
 
 ---
 
-# Future Plans
-
-- Additional tool ingestion  
-- Attack path graphing  
-- Credential discovery correlation  
-- BloodHound integration  
-- multi-tool analysis pipelines  
-- automated host tagging  
-- better canvas relationships  
-
----
-
-# License
-
-MIT
