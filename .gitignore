@@ -1,0 +1,19 @@
+# Scan output — may contain sensitive client data
+scans/
+*.xml
+
+# Generated Obsidian vault — contains host notes, AI analysis, canvas
+Obsidian/
+*.canvas
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
