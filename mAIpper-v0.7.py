@@ -602,21 +602,50 @@ def build_ollama_prompt(scan_data: dict) -> str:
 
     instructions = """
 You are an experienced penetration tester analyzing Nmap scan results.
+This analysis will be used in a professional penetration testing engagement
+under a signed Rules of Engagement. Accuracy matters more than completeness.
 
 Your job is to produce practical, concise, operator-focused analysis.
 
+GROUNDING RULES — follow these strictly:
+- Only reference ports, services, CVEs, and findings that are explicitly present
+  in the data provided. Do not invent or infer CVE IDs, version numbers, or
+  service details not shown.
+- If evidence is insufficient to make a claim, say "insufficient data" rather
+  than guessing.
+- Tag each finding or suggestion as one of:
+    [CONFIRMED]  — directly present in the scan data
+    [INFERRED]   — reasonable conclusion from the scan data
+    [ASSUMED]    — requires verification; explain why
+- Do not suggest an attack path is viable unless the scan data provides
+  supporting evidence for each step.
+
 Priorities:
 - Identify notable exposed services and likely attack surface
-- Suggest useful follow-up enumeration tools for discovered services
-- Suggest practical next-step commands or techniques where appropriate
+- Suggest useful follow-up enumeration tools with a ready-to-run example command
+  for each, substituting the actual target IP or hostname from the scan data
+  (short, focused commands preferred)
 - Highlight likely misconfigurations, risky exposures, or common weaknesses
-- Infer likely technology stacks when reasonable, but clearly separate facts from assumptions
-- Prefer real-world offensive security workflow recommendations over generic security advice
+- Infer likely technology stacks when reasonable, clearly tagging [INFERRED]
+- Prefer real-world offensive security workflow recommendations over generic advice
+
+Active Directory detection:
+- If you observe Kerberos (88), LDAP (389/636/3268), DNS (53), and SMB (445)
+  across one or more hosts, explicitly identify this as an Active Directory
+  environment in the Environment Assessment section and tailor all attack path
+  and enumeration suggestions to AD-specific methodology:
+  AS-REP roasting, Kerberoasting, BloodHound, Pass-the-Hash, Pass-the-Ticket,
+  DCSync, LDAP anonymous bind enumeration, GPO abuse, etc.
+
+Cross-host correlation:
+- Identify patterns across multiple hosts. If a finding applies network-wide
+  (e.g., SMB signing disabled everywhere, same service version on all hosts),
+  report it once as a network-level finding rather than repeating it per host.
 
 When suggesting tools, favor practical enumeration tools such as:
 - SMB: netexec, smbclient, smbmap, enum4linux-ng
 - LDAP: ldapsearch, netexec, bloodyAD
-- Kerberos: kerbrute, impacket tools, netexec
+- Kerberos: kerbrute, impacket tools (GetUserSPNs, GetNPUsers), netexec
 - MSSQL: impacket-mssqlclient, netexec
 - WinRM: evil-winrm, netexec
 - RDP: netexec, xfreerdp
@@ -629,10 +658,6 @@ When suggesting tools, favor practical enumeration tools such as:
 - FTP: ftp, Nmap NSE scripts
 - RPC: rpcclient, netexec
 - VNC: vncsnapshot, hydra
-
-Be specific when the evidence supports it.
-Do not invent vulnerabilities that are not supported by the scan.
-If service detection is weak or uncertain, say so.
 """.strip()
 
     lines = [
@@ -677,21 +702,34 @@ If service detection is weak or uncertain, say so.
         lines.append("")
 
     output_format = """
-Return your response in markdown using exactly these sections:
+Return your response in markdown using exactly these sections in this order:
+
+## Environment Assessment
+- State the inferred environment type (Active Directory domain, standalone Linux
+  hosts, mixed Windows/Linux, web application stack, OT/ICS, etc.)
+- Provide a confidence level: HIGH / MEDIUM / LOW
+- List the specific evidence from the scan data that supports the assessment
+- If AD is detected, state the inferred domain name if visible in hostnames or
+  DNS responses
 
 ## Key Observations
 - Brief bullets of the most important findings
+- Each bullet must include a [CONFIRMED], [INFERRED], or [ASSUMED] tag
 
 ## Enumeration Suggestions
-- Group suggestions by service or host
-- Include relevant tools and useful follow-up ideas
+- Group by service or host
+- For each suggestion, include a ready-to-run example command with the actual
+  target IP or hostname substituted in
+- Tag each with [CONFIRMED], [INFERRED], or [ASSUMED]
 
 ## Potential Attack Paths
-- Mention realistic next steps or attack paths suggested by the scan
-- Distinguish confirmed findings from assumptions
+- Realistic next steps or attack paths with supporting scan evidence for each step
+- Tag each path as [CONFIRMED], [INFERRED], or [ASSUMED]
+- Do not include a path if the scan data does not support it
 
 ## Notable Risks or Misconfigurations
-- Mention anything unusually exposed or high value
+- Network-wide findings first, then per-host
+- Tag each with [CONFIRMED], [INFERRED], or [ASSUMED]
 """.strip()
 
     prompt = f"{instructions}\n\nNmap Scan Summary\n=================\n{chr(10).join(lines)}\n\n{output_format}"
@@ -708,20 +746,44 @@ def build_nessus_ollama_prompt(nessus_data: dict) -> str:
 
     instructions = """
 You are an experienced penetration tester analyzing Nessus vulnerability scan results.
+This analysis will be used in a professional penetration testing engagement
+under a signed Rules of Engagement. Accuracy matters more than completeness.
 
 Your job is to produce practical, concise, operator-focused analysis.
 
+GROUNDING RULES — follow these strictly:
+- Only reference ports, services, CVEs, and findings that are explicitly present
+  in the data provided. Do not invent or infer CVE IDs, version numbers, or
+  service details not shown.
+- If evidence is insufficient to make a claim, say "insufficient data" rather
+  than guessing.
+- Tag each finding or suggestion as one of:
+    [CONFIRMED]  — directly present in the scan data
+    [INFERRED]   — reasonable conclusion from the scan data
+    [ASSUMED]    — requires verification; explain why
+- Do not suggest an attack path is viable unless the scan data provides
+  supporting evidence for each step.
+- Nessus plugin findings can produce false positives, particularly for
+  version-based checks. If a finding relies solely on version detection without
+  plugin output confirming exploitation, note it as
+  [VERIFY — possible false positive].
+
 Priorities:
 - Identify the highest-impact vulnerabilities by CVSS score and exploitability
-- Highlight any publicly known exploits (especially Metasploit modules or PoC code) for CVEs found
-- Group findings by exploitation priority: critical/exploitable first, then high, then medium
-- Suggest which vulnerabilities to chain or combine for privilege escalation or lateral movement
-- Call out any patch gaps or unpatched critical software
-- Note if findings suggest specific misconfigurations (default credentials, unpatched services, etc.)
-
-Be specific when the evidence supports it.
-Do not invent vulnerabilities not present in the data.
-If CVSS scores are missing, use context clues to estimate risk.
+- For each CVE, tag its weaponization status:
+    [MSF]         — known Metasploit module exists
+    [POC]         — public PoC exists but may require adaptation
+    [THEORETICAL] — no known public exploit at time of analysis
+- Flag any findings suggesting credential exposure, default credentials,
+  cleartext protocols, or password policy weaknesses — these often have
+  outsized impact even when CVSS scores are moderate
+- Version-based detection findings (where plugin_output is absent or says only
+  "version X detected") must be flagged [VERIFY — version-based only]
+- Cross-host correlation: if the same critical/high finding appears on multiple
+  hosts, group them and call out the network-wide scope rather than listing each
+  host separately
+- Group findings by exploitation priority: critical/weaponized first, then
+  high, then medium
 """.strip()
 
     lines = [
@@ -756,11 +818,12 @@ If CVSS scores are missing, use context clues to estimate risk.
         lines.append("  Top findings:")
 
         for f in notable[:15]:
-            sev  = severity_int_to_str(f["severity_int"])
-            cvss = f.get("cvss3_base") or f.get("cvss_base") or "N/A"
-            cves = ", ".join(f["cves"]) if f["cves"] else "no CVE"
+            sev      = severity_int_to_str(f["severity_int"])
+            cvss     = f.get("cvss3_base") or f.get("cvss_base") or "N/A"
+            cves     = ", ".join(f["cves"]) if f["cves"] else "no CVE"
+            has_out  = "plugin_output:yes" if f.get("plugin_output") else "plugin_output:none"
             lines.append(
-                f"    [{sev}] {f['plugin_name']} | CVSS:{cvss} | {cves} | port {f['protocol']}/{f['port']}"
+                f"    [{sev}] {f['plugin_name']} | CVSS:{cvss} | {cves} | port {f['protocol']}/{f['port']} | {has_out}"
             )
             if f.get("solution"):
                 sol = f["solution"][:200].replace("\n", " ")
@@ -773,16 +836,22 @@ Return your response in markdown using exactly these sections:
 
 ## Key Observations
 - Most impactful vulnerabilities and what they mean for the engagement
+- Each bullet must include a [CONFIRMED], [INFERRED], or [ASSUMED] tag
+- Group any finding that appears on multiple hosts as a single network-wide bullet
 
 ## Exploitation Priority
 - Rank the top exploitable findings with reasoning
-- Note any known public exploits or Metasploit modules
+- For each CVE include its [MSF], [POC], or [THEORETICAL] tag
+- Mark version-based-only detections with [VERIFY — version-based only]
+- Flag credential/cleartext findings prominently
 
 ## Attack Chains
-- Suggest how findings could be combined for privilege escalation or lateral movement
+- How findings could be combined for privilege escalation or lateral movement
+- Each step must cite specific scan evidence; tag with [CONFIRMED]/[INFERRED]/[ASSUMED]
 
 ## Remediation Focus
-- Highest-priority patches or configuration fixes the defender should address first
+- Highest-priority patches or configuration fixes
+- Network-wide issues first, then per-host
 """.strip()
 
     prompt = f"{instructions}\n\nNessus Scan Summary\n===================\n{chr(10).join(lines)}\n\n{output_format}"
@@ -799,18 +868,37 @@ def build_burp_ollama_prompt(burp_data: dict) -> str:
 
     instructions = """
 You are an experienced web application penetration tester analyzing Burp Suite scanner results.
+This analysis will be used in a professional penetration testing engagement
+under a signed Rules of Engagement. Accuracy matters more than completeness.
 
 Your job is to produce practical, concise, operator-focused analysis.
 
-Priorities:
-- Identify the most exploitable web vulnerabilities (SQLi, XSS, SSRF, IDOR, auth bypass, etc.)
-- Suggest how findings could be chained for greater impact (e.g., stored XSS → session hijack)
-- Assess the web attack surface: authentication, input handling, business logic issues
-- Suggest specific manual testing steps to confirm or escalate scanner-identified findings
-- Highlight any findings that may indicate larger systemic issues (frameworks, libraries, misconfig)
+GROUNDING RULES — follow these strictly:
+- Only reference ports, services, CVEs, and findings that are explicitly present
+  in the data provided. Do not invent or infer CVE IDs, version numbers, or
+  service details not shown.
+- If evidence is insufficient to make a claim, say "insufficient data" rather
+  than guessing.
+- Tag each finding or suggestion as one of:
+    [CONFIRMED]  — directly present in the scan data
+    [INFERRED]   — reasonable conclusion from the scan data
+    [ASSUMED]    — requires verification; explain why
+- Do not suggest an attack path is viable unless the scan data provides
+  supporting evidence for each step.
+- Burp "Tentative" findings have a high false positive rate. Always flag these
+  as [TENTATIVE — VERIFY MANUALLY] and do not build attack chains primarily on
+  tentative findings.
 
-Be specific about what the scanner found vs. what requires manual verification.
-Do not inflate confidence for "Tentative" findings without supporting evidence.
+Priorities:
+- Identify the most exploitable web vulnerabilities (SQLi, XSS, SSRF, IDOR,
+  auth bypass, etc.) and classify each by its OWASP Top 10 2021 category
+  (e.g., A01:Broken Access Control, A03:Injection, A07:Auth Failures, etc.)
+- For each Certain or Firm finding, suggest a specific manual verification step
+  or payload to confirm exploitability beyond the scanner result
+- Suggest how findings could be chained for greater impact
+- Assess the web attack surface: authentication, input handling, business logic
+- Highlight systemic issues (framework versions, CSP absence, insecure headers)
+- Be explicit about what the scanner confirmed vs. what requires manual testing
 """.strip()
 
     lines = [
@@ -855,18 +943,29 @@ Do not inflate confidence for "Tentative" findings without supporting evidence.
 Return your response in markdown using exactly these sections:
 
 ## Key Observations
-- Most significant web vulnerabilities found and their potential impact
+- Most significant web vulnerabilities and their potential impact
+- Each bullet must include its OWASP Top 10 2021 category and a
+  [CONFIRMED], [INFERRED], or [ASSUMED] tag
+- Tentative findings must be tagged [TENTATIVE — VERIFY MANUALLY]
 
 ## Exploitation Priority
 - Which issues to pursue first and why
-- Distinguish confirmed vs. tentative findings
+- For each Certain/Firm finding, include a specific manual verification step
+  or payload (e.g., exact parameter to test, HTTP method, expected response)
+- Do not elevate Tentative findings above Certain/Firm without explanation
 
 ## Attack Chains
 - How findings could be combined for greater impact
-- Realistic exploitation scenarios
+- Each step must cite specific scanner evidence; tag [CONFIRMED]/[INFERRED]/[ASSUMED]
+- Do not build chains primarily on Tentative findings
+
+## False Positive Risk Assessment
+- List findings that are likely false positives, with reasoning
+- Consider: finding type, confidence level (Tentative = higher FP risk), context,
+  and whether the issue_detail provides concrete evidence or just a generic description
 
 ## Remediation Focus
-- Top development fixes that would eliminate the highest-impact issues
+- Top development/configuration fixes to eliminate the highest-impact issues
 """.strip()
 
     prompt = f"{instructions}\n\nBurp Suite Scan Summary\n=======================\n{chr(10).join(lines)}\n\n{output_format}"
@@ -1677,21 +1776,37 @@ def build_priority_targets_prompt(vault_dir: Path, all_analyses: list[tuple[str,
     instructions = """
 You are an experienced penetration tester. Given scan data about multiple hosts,
 rank them from highest to lowest exploitation priority.
+This ranking will be used in a professional penetration testing engagement
+under a signed Rules of Engagement. Accuracy matters more than completeness.
+
+GROUNDING RULES — follow these strictly:
+- Only reference ports, services, CVEs, and findings that are explicitly present
+  in the data provided. Do not invent or infer CVE IDs, version numbers, or
+  service details not shown.
+- Only rank a host as a top target if there is concrete scan evidence supporting
+  exploitability. Do not rank based on port count alone.
+- If evidence is insufficient to justify a high ranking, say so rather than
+  padding the list.
+- Tag each ranked entry as one of:
+    [CONFIRMED]  — directly in the scan data (CVE with plugin output, confirmed vuln)
+    [INFERRED]   — reasonable conclusion from the scan data (service fingerprint, role)
+    [ASSUMED]    — requires verification; explain why
 
 Output ONLY a numbered list — no preamble, no section headers, no trailing text.
 Each entry must be a single line in this exact format:
-  N. <hostname or IP> — <specific reason: CVE IDs, vuln names, service risks>
+  N. <hostname or IP> [TAG] — <primary evidence: CVE ID / finding name / service>; <brief impact>
 
 Base your ranking on:
-- Exploitability of CVEs (known public exploits / Metasploit modules first)
-- CVSS scores (critical ≥ 9.0, high ≥ 7.0)
-- Exposed management interfaces (RDP, WinRM, SSH with weak auth, Telnet)
-- Domain role (domain controllers, CA servers, databases are high-value)
-- Chaining potential (pivot hosts, credential stores, jump boxes)
-- Web findings (authentication bypass, SQLi > stored XSS > IDOR > info leakage)
-- Unencrypted or unauthenticated services (FTP, SNMP, NFS, Redis, MongoDB)
+- CVEs with confirmed plugin output and known weaponized exploits ([MSF] first)
+- CVSS scores (critical ≥ 9.0, high ≥ 7.0) — but only when plugin_output:yes
+- Exposed management interfaces with evidence of weak auth (RDP, WinRM, SSH)
+- Domain role evidence in hostnames, ports, or service banners (DC, CA, DB)
+- Chaining potential supported by scan data (pivot hosts, credential stores)
+- Web findings from Burp (Certain/Firm auth bypass, SQLi — not Tentative)
+- Unencrypted or unauthenticated services confirmed in scan data
 
-If no vulnerability data is available for a host, rank by service exposure alone.
+Do not rank a host highly based solely on port count or service tags without
+supporting vulnerability or misconfiguration evidence.
 Maximum 10 entries.
 """.strip()
 
