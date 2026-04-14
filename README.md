@@ -7,24 +7,28 @@ The goal is to automatically convert reconnaissance output into **organized oper
 Currently supported:
 
 - **Nmap XML scans**
+- **Nessus XML exports** (`.nessus` files)
+- **Burp Suite Pro Scanner XML**
 
 Planned support:
 
 - NetExec / CrackMapExec
 - LDAP enumeration
 - SMB enumeration
-- Web scanning tools
 - Additional recon tooling
 
 ---
 
 # Features
 
-- Parse **Nmap XML output**
-- Generate **per-host notes** in Obsidian
-- Produce **AI-assisted analysis** using Ollama
+- Parse **Nmap XML**, **Nessus XML**, and **Burp Suite Pro Scanner XML**
+- Generate **per-host notes** in Obsidian, merged across scan sources
+- Produce **AI-assisted analysis** using Ollama with hallucination mitigations
+- Automatic **Active Directory detection** — domain-specific analysis when AD services are present
 - Suggest **enumeration tools and attack paths**
+- **Priority Targets** canvas node — AI-ranked list of highest-value hosts across all scan sources
 - Automatically create an **Obsidian Canvas visualization**
+- Optional **Excel export** (`--excel`) for reporting
 - Organize reconnaissance results into a structured **knowledge base**
 
 ---
@@ -34,6 +38,13 @@ Planned support:
 - Python **3.10+**
 - **Ollama**
 - An LLM model installed locally
+- `requests` (required)
+- `openpyxl` (optional — only needed for `--excel`)
+
+```bash
+pip install requests
+pip install openpyxl  # optional
+```
 
 Recommended model:
 
@@ -86,22 +97,28 @@ Example:
 ```
 project/
 │
-├─ mAIpper.py
+├─ mAIpper-v0.7.py
 │
 ├─ scans/
-│   └─ nmap/
-│       ├─ internal.xml
-│       ├─ external.xml
-│       └─ dmz.xml
+│   ├─ nmap/
+│   │   ├─ internal.xml
+│   │   ├─ external.xml
+│   │   └─ dmz.xml
+│   ├─ nessus/
+│   │   └─ internal.nessus
+│   └─ burp/
+│       └─ webapp.xml
 ```
 
-Currently supported:
+Supported scan paths:
 
 ```
 scans/nmap/*.xml
+scans/nessus/*.nessus
+scans/burp/*.xml
 ```
 
-You can also specify a different scan directory using:
+You can also specify a different base scan directory using:
 
 ```
 --scans-dir
@@ -162,14 +179,20 @@ Scan notes include:
 
 | Option | Description |
 |------|------|
-| `--scans-dir` | Directory containing scan results |
-| `--xml` | Process a single XML scan file |
-| `--vault` | Obsidian vault output directory |
+| `--scans-dir` | Base directory containing scan subfolders (default: `./scans`) |
+| `--xml` | Process a single Nmap XML file |
+| `--vault` | Obsidian vault output directory (default: `Obsidian`) |
 | `--model` | Ollama model to use |
-| `--ollama-url` | URL of Ollama API |
+| `--ollama-url` | URL of Ollama API (default: `http://localhost:11434`) |
 | `--no-ollama` | Skip AI analysis |
 | `--no-canvas` | Skip canvas generation |
-| `-v` | Increase verbosity |
+| `--no-nessus` | Skip Nessus scan processing |
+| `--no-burp` | Skip Burp Suite scan processing |
+| `--excel` | Export findings to `Export.xlsx` (requires `openpyxl`) |
+| `--canvas-name` | Canvas filename (default: `Assessment Canvas.canvas`) |
+| `--canvas-cols` | Host columns per subnet group (default: 2) |
+| `--canvas-groups-per-row` | Subnet groups per row (default: 3) |
+| `-v` | Verbose logging (INFO) |
 | `-vv` | Debug logging |
 
 ---
