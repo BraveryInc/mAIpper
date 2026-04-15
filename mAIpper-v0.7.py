@@ -57,7 +57,13 @@ except ImportError:
 # Constants
 # ============================================================
 
-IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+IPV4_RE          = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+CVE_RE           = re.compile(r"\bCVE-\d{4}-\d+\b", re.IGNORECASE)
+PORT_IN_TEXT_RE  = re.compile(r"(?:port\s+(\d{1,5})|(\d{1,5})/(?:tcp|udp))", re.IGNORECASE)
+IP_IN_TEXT_RE    = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+FQDN_IN_TEXT_RE  = re.compile(
+    r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}\b"
+)
 
 STATUS_COLORS: dict[str, str | None] = {
     "not-started": None,
@@ -791,6 +797,45 @@ Return your response in markdown using exactly these sections:
 
 
 # ============================================================
+# Ollama — Nessus two-pass helpers
+# ============================================================
+
+def _build_nessus_fact_extraction_prompt(nessus_data: dict) -> str:
+    """
+    Pass 1 prompt: instruct the model to extract ONLY facts explicitly present
+    in the Nessus data — no inference, no recommendations.
+    """
+    hosts = nessus_data.get("hosts", [])
+    lines = [
+        "You are a data extraction assistant. From the following Nessus scan data, "
+        "extract ONLY facts that are explicitly present. Do not infer, recommend, or analyze. "
+        "Output a structured list: for each host, list confirmed CVEs with their CVSS scores, "
+        "confirmed severity levels, and confirmed affected ports/services. "
+        "Mark everything as [CONFIRMED]. Do not add any information not present in the data.",
+        "",
+        "Nessus data:",
+    ]
+    for host in hosts:
+        ip       = host.get("ip", "unknown")
+        hostname = host.get("hostname", "")
+        label    = f"{hostname} ({ip})" if hostname and hostname != ip else ip
+        lines.append(f"\nHost: {label}")
+        notable = [f for f in host.get("findings", []) if f["severity_int"] >= 1]
+        if not notable:
+            lines.append("  No notable findings.")
+            continue
+        for f in notable[:20]:
+            sev  = severity_int_to_str(f["severity_int"])
+            cvss = f.get("cvss3_base") or f.get("cvss_base") or "N/A"
+            cves = ", ".join(f["cves"]) if f["cves"] else "none"
+            lines.append(
+                f"  [{sev}] {f['plugin_name']} | CVSS:{cvss} | CVE:{cves} "
+                f"| port:{f['protocol']}/{f['port']}"
+            )
+    return "\n".join(lines)
+
+
+# ============================================================
 # Ollama — Burp Suite
 # ============================================================
 
@@ -874,15 +919,152 @@ Return your response in markdown using exactly these sections:
     return prompt
 
 
-def ollama_chat(base_url: str, model: str, prompt: str) -> str:
+def ollama_chat(base_url: str, model: str, prompt: str, temperature: float = 0.15) -> str:
     url = base_url.rstrip("/") + "/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
-    logging.info(f"Querying Ollama model: {model}")
+    payload = {"model": model, "prompt": prompt, "stream": False, "temperature": temperature}
+    logging.info(f"Querying Ollama model: {model} (temperature={temperature})")
     r = requests.post(url, json=payload, timeout=180)
     r.raise_for_status()
     response_text = r.json().get("response", "")
     logging.debug(f"Ollama response: {len(response_text)} chars")
     return response_text
+
+
+# ============================================================
+# AI output validation
+# ============================================================
+
+def validate_ai_output(
+    raw_text: str, source_data: dict, source_type: str
+) -> tuple[str, list[str]]:
+    """
+    Post-process AI output to flag potential hallucinations.
+
+    Returns (annotated_text, warnings_list).
+    source_type: "nmap", "nessus", or "burp"
+    """
+    warnings: list[str] = []
+    hosts = source_data.get("hosts", [])
+
+    # --- Build source truth sets ---
+    source_ips:       set[str] = set()
+    source_ports:     set[int] = set()
+    source_cves:      set[str] = set()
+    source_hostnames: set[str] = set()
+
+    if source_type == "nmap":
+        for h in hosts:
+            for addr in h.get("addresses", []):
+                if addr.get("addrtype") == "ipv4" and addr.get("addr"):
+                    source_ips.add(addr["addr"])
+            for p in h.get("open_ports", []):
+                source_ports.add(p["port"])
+            for hn in h.get("hostnames", []):
+                if hn.get("name"):
+                    source_hostnames.add(hn["name"].lower().rstrip("."))
+
+    elif source_type == "nessus":
+        for h in hosts:
+            if h.get("ip"):
+                source_ips.add(h["ip"])
+            if h.get("hostname"):
+                source_hostnames.add(h["hostname"].lower().rstrip("."))
+            for f in h.get("findings", []):
+                if f.get("port"):
+                    source_ports.add(int(f["port"]))
+                for cve in f.get("cves", []):
+                    source_cves.add(cve.strip().upper())
+
+    elif source_type == "burp":
+        for h in hosts:
+            if h.get("ip"):
+                source_ips.add(h["ip"])
+            if h.get("url"):
+                from urllib.parse import urlparse
+                parsed = urlparse(h["url"])
+                if parsed.netloc:
+                    source_hostnames.add(parsed.netloc.split(":")[0].lower())
+
+    annotated = raw_text
+
+    # --- CVE validation (nessus only) ---
+    if source_type == "nessus":
+        found_cves = {m.upper() for m in CVE_RE.findall(annotated)}
+        for cve in sorted(found_cves):
+            if cve not in source_cves:
+                inline_warn = (
+                    f"\n> ⚠️ HALLUCINATION WARNING: {cve} was not found in the "
+                    "scan data — verify before acting."
+                )
+                # Insert after the first occurrence of this CVE
+                pos = 0
+                while pos < len(annotated):
+                    m = CVE_RE.search(annotated, pos)
+                    if not m:
+                        break
+                    if m.group(0).upper() == cve:
+                        end = m.end()
+                        annotated = annotated[:end] + inline_warn + annotated[end:]
+                        break
+                    pos = m.end()
+                warnings.append(
+                    f"{cve} mentioned in analysis but not present in Nessus input"
+                )
+
+    # --- IP cross-reference (all types, only when we have source IPs to compare) ---
+    if source_ips:
+        found_ips = set(IP_IN_TEXT_RE.findall(annotated))
+        for ip in sorted(found_ips):
+            if ip not in source_ips:
+                warnings.append(
+                    f"IP {ip} appears in analysis but was not in input scan"
+                )
+
+    # --- Port cross-reference (all types, only when we have source ports) ---
+    if source_ports:
+        found_ports: set[int] = set()
+        for m in PORT_IN_TEXT_RE.finditer(annotated):
+            port_str = m.group(1) or m.group(2)
+            try:
+                found_ports.add(int(port_str))
+            except (ValueError, TypeError):
+                pass
+        for port in sorted(found_ports):
+            if port not in source_ports:
+                warnings.append(
+                    f"Port {port} mentioned in analysis but was not open on any host in the scan"
+                )
+
+    # --- Hostname cross-reference (all types, only when we have source hostnames) ---
+    if source_hostnames:
+        found_fqdns: set[str] = set()
+        for m in FQDN_IN_TEXT_RE.finditer(annotated):
+            val = m.group(0).lower().rstrip(".")
+            if not is_ipv4(val):
+                found_fqdns.add(val)
+        for fqdn in sorted(found_fqdns):
+            if not any(
+                fqdn == sh
+                or fqdn.endswith("." + sh)
+                or sh.endswith("." + fqdn)
+                for sh in source_hostnames
+            ):
+                warnings.append(
+                    f"Hostname {fqdn} appears in analysis but was not in input scan"
+                )
+
+    # --- Prepend summary block if warnings exist ---
+    if warnings:
+        n = len(warnings)
+        block_lines = [
+            f"> ⚠️ **Validation Warnings** "
+            f"({n} issue{'s' if n != 1 else ''} found — review before acting)"
+        ]
+        for w in warnings:
+            block_lines.append(f"> - {w}")
+        annotated = "\n".join(block_lines) + "\n\n" + annotated
+
+    return annotated, warnings
 
 
 # ============================================================
@@ -1095,6 +1277,7 @@ def create_obsidian_vault(
     tool_name: str,
     analysis_text: str | None,
     model_name: str | None,
+    validation_warnings: list[str] | None = None,
 ) -> dict:
     """Write all host notes and the scan note for one Nmap scan file."""
     logging.info(f"Writing Nmap vault content: {vault_dir}")
@@ -1135,6 +1318,11 @@ def create_obsidian_vault(
     if model_name:
         scan_lines.append(f"Model: `{model_name}`\n")
     scan_lines.append(analysis_text or "_No AI analysis generated._")
+
+    if validation_warnings:
+        scan_lines += ["", "## Validation Warnings", ""]
+        for w in validation_warnings:
+            scan_lines.append(f"- {w}")
 
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
     logging.info(f"Wrote Nmap scan note: {scan_path.name}")
@@ -1264,6 +1452,7 @@ def create_nessus_vault(
     nessus_data: dict,
     analysis_text: str | None,
     model_name: str | None,
+    validation_warnings: list[str] | None = None,
 ) -> dict:
     """Write Nessus host note sections and scan note."""
     logging.info(f"Writing Nessus vault content: {vault_dir}")
@@ -1317,6 +1506,11 @@ def create_nessus_vault(
     if model_name:
         scan_lines.append(f"Model: `{model_name}`\n")
     scan_lines.append(analysis_text or "_No AI analysis generated._")
+
+    if validation_warnings:
+        scan_lines += ["", "## Validation Warnings", ""]
+        for w in validation_warnings:
+            scan_lines.append(f"- {w}")
 
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
     logging.info(f"Wrote Nessus scan note: {scan_path.name}")
@@ -1443,6 +1637,7 @@ def create_burp_vault(
     burp_data: dict,
     analysis_text: str | None,
     model_name: str | None,
+    validation_warnings: list[str] | None = None,
 ) -> dict:
     """Write Burp Suite host note sections and scan note."""
     logging.info(f"Writing Burp vault content: {vault_dir}")
@@ -1491,6 +1686,11 @@ def create_burp_vault(
     if model_name:
         scan_lines.append(f"Model: `{model_name}`\n")
     scan_lines.append(analysis_text or "_No AI analysis generated._")
+
+    if validation_warnings:
+        scan_lines += ["", "## Validation Warnings", ""]
+        for w in validation_warnings:
+            scan_lines.append(f"- {w}")
 
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
     logging.info(f"Wrote Burp scan note: {scan_path.name}")
@@ -2357,6 +2557,10 @@ def main() -> None:
                     help="Host cards per row within each subnet group (default: 2)")
     ap.add_argument("--canvas-groups-per-row", type=int, default=3,
                     help="Subnet groups per canvas row (default: 3)")
+    ap.add_argument("--temperature",     type=float, default=0.15,
+                    help="Ollama sampling temperature (0.0–1.0, default: 0.15)")
+    ap.add_argument("--skip-validation", action="store_true",
+                    help="Skip post-processing AI output validation (faster, no hallucination checks)")
     ap.add_argument("-v", "--verbose", action="count", default=1,
                     help="Increase verbosity: -v = INFO, -vv = DEBUG")
 
@@ -2402,11 +2606,22 @@ def main() -> None:
         scan_data = parse_nmap_xml(xml_path)
 
         analysis: str | None = None
+        nmap_warnings: list[str] = []
         if not args.no_ollama:
             try:
-                analysis = ollama_chat(
-                    args.ollama_url, args.model, build_ollama_prompt(scan_data)
+                raw_analysis = ollama_chat(
+                    args.ollama_url, args.model,
+                    build_ollama_prompt(scan_data),
+                    args.temperature,
                 )
+                if not args.skip_validation:
+                    analysis, nmap_warnings = validate_ai_output(
+                        raw_analysis, scan_data, "nmap"
+                    )
+                    for w in nmap_warnings:
+                        logging.warning(f"[Nmap Validation] {w}")
+                else:
+                    analysis = raw_analysis
             except Exception as exc:
                 logging.warning(f"Ollama failed ({xml_path.name}): {exc}")
                 analysis = f"_Ollama failed: {exc}_"
@@ -2420,6 +2635,7 @@ def main() -> None:
             args.tool_name,
             analysis,
             None if args.no_ollama else args.model,
+            validation_warnings=nmap_warnings or None,
         )
 
         scan_host_map[result["scan_stem"]] = result["host_stems"]
@@ -2445,11 +2661,45 @@ def main() -> None:
             nessus_data = parse_nessus_xml(nessus_path)
 
             analysis = None
+            nessus_warnings: list[str] = []
             if not args.no_ollama:
                 try:
-                    analysis = ollama_chat(
-                        args.ollama_url, args.model, build_nessus_ollama_prompt(nessus_data)
+                    # Pass 1: fact extraction only
+                    facts: str | None = None
+                    try:
+                        fact_prompt = _build_nessus_fact_extraction_prompt(nessus_data)
+                        facts = ollama_chat(
+                            args.ollama_url, args.model, fact_prompt, args.temperature
+                        )
+                        logging.info(
+                            f"Nessus Pass 1 complete ({nessus_path.name}): "
+                            f"{len(facts)} chars extracted"
+                        )
+                    except Exception as exc:
+                        logging.warning(
+                            f"Nessus Pass 1 failed ({nessus_path.name}): {exc}; "
+                            "falling back to single-pass"
+                        )
+
+                    # Pass 2: analysis (optionally grounded in Pass 1 facts)
+                    p2_prompt = build_nessus_ollama_prompt(nessus_data)
+                    if facts:
+                        p2_prompt = (
+                            "The following facts have been extracted directly from the scan "
+                            "data. Base your analysis ONLY on these confirmed facts:\n\n"
+                            + facts + "\n\n" + p2_prompt
+                        )
+                    raw_analysis = ollama_chat(
+                        args.ollama_url, args.model, p2_prompt, args.temperature
                     )
+                    if not args.skip_validation:
+                        analysis, nessus_warnings = validate_ai_output(
+                            raw_analysis, nessus_data, "nessus"
+                        )
+                        for w in nessus_warnings:
+                            logging.warning(f"[Nessus Validation] {w}")
+                    else:
+                        analysis = raw_analysis
                 except Exception as exc:
                     logging.warning(f"Ollama failed ({nessus_path.name}): {exc}")
                     analysis = f"_Ollama failed: {exc}_"
@@ -2460,6 +2710,7 @@ def main() -> None:
                 nessus_data,
                 analysis,
                 None if args.no_ollama else args.model,
+                validation_warnings=nessus_warnings or None,
             )
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
@@ -2497,11 +2748,22 @@ def main() -> None:
             burp_data = parse_burp_xml(burp_path)
 
             analysis = None
+            burp_warnings: list[str] = []
             if not args.no_ollama:
                 try:
-                    analysis = ollama_chat(
-                        args.ollama_url, args.model, build_burp_ollama_prompt(burp_data)
+                    raw_analysis = ollama_chat(
+                        args.ollama_url, args.model,
+                        build_burp_ollama_prompt(burp_data),
+                        args.temperature,
                     )
+                    if not args.skip_validation:
+                        analysis, burp_warnings = validate_ai_output(
+                            raw_analysis, burp_data, "burp"
+                        )
+                        for w in burp_warnings:
+                            logging.warning(f"[Burp Validation] {w}")
+                    else:
+                        analysis = raw_analysis
                 except Exception as exc:
                     logging.warning(f"Ollama failed ({burp_path.name}): {exc}")
                     analysis = f"_Ollama failed: {exc}_"
@@ -2512,6 +2774,7 @@ def main() -> None:
                 burp_data,
                 analysis,
                 None if args.no_ollama else args.model,
+                validation_warnings=burp_warnings or None,
             )
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
@@ -2531,7 +2794,19 @@ def main() -> None:
         if not args.no_ollama and all_analyses:
             try:
                 pt_prompt = build_priority_targets_prompt(vault_dir, all_analyses)
-                raw_pt    = ollama_chat(args.ollama_url, args.model, pt_prompt)
+                raw_pt    = ollama_chat(
+                    args.ollama_url, args.model, pt_prompt, args.temperature
+                )
+                if not args.skip_validation:
+                    # Build a combined source for cross-reference (all Nmap hosts)
+                    combined_hosts: list[dict] = []
+                    for _, _, sd in all_nmap_scans:
+                        combined_hosts.extend(sd.get("hosts", []))
+                    raw_pt, pt_warnings = validate_ai_output(
+                        raw_pt, {"hosts": combined_hosts}, "nmap"
+                    )
+                    for w in pt_warnings:
+                        logging.warning(f"[Priority Targets Validation] {w}")
                 # Prepend the standard header so the canvas node is self-labelled
                 priority_targets_text = "## Priority Targets\n\n" + raw_pt.strip()
             except Exception as exc:
