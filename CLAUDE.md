@@ -4,7 +4,7 @@ This file provides guidance when working with code in this repository.
 
 ## What This Is
 
-**mAIpper** is a single-file Python CLI tool (`mAIpper-v0.10.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
+**mAIpper** is a single-file Python CLI tool (`mAIpper-v0.11.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
 
 Supported input formats:
 - **Nmap XML** (`scans/nmap/*.xml`)
@@ -18,41 +18,44 @@ Supported input formats:
 ## Running the Tool
 
 ```bash
-# Basic usage — processes all scan files under ./scans/
-python mAIpper-v0.10.py
+# Basic usage — processes all scan files with full LLM analysis
+python mAIpper-v0.11.py
 
 # Initialize scan directory structure + config file
-python mAIpper-v0.10.py --init
+python mAIpper-v0.11.py --init
 
-# Interactive mode — watch for changes, chat with LLM, drop data
-python mAIpper-v0.10.py -i
-python mAIpper-v0.10.py -i --watch-interval 60
+# Interactive mode — fast start (no LLM), analyze on demand
+python mAIpper-v0.11.py -i
+python mAIpper-v0.11.py -i --watch-interval 60
+# Then in interactive mode:
+#   /analyze   — process checked [x] investigation/analysis boxes
+#   /deepdive  — full LLM analysis of all scans
 
 # Single Nmap file
-python mAIpper-v0.10.py --xml scans/nmap/internal.xml
+python mAIpper-v0.11.py --xml scans/nmap/internal.xml
 
 # Skip AI, skip canvas, custom vault output dir
-python mAIpper-v0.10.py --no-ollama --no-canvas --vault MyNotes
+python mAIpper-v0.11.py --no-ollama --no-canvas --vault MyNotes
 
 # Skip specific parsers
-python mAIpper-v0.10.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
+python mAIpper-v0.11.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
 
 # Remote Ollama instance, different model
-python mAIpper-v0.10.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
+python mAIpper-v0.11.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
 
 # Export to Excel (requires openpyxl)
-python mAIpper-v0.10.py --excel
+python mAIpper-v0.11.py --excel
 
 # Force re-analysis of all files (ignore incremental state)
-python mAIpper-v0.10.py --reanalyze
+python mAIpper-v0.11.py --reanalyze
 
 # Hallucination mitigation tuning
-python mAIpper-v0.10.py --temperature 0.1    # lower = less creative (default: 0.15)
-python mAIpper-v0.10.py --skip-validation    # bypass post-processing validator
+python mAIpper-v0.11.py --temperature 0.1    # lower = less creative (default: 0.15)
+python mAIpper-v0.11.py --skip-validation    # bypass post-processing validator
 
 # Verbose / debug logging
-python mAIpper-v0.10.py -v      # INFO
-python mAIpper-v0.10.py -vv     # DEBUG
+python mAIpper-v0.11.py -v      # INFO
+python mAIpper-v0.11.py -vv     # DEBUG
 ```
 
 Dependencies beyond stdlib:
@@ -74,7 +77,7 @@ Set `interactive = true` in `[interactive]` to start in interactive mode by defa
 
 ## Architecture
 
-Everything lives in `mAIpper-v0.10.py`. The flow is linear:
+Everything lives in `mAIpper-v0.11.py`. The flow is linear:
 
 1. **`main`** — loads config, parses args, handles `--init` and `-i` interactive mode, dispatches to `_run_processing`
 2. **`_run_processing`** — loads operator notes, resolves scan files across all parsers, skips unchanged files (incremental state), collects `scan_host_map` and `all_analyses`, processes deep dives, calls vault writers and canvas builder, optionally exports Excel
@@ -89,8 +92,13 @@ Everything lives in `mAIpper-v0.10.py`. The flow is linear:
 11. **`validate_ai_output`** — post-processing validator that cross-references CVEs, IPs, ports, and hostnames against source data
 12. **`create_obsidian_vault`** / **`create_nessus_vault`** / **`create_burp_vault`** / **`create_autorecon_vault`** / **`create_loot_vault`** / **`create_misc_vault`** — writes and merges host notes; `status` and `## Operator Notes` are always preserved on re-run
 13. **`_process_deep_dives`** — scans host notes for checked `[x] Investigate:` checkboxes, runs focused LLM analysis, writes results as collapsible callouts, marks `[/]` when complete
-14. **`build_canvas`** — full rebuild: Campaign Overview → Priority Targets → scan cards → subnet groups → Next Steps
-15. **`export_excel`** — generates `Export.xlsx` with Summary, Nmap, Nessus, Burp, AutoRecon, and Loot sheets
+14. **`_process_analyze_requests`** — scans scan notes for checked `[x] Analyze:` checkboxes, re-parses source files, runs scan-type-specific LLM analysis, updates `## Analysis` sections
+15. **`build_canvas`** — full rebuild: Campaign Overview → Priority Targets → scan cards → subnet groups → Next Steps
+16. **`build_users_canvas`** — builds Users Canvas: credential → host → service relationship graph with confirmed access edges
+17. **`_detect_misc_tool`** — auto-detects tool type from filename/content signatures, returns (tool_name, analysis_level)
+18. **`_process_eat_me_page`** — parses Eat Me drop zone, creates host notes, archives to Scans/, resets page
+19. **`_write_campaign_targets_note`** — generates copy-paste target lists from all vault data
+20. **`export_excel`** — generates `Export.xlsx` with Summary, Nmap, Nessus, Burp, AutoRecon, and Loot sheets
 
 ## Incremental Analysis
 
@@ -98,18 +106,28 @@ mAIpper tracks which files have been analyzed via `.maipper_state.json` in the v
 
 ## Interactive Mode
 
-`-i` / `--interactive` starts an interactive session combining file watching, LLM chat, and data drops.
+`-i` / `--interactive` starts an interactive session. Initial processing is **fast (no LLM)** — all Python parsing, host notes, scan notes, and canvases are generated immediately. LLM analysis is on-demand only.
 
 **Commands:**
 - `/hosts` — list discovered hosts
 - `/status` — assessment summary
-- `/refresh` — force re-process all files
+- `/analyze` — analyze checked `[x]` items (investigation checkboxes + scan analysis boxes)
+- `/deepdive` — full LLM analysis of all scans (equivalent to batch mode)
+- `/refresh` — re-process all scan files (no analysis)
 - `/paste` — multiline paste (auto-detects IPs, credentials, or saves to misc)
 - `+cred user:pass [host_ip]` — add credential to loot
 - `/help` — command list
 - `<question>` — ask the LLM about the assessment (full vault context injected)
-- Empty Enter — check for scan changes + process pending deep dives
-- Ctrl+C — exit
+- Empty Enter — check for scan + vault changes, process Eat Me, report pending analysis items
+- Ctrl+C — cancel current operation / exit at prompt
+
+**Analysis workflow:** Check `[x]` on any investigate checkbox (host notes) or analyze checkbox (scan notes) in Obsidian, then run `/analyze`. The LLM processes only checked items. Investigation results appear as callouts in `## Deep Dives`; scan analysis fills the `## Analysis` section. Checkboxes turn `[/]` (green) when complete.
+
+**Vault change detection:** The watch loop monitors both `scans/` and vault files (`Hosts/*.md`, `Eat Me.md`, `Loot/Credentials.md`). On vault changes:
+- **Host notes changed** → operator notes reloaded; pending checkboxes reported
+- **Eat Me.md changed** → Python processing runs (host creation, targets update)
+- **Credentials.md changed** → Users Canvas rebuilt
+- No LLM calls happen automatically — always explicit via `/analyze` or `/deepdive`
 
 ## Loot Integration
 
@@ -122,16 +140,72 @@ Assessors drop loot files into `scans/loot/` — credentials, hashes, keys, sens
 
 **Output:** Centralized `Loot/Credentials.md` and `Loot/Hashes.md` with per-host tables. Host notes get lightweight `## Loot` sections with summary stats and links. File listings stay inline.
 
-## Deep Dive Checkboxes
+## Credential Annotations
 
-Host notes include `- [ ] Investigate:` checkboxes next to ports (all), Nessus findings (medium+), and Burp issues (high/medium).
+`Loot/Credentials.md` includes `### Operator Notes` sections under each host's credential table. These are preserved across re-runs.
 
-**Flow:**
+**Confirmed access syntax** — used by the Users Canvas:
+- `- [x] Confirmed on 10.10.10.5` — marks confirmed access, creates green edge in Users Canvas
+- `- [x] Works on 10.10.10.5` — alternate syntax, same effect
+- Free-text notes are also preserved (e.g., "svc_sql also works on MSSQL")
+
+## Users Canvas
+
+`Users Canvas.canvas` visualizes credential → host relationships. Generated from loot data + credential annotations. Skip with `--no-users-canvas`.
+
+**Layout:**
+- Left side: user nodes grouped by **source host** (where the credential was found), not account type
+- Right side: host file nodes grouped by subnet
+- Each user node shows: source file, cred type, and inline Notes from the Credentials.md table
+- Nodes are dynamically sized to fit their content
+- Edges: standard edges show where credentials were found (labeled with cred type + notes); green edges show operator-confirmed access
+
+**Edge labels** include the Notes column content, e.g. `cleartext · Verified - SMB + RDP` or `cleartext · DB only on this server`.
+
+## Campaign Targets Note
+
+`Hosts/_Campaign Targets.md` is auto-generated on every run. Contains copy-paste-ready target lists:
+- **IPs** — all discovered IPs, sorted numerically
+- **Subnets** — all /24 subnets seen
+- **Hostnames** — all FQDNs from host notes, loot files, and misc files
+- **Domains / URLs** — web-only domains not already in Hostnames
+
+Each list is in a fenced code block for easy copy-paste into tools.
+
+## Smarter Misc Analysis
+
+`parse_misc_dir` auto-detects the tool that produced each misc file via `_detect_misc_tool()`. Detection uses filename hints and content signature matching against 25+ tools.
+
+**Analysis levels:**
+- **full** — recognized tool with 2+ signature matches. Full LLM prompt with tool-specific hints.
+- **standard** — partial match or unknown tool. Standard LLM prompt.
+- **minimal** — detected as notes/todo/free-text. Short LLM prompt extracting only key facts (IPs, creds, versions). Saves LLM tokens and time.
+
+**Detected tools include:** nikto, gobuster, dirb, dirsearch, feroxbuster, ffuf, wpscan, linpeas, winpeas, enum4linux, smbmap, smbclient, nmap, masscan, hydra, crackmapexec, bloodhound, impacket, kerbrute, nuclei, testssl, ldapsearch, and more.
+
+Scan notes show `Detected tool:` and `Analysis level:` metadata.
+
+## On-Demand Analysis
+
+Interactive mode starts with **no LLM analysis**. All structured data is generated by Python instantly. Analysis is triggered explicitly:
+
+**Investigation checkboxes** (in host notes) — next to ports, Nessus findings (medium+), Burp issues (high/medium):
 1. `- [ ] Investigate: SMB (tcp/445)` — unchecked, normal
 2. `- [x] Investigate: SMB (tcp/445)` — user checked, **yellow highlight** (pending)
-3. `- [/] Investigate: SMB (tcp/445)` — mAIpper analyzed, **green highlight** (complete)
+3. Run `/analyze` → LLM generates deep dive
+4. `- [/] Investigate: SMB (tcp/445)` — **green highlight** (complete), results in `## Deep Dives`
 
-Results appear as collapsible callouts in `## Deep Dives`. CSS snippet auto-installed and auto-enabled in `.obsidian/`.
+**Scan analysis checkboxes** (in scan notes) — one per scan note:
+1. `- [ ] Analyze: Nmap` — unchecked
+2. `- [x] Analyze: Nmap` — user checked
+3. Run `/analyze` → LLM re-parses source file, fills `## Analysis` section
+4. `- [/] Analyze: Nmap` — complete
+
+Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per-host Loot (`- [ ] Analyze: Loot — {host}`).
+
+**Batch mode** (`python mAIpper-v0.11.py` without `-i`) runs full analysis upfront as before. Checkboxes appear pre-set to `[/]`.
+
+CSS snippet auto-installed in `.obsidian/` for yellow `[x]` and green `[/]` highlighting.
 
 ## Operator Notes Feedback Loop
 
@@ -160,6 +234,8 @@ loot_hash_count: 2
 Obsidian/
 ├─ .obsidian/snippets/maipper.css   # auto-installed CSS for investigation checkboxes
 ├─ Hosts/<hostname-or-ip>.md        # frontmatter + ports + findings + deep dives + operator notes
+├─ Hosts/_Campaign Targets.md       # copy-paste target lists (IPs, subnets, hostnames, domains)
+├─ Eat Me.md                       # operator drop zone — paste anything, processed on next run
 ├─ Scans/<scan-name> - Nmap.md      # per-scan note with AI analysis
 ├─ Scans/<scan-name> - Nessus.md
 ├─ Scans/<scan-name> - Burp.md
@@ -170,6 +246,7 @@ Obsidian/
 │   ├─ Credentials.md              # all credentials organized by host
 │   └─ Hashes.md                   # all hashes organized by host
 ├─ Assessment Canvas.canvas
+├─ Users Canvas.canvas              # credential → host → service graph
 └─ Export.xlsx                      # optional; --excel flag
 ```
 
@@ -203,6 +280,22 @@ Seven prompts, each with GROUNDING RULES header (English-only, anti-hallucinatio
 | Burp | `build_burp_ollama_prompt` | Key Observations, Exploitation Priority, Attack Chains, False Positive Risk, Remediation Focus |
 | AutoRecon | `build_autorecon_ollama_prompt` | Key Observations, Service-Specific Findings, Credential & Access Findings, Attack Paths, Manual Follow-Up |
 | Loot | `build_loot_ollama_prompt` | Loot Analysis, Credential Impact, Recommended Next Steps |
-| Misc | `build_misc_ollama_prompt` | Tool Identification, Key Findings, Notable Items, Recommended Next Steps |
+| Misc (full/standard) | `build_misc_ollama_prompt` | Tool Identification (auto-detected or ask LLM), Key Findings, Notable Items, Recommended Next Steps; tool-specific hints for 25+ tools |
+| Misc (minimal) | `_build_misc_minimal_prompt` | Key Facts only (IPs, creds, versions); used for notes/todo files |
 | Deep Dive | `build_deep_dive_prompt` | Attack Surface, Enumeration Commands, Known Vulnerabilities, Attack Paths, Next Steps |
 | Priority Targets | `build_priority_targets_prompt` | Numbered ranked list, evidence citation required |
+
+## Eat Me Page
+
+`Eat Me.md` is a drop zone at the vault root. Assessors paste anything — arp tables, host lists, tool output, notes — and on the next mAIpper run (batch or interactive Enter), the content is:
+
+1. **Parsed** for IPs, hostnames, FQDNs, URLs, and credentials
+2. **New host notes** created for each IP not already in the vault, with:
+   - MAC address (if from arp output)
+   - Ready-to-run nmap scan commands in `## Next Steps`
+   - `eat-me` tag and `Eat Me` source
+3. **Archived** to `Scans/Eat Me <timestamp>.md` with links to new/existing hosts, extracted hostnames, and the original input in a collapsible block
+4. **Campaign Targets** updated with newly discovered IPs/hostnames
+5. **Eat Me page reset** to blank template for the next drop
+
+Supports arp -a output (Linux and Windows formats), plain IP lists, tool output with embedded IPs/URLs, and free-text notes.
