@@ -1446,6 +1446,18 @@ def parse_autorecon_results(results_dir: Path) -> dict:
 # Loot pre-processing extractors
 # ============================================================
 
+_INLINE_NOTE_RE = re.compile(r"\s+[-–—]\s*\(.*\)$|\s+[-–—]\s+\S.*$|\s+\((?:db |only|note|for ).*\)$", re.IGNORECASE)
+
+
+def _strip_password_note(pw: str) -> tuple[str, str]:
+    """Split 'password - (db only)' into ('password', 'db only')."""
+    m = _INLINE_NOTE_RE.search(pw)
+    if m:
+        note = m.group(0).strip().lstrip("-–— ").strip("()")
+        return pw[:m.start()].strip(), note
+    return pw, ""
+
+
 def _extract_credentials(text: str) -> list[dict]:
     """Extract credential pairs from loot text."""
     creds: list[dict] = []
@@ -1456,7 +1468,8 @@ def _extract_credentials(text: str) -> list[dict]:
         if key not in seen:
             seen.add(key)
             creds.append({"username": m.group(1), "password": m.group(2),
-                          "cred_type": "cleartext", "source_pattern": "key=value"})
+                          "cred_type": "cleartext", "source_pattern": "key=value",
+                          "inline_note": ""})
 
     for m in HASHCAT_FORMAT_RE.finditer(text):
         user, hash_val = m.group(1), m.group(2)
@@ -1469,7 +1482,8 @@ def _extract_credentials(text: str) -> list[dict]:
             if hash_val.startswith("$"):
                 ctype = "bcrypt_hash"
             creds.append({"username": user, "password": hash_val,
-                          "cred_type": ctype, "source_pattern": "hashcat"})
+                          "cred_type": ctype, "source_pattern": "hashcat",
+                          "inline_note": ""})
 
     for line in text.splitlines():
         line = line.strip()
@@ -1478,11 +1492,14 @@ def _extract_credentials(text: str) -> list[dict]:
         if ":" in line:
             parts = line.split(":", 1)
             if len(parts) == 2:
-                user, pw = parts[0].strip(), parts[1].strip()
-                if (not user or not pw or len(user) > 64 or len(pw) > 128
+                user, pw_raw = parts[0].strip(), parts[1].strip()
+                if (not user or not pw_raw or len(user) > 64 or len(pw_raw) > 128
                         or " " in user or user.startswith("/")):
                     continue
                 if all(c in "0123456789abcdefABCDEF" for c in user) and len(user) > 20:
+                    continue
+                pw, inline_note = _strip_password_note(pw_raw)
+                if not pw:
                     continue
                 key = (user.lower(), pw)
                 if key not in seen:
@@ -1495,9 +1512,70 @@ def _extract_credentials(text: str) -> list[dict]:
                     elif SHA256_HASH_RE.fullmatch(pw):
                         ctype = "SHA256_hash"
                     creds.append({"username": user, "password": pw,
-                                  "cred_type": ctype, "source_pattern": "colon"})
+                                  "cred_type": ctype, "source_pattern": "colon",
+                                  "inline_note": inline_note})
 
     return creds[:100]
+
+
+_USERNAME_LINE_RE = re.compile(
+    r"^(?:user(?:name)?|login|account|name)\s*[=:]\s*(\S+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_USERNAME_CONTEXT_RE = re.compile(
+    r"(?:username|user|account|login|name|member|employee|personnel|staff|people)",
+    re.IGNORECASE,
+)
+
+
+def _extract_usernames(text: str, known_users: set[str] | None = None) -> list[str]:
+    """Extract standalone usernames from text (not already in credential pairs).
+
+    Handles:
+    - key=value patterns: username=admin
+    - Bare names on their own lines after a context line mentioning 'users'/'usernames'
+    """
+    known = {u.lower() for u in (known_users or set())}
+    usernames: list[str] = []
+    seen: set[str] = set()
+
+    # Pattern 1: key=value
+    for m in _USERNAME_LINE_RE.finditer(text):
+        user = m.group(1).strip()
+        if user.lower() not in known and user.lower() not in seen:
+            if len(user) <= 64 and " " not in user and not user.startswith("/"):
+                seen.add(user.lower())
+                usernames.append(user)
+
+    # Pattern 2: bare names after context lines
+    lines = text.splitlines()
+    in_username_block = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_username_block:
+                in_username_block = False
+            continue
+
+        if ":" in stripped:
+            in_username_block = False
+            continue
+
+        if _USERNAME_CONTEXT_RE.search(stripped) and len(stripped) > 10:
+            in_username_block = True
+            continue
+
+        if in_username_block:
+            word = stripped.split()[0] if stripped.split() else ""
+            if (word and len(word) <= 32 and len(stripped.split()) <= 2
+                    and word.lower() not in known and word.lower() not in seen
+                    and not word.startswith(("/", "#", "-", "*"))
+                    and ":" not in word and "=" not in word):
+                seen.add(word.lower())
+                usernames.append(word)
+
+    return usernames[:50]
 
 
 def _extract_hashes(text: str) -> list[dict]:
@@ -1580,14 +1658,24 @@ def _process_loot_file(filepath: Path) -> dict | None:
     file_listings = _extract_file_listings(raw)
     network_refs = _extract_network_refs(raw)
 
+    # Extract standalone usernames not already in credential pairs
+    known_cred_users = {c["username"] for c in credentials}
+    # Also count hash-associated usernames as known
+    for h in hashes:
+        if h.get("username"):
+            known_cred_users.add(h["username"])
+    standalone_usernames = _extract_usernames(raw, known_cred_users)
+
     counts = {"credentials": len(credentials), "hashes": len(hashes),
               "file_listing": len(file_listings), "network": len(network_refs)}
-    if not any(counts.values()):
+    if not any(counts.values()) and not standalone_usernames:
         category = "notes"
     elif sum(1 for v in counts.values() if v > 0) > 2:
         category = "mixed"
-    else:
+    elif any(counts.values()):
         category = max(counts, key=counts.get)
+    else:
+        category = "usernames"
 
     return {
         "filename": filepath.name,
@@ -1597,6 +1685,7 @@ def _process_loot_file(filepath: Path) -> dict | None:
         "hashes": hashes,
         "file_listings": file_listings,
         "network_refs": network_refs,
+        "standalone_usernames": standalone_usernames,
         "raw_preview": raw[:2000],
         "category": category,
     }
@@ -1618,7 +1707,6 @@ def _resolve_host_from_path(filepath: Path, loot_dir: Path) -> str | None:
         if is_probable_fqdn(subdir):
             return subdir
 
-    fname = filepath.stem
     m = LOOT_IP_PREFIX_RE.match(filepath.name)
     if m:
         return m.group(1)
@@ -1629,7 +1717,131 @@ def _resolve_host_from_path(filepath: Path, loot_dir: Path) -> str | None:
     return None
 
 
-def parse_loot_dir(loot_dir: Path) -> dict:
+_HOST_MENTION_RE = re.compile(
+    r"(?:for|on|from|at|server|host|machine|box|target)\s+"
+    r"([A-Za-z][A-Za-z0-9\-]{2,30}(?:\.[A-Za-z0-9\-]+)*)",
+    re.IGNORECASE,
+)
+
+
+def _resolve_host_from_content(
+    text: str,
+    known_hosts: dict[str, str] | None = None,
+) -> str | None:
+    """Fallback: resolve host from file content when path gives no answer.
+
+    Checks for:
+    1. Known host identifiers (hostnames, stems, IPs from existing vault notes)
+    2. Prose mentions like "for the server DANTE-WEB-NIX01"
+    3. IP addresses in text (single or dominant)
+
+    known_hosts: {identifier_lower: host_key} mapping from vault
+    """
+    text_lower = text.lower()
+
+    # Check for known hostnames/stems from vault (case-insensitive)
+    if known_hosts:
+        matches: dict[str, int] = {}
+        for identifier, host_key in known_hosts.items():
+            if len(identifier) < 4:
+                continue
+            count = text_lower.count(identifier)
+            if count > 0:
+                matches[host_key] = matches.get(host_key, 0) + count
+        if matches:
+            if len(matches) == 1:
+                return next(iter(matches))
+            sorted_matches = sorted(matches.items(), key=lambda x: x[1], reverse=True)
+            top_key, top_count = sorted_matches[0]
+            second_count = sorted_matches[1][1] if len(sorted_matches) > 1 else 0
+            if top_count >= second_count * 2:
+                return top_key
+
+    # Look for prose host mentions ("for the server X", "on host X", etc.)
+    prose_hosts: dict[str, int] = {}
+    for m in _HOST_MENTION_RE.finditer(text):
+        name = m.group(1).strip().rstrip(".")
+        # Filter out common English words that follow these prepositions
+        if name.lower() in (
+            "the", "this", "that", "each", "all", "any", "some", "our",
+            "its", "their", "your", "following", "above", "below",
+        ):
+            continue
+        if len(name) >= 3:
+            prose_hosts[name] = prose_hosts.get(name, 0) + 1
+
+    if prose_hosts:
+        if len(prose_hosts) == 1:
+            return next(iter(prose_hosts))
+        sorted_prose = sorted(prose_hosts.items(), key=lambda x: x[1], reverse=True)
+        top_name, top_count = sorted_prose[0]
+        second_count = sorted_prose[1][1] if len(sorted_prose) > 1 else 0
+        if top_count >= second_count * 2:
+            return top_name
+
+    # Fall back to IP matching
+    ip_counts: dict[str, int] = {}
+    for ip in IP_IN_TEXT_RE.findall(text):
+        if _is_target_ip(ip):
+            ip_counts[ip] = ip_counts.get(ip, 0) + 1
+
+    if not ip_counts:
+        return None
+
+    if len(ip_counts) == 1:
+        return next(iter(ip_counts))
+
+    sorted_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)
+    top_ip, top_count = sorted_ips[0]
+    second_count = sorted_ips[1][1] if len(sorted_ips) > 1 else 0
+    if top_count >= 3 and top_count >= second_count * 2:
+        return top_ip
+
+    return None
+
+
+def _build_known_hosts_lookup(vault_dir: Path) -> dict[str, str]:
+    """Build a lookup of known host identifiers from vault host notes.
+
+    Returns: {identifier_lower: host_key} where host_key is the IP or hostname
+    used as the primary key in loot/misc data structures.
+    """
+    lookup: dict[str, str] = {}
+    hosts_dir = vault_dir / "Hosts"
+    if not hosts_dir.exists():
+        return lookup
+
+    for hp in hosts_dir.glob("*.md"):
+        if hp.stem.startswith("_"):
+            continue
+        try:
+            fm, _ = read_frontmatter(hp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        ip = fm.get("ip", "")
+        hostnames = fm.get("hostnames", [])
+        host_key = ip or (hostnames[0] if hostnames else hp.stem)
+
+        # Register the IP
+        if ip:
+            lookup[ip.lower()] = host_key
+        # Register all hostnames
+        for hn in hostnames:
+            if hn:
+                lookup[hn.lower()] = host_key
+                # Also register short form (first part before dot)
+                short = hn.split(".")[0].lower()
+                if len(short) >= 4:
+                    lookup[short] = host_key
+        # Register the file stem (which may be the hostname or IP)
+        if len(hp.stem) >= 4:
+            lookup[hp.stem.lower()] = host_key
+
+    return lookup
+
+
+def parse_loot_dir(loot_dir: Path, known_hosts: dict[str, str] | None = None) -> dict:
     """Walk a loot directory and extract structured data, associating with hosts."""
     logging.info(f"Parsing loot directory: {loot_dir}")
 
@@ -1666,6 +1878,10 @@ def parse_loot_dir(loot_dir: Path) -> dict:
             hash_types.add(h["hash_type"])
 
         host_key = _resolve_host_from_path(filepath, loot_dir)
+        if not host_key:
+            host_key = _resolve_host_from_content(result.get("raw_preview", ""), known_hosts)
+            if host_key:
+                logging.info(f"Loot: content-based host association: {filepath.name} → {host_key}")
         if host_key:
             loot_data["summary"]["host_files"] += 1
             if host_key not in loot_data["host_loot"]:
@@ -1691,7 +1907,7 @@ def parse_loot_dir(loot_dir: Path) -> dict:
 # Misc tool output parsing
 # ============================================================
 
-def parse_misc_dir(misc_dir: Path) -> dict:
+def parse_misc_dir(misc_dir: Path, known_hosts: dict[str, str] | None = None) -> dict:
     """Walk a misc directory and read text files for LLM interpretation."""
     logging.info(f"Parsing misc directory: {misc_dir}")
 
@@ -1732,6 +1948,10 @@ def parse_misc_dir(misc_dir: Path) -> dict:
             logging.warning(f"Misc file truncated ({filepath.stat().st_size} bytes): {filepath.name}")
 
         host_key = _resolve_host_from_path(filepath, misc_dir)
+        if not host_key:
+            host_key = _resolve_host_from_content(raw[:2000], known_hosts)
+            if host_key:
+                logging.info(f"Misc: content-based host association: {filepath.name} → {host_key}")
         if host_key:
             hosts_seen.add(host_key)
 
@@ -3739,7 +3959,8 @@ def _reparse_and_analyze_scan(
             logging.warning("[Analyze] Loot source directory not found")
             return False
 
-        loot_data = parse_loot_dir(loot_dir)
+        known = _build_known_hosts_lookup(vault_dir)
+        loot_data = parse_loot_dir(loot_dir, known_hosts=known)
         is_campaign = host_key == "campaign"
 
         if is_campaign:
@@ -4926,7 +5147,12 @@ _CRED_CONFIRMED_RE = re.compile(
 
 
 _CRED_TABLE_ROW_RE = re.compile(
-    r"^\|\s*`([^`]*)`\s*\|\s*`([^`]*)`\s*\|\s*(\S+)\s*\|\s*(\S+)\s*\|\s*(.*?)\s*\|$"
+    r"^\|\s*`([^`]*)`\s*\|"    # Username
+    r"\s*(.*?)\s*\|"           # Password
+    r"\s*(.*?)\s*\|"           # Hash
+    r"\s*(.*?)\s*\|"           # Hash Type
+    r"\s*(.*?)\s*\|"           # Source
+    r"\s*(.*?)\s*\|$"          # Notes
 )
 
 
@@ -5013,7 +5239,7 @@ def _read_credential_row_notes(creds_path: Path) -> dict[str, dict[str, str]]:
         m = _CRED_TABLE_ROW_RE.match(line)
         if m:
             username = m.group(1)
-            note = m.group(5).strip()
+            note = m.group(6).strip()
             if note and note != "—":
                 row_notes.setdefault(current_host, {})[username] = note
 
@@ -5033,6 +5259,117 @@ def _parse_confirmed_hosts(annotations: dict[str, str]) -> dict[str, list[str]]:
     return confirmed
 
 
+def _classify_hash_type(value: str) -> str:
+    """Identify hash type from the hash value string."""
+    if not value:
+        return ""
+    if BCRYPT_HASH_RE.match(value):
+        return "bcrypt"
+    if value.startswith("$6$"):
+        return "SHA-512 (Unix)"
+    if value.startswith("$5$"):
+        return "SHA-256 (Unix)"
+    if value.startswith("$1$"):
+        return "MD5 (Unix)"
+    if value.startswith("$apr1$"):
+        return "APR1-MD5"
+    if NTLM_HASH_RE.fullmatch(value) and len(value) == 32:
+        return "NTLM"
+    if SHA256_HASH_RE.fullmatch(value) and len(value) == 64:
+        return "SHA-256"
+    if len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return "SHA-1"
+    if len(value) == 128 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return "SHA-512"
+    if value.startswith("$"):
+        return "crypt"
+    return "unknown"
+
+
+def _is_hash(value: str) -> bool:
+    """Check if a credential password value is actually a hash."""
+    if not value:
+        return False
+    if value.startswith("$"):
+        return True
+    if NTLM_HASH_RE.fullmatch(value) and len(value) == 32:
+        return True
+    if SHA256_HASH_RE.fullmatch(value) and len(value) == 64:
+        return True
+    if len(value) >= 32 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return True
+    return False
+
+
+def _build_cred_rows(
+    loot_files: list[dict],
+) -> list[dict]:
+    """Build normalized credential rows from loot files.
+
+    Each row: {username, password, hash, hash_type, source, inline_note}
+    Separates passwords from hashes. Adds standalone usernames with blanks.
+    """
+    rows: list[dict] = []
+    seen_users: set[str] = set()
+
+    for lf in loot_files:
+        source = lf["filename"]
+        for c in lf.get("credentials", []):
+            user = c["username"]
+            value = c["password"]
+            inline_note = c.get("inline_note", "")
+            seen_users.add(user.lower())
+
+            if _is_hash(value):
+                rows.append({
+                    "username": user,
+                    "password": "",
+                    "hash": value,
+                    "hash_type": _classify_hash_type(value),
+                    "source": source,
+                    "inline_note": inline_note,
+                })
+            else:
+                rows.append({
+                    "username": user,
+                    "password": value,
+                    "hash": "",
+                    "hash_type": "",
+                    "source": source,
+                    "inline_note": inline_note,
+                })
+
+        # Add hash-associated usernames from the hashes extractor
+        for h in lf.get("hashes", []):
+            if h.get("username"):
+                user = h["username"]
+                if user.lower() not in seen_users:
+                    seen_users.add(user.lower())
+                    rows.append({
+                        "username": user,
+                        "password": "",
+                        "hash": h["hash"],
+                        "hash_type": _classify_hash_type(h["hash"]),
+                        "source": source,
+                        "inline_note": "",
+                    })
+
+        # Add standalone usernames (no cred pair found)
+        for user in lf.get("standalone_usernames", []):
+            if user.lower() not in seen_users:
+                seen_users.add(user.lower())
+                rows.append({
+                    "username": user,
+                    "password": "",
+                    "hash": "",
+                    "hash_type": "",
+                    "source": source,
+                    "inline_note": "",
+                })
+
+    return rows
+
+
 def _write_loot_credentials_page(
     loot_dir_out: Path,
     loot_data: dict,
@@ -5045,39 +5382,37 @@ def _write_loot_credentials_page(
     existing_row_notes = _read_credential_row_notes(page_path)
 
     lines: list[str] = [
-        "# Credentials",
+        "# Credentials & Users",
         "",
         f"_Last updated: {loot_data['parsed_at']}_",
         "",
     ]
 
     total_creds = loot_data["summary"].get("total_credentials", 0)
-    lines.append(f"**Total credentials:** {total_creds}")
+    lines.append(f"**Total credential entries:** {total_creds}")
     lines.append("")
 
     has_content = False
 
     for host_key, loot_files in sorted(loot_data["host_loot"].items()):
-        all_creds = []
-        for lf in loot_files:
-            for c in lf.get("credentials", []):
-                all_creds.append({**c, "source": lf["filename"]})
-        if not all_creds:
+        rows = _build_cred_rows(loot_files)
+        if not rows:
             continue
         has_content = True
         host_stem = host_stem_map.get(host_key, safe_filename(host_key))
         host_row_notes = existing_row_notes.get(host_key, {})
         lines.append(f"## [[Hosts/{host_stem}|{host_key}]]")
         lines.append("")
-        lines.append("| Username | Password/Hash | Type | Source | Notes |")
-        lines.append("|----------|--------------|------|--------|-------|")
-        for c in all_creds[:50]:
-            pw = c["password"][:60] + "..." if len(c["password"]) > 60 else c["password"]
-            note = host_row_notes.get(c["username"], "—")
-            lines.append(f"| `{c['username']}` | `{pw}` | {c['cred_type']} | {c['source']} | {note} |")
+        lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
+        lines.append("|----------|----------|------|-----------|--------|-------|")
+        for r in rows[:50]:
+            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
+            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
+            ht = r["hash_type"] or "—"
+            note = host_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
+            lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
         lines.append("")
 
-        # Per-host operator notes (preserved across re-runs)
         lines.append(_CRED_NOTES_SENTINEL)
         lines.append(_CRED_NOTES_HINT)
         existing_notes = existing_annotations.get(host_key, "")
@@ -5086,21 +5421,20 @@ def _write_loot_credentials_page(
             lines.append(existing_notes)
         lines.append("")
 
-    campaign_creds = []
-    for lf in loot_data.get("campaign_loot", []):
-        for c in lf.get("credentials", []):
-            campaign_creds.append({**c, "source": lf["filename"]})
-    if campaign_creds:
+    campaign_rows = _build_cred_rows(loot_data.get("campaign_loot", []))
+    if campaign_rows:
         has_content = True
         campaign_row_notes = existing_row_notes.get("Campaign-Level", {})
         lines.append("## Campaign-Level")
         lines.append("")
-        lines.append("| Username | Password/Hash | Type | Source | Notes |")
-        lines.append("|----------|--------------|------|--------|-------|")
-        for c in campaign_creds[:50]:
-            pw = c["password"][:60] + "..." if len(c["password"]) > 60 else c["password"]
-            note = campaign_row_notes.get(c["username"], "—")
-            lines.append(f"| `{c['username']}` | `{pw}` | {c['cred_type']} | {c['source']} | {note} |")
+        lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
+        lines.append("|----------|----------|------|-----------|--------|-------|")
+        for r in campaign_rows[:50]:
+            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
+            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
+            ht = r["hash_type"] or "—"
+            note = campaign_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
+            lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
         lines.append("")
 
         lines.append(_CRED_NOTES_SENTINEL)
@@ -5112,10 +5446,10 @@ def _write_loot_credentials_page(
         lines.append("")
 
     if not has_content:
-        lines.append("_No credentials found._")
+        lines.append("_No credentials or users found._")
 
     page_path.write_text("\n".join(lines), encoding="utf-8")
-    logging.info(f"Wrote Loot/Credentials.md ({total_creds} credentials)")
+    logging.info(f"Wrote Loot/Credentials.md ({total_creds} entries)")
 
 
 def _write_loot_hashes_page(
@@ -6219,7 +6553,7 @@ def _install_eat_me_page(vault_dir: Path) -> None:
         logging.info("Created Eat Me page")
 
 
-def _process_eat_me_page(vault_dir: Path) -> dict | None:
+def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
     """Process the Eat Me page: extract IPs, hostnames, creds, etc.
 
     Returns a dict of extracted data, or None if nothing to process.
@@ -6368,7 +6702,50 @@ def _process_eat_me_page(vault_dir: Path) -> dict | None:
     scans_dir.mkdir(exist_ok=True)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    scan_display = f"Eat Me {timestamp}"
+
+    # Name the note — try LLM for accuracy, fall back to Python heuristic
+    content_label = None
+    if args and not getattr(args, "no_ollama", True):
+        try:
+            preview = content[:3000]
+            naming_prompt = (
+                "You are naming a file for a penetration testing engagement notebook. "
+                "Read the content below and respond with ONLY a short descriptive title "
+                "(2-5 words, no quotes, no punctuation). Examples: 'NetExec SMB Scan', "
+                "'ARP Table', 'Domain User List', 'Gobuster Results', 'FTP Credentials', "
+                "'Nmap Service Scan', 'BloodHound Output'.\n\n"
+                f"CONTENT:\n```\n{preview}\n```\n\nTITLE:"
+            )
+            raw_name = ollama_chat(
+                args.ollama_url, args.model, naming_prompt, 0.1,
+            ).strip().strip("'\"").strip()
+            if raw_name and len(raw_name) <= 60 and "\n" not in raw_name:
+                content_label = raw_name
+                logging.info(f"Eat Me: LLM named note '{content_label}'")
+        except Exception as exc:
+            logging.debug(f"Eat Me: LLM naming failed, using heuristic: {exc}")
+
+    if not content_label:
+        content_label = "Notes"
+        arp_lines = len(_ARP_LINE_RE.findall(content))
+        if arp_lines >= 3:
+            content_label = "ARP Table"
+        elif discovered_creds and not discovered_ips:
+            content_label = "Credentials"
+        elif len(discovered_ips) >= 3 and not discovered_creds:
+            content_label = "Host List"
+        elif discovered_creds and discovered_ips:
+            content_label = "Recon Data"
+        else:
+            tool_type, _ = _detect_misc_tool("eat_me", content)
+            if tool_type not in ("unknown", "notes"):
+                content_label = f"{tool_type.title()} Output"
+            elif len(discovered_ips) > 0:
+                content_label = "Host Discovery"
+            elif discovered_hostnames:
+                content_label = "DNS Info"
+
+    scan_display = f"{content_label} - {timestamp}"
     scan_stem = safe_filename(scan_display)
     scan_path = scans_dir / ensure_md_suffix(scan_stem)
 
@@ -6508,7 +6885,6 @@ def _write_campaign_targets_note(
     ips: set[str] = set()
     hostnames: set[str] = set()
     subnets: set[str] = set()
-    urls: set[str] = set()
     hosts_entries: dict[str, list[str]] = {}  # ip → [hostname, ...]
 
     # Scan all host notes for IPs and hostnames
@@ -6536,99 +6912,7 @@ def _write_campaign_targets_note(
             if ip and _is_target_ip(str(ip)) and host_fqdns:
                 hosts_entries[ip] = host_fqdns
 
-            # Extract URLs from body (Burp findings, etc.)
-            for m in _URL_RE.finditer(body):
-                domain = m.group(1).lower()
-                if not IPV4_RE.match(domain):
-                    urls.add(domain)
-
-    # Scan notes for additional URLs (not IPs — those come from host frontmatter)
-    if scans_dir.exists():
-        for sp in scans_dir.glob("*.md"):
-            try:
-                text = sp.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            for m in _URL_RE.finditer(text):
-                domain = m.group(1).lower()
-                if not IPV4_RE.match(domain):
-                    urls.add(domain)
-
-    # Extract URLs from raw loot/misc content (domains only, not IPs —
-    # IPs from raw content are too noisy with version numbers, RFC examples, etc.)
-    if loot_data:
-        for loot_files in loot_data.get("host_loot", {}).values():
-            for lf in loot_files:
-                raw = lf.get("raw_preview", "")
-                for m in _URL_RE.finditer(raw):
-                    domain = m.group(1).lower()
-                    if not IPV4_RE.match(domain):
-                        urls.add(domain)
-        for lf in loot_data.get("campaign_loot", []):
-            raw = lf.get("raw_preview", "")
-            for m in _URL_RE.finditer(raw):
-                domain = m.group(1).lower()
-                if not IPV4_RE.match(domain):
-                    urls.add(domain)
-
-    if misc_data:
-        for file_info in misc_data.get("files", []):
-            raw = file_info.get("content", "")[:50_000]
-            for m in _URL_RE.finditer(raw):
-                domain = m.group(1).lower()
-                if not IPV4_RE.match(domain):
-                    urls.add(domain)
-
-    # Filter noise from URLs — vendor sites, documentation, tool homepages
-    noise_domains = {
-        "localhost", "example.com", "github.com", "obsidian.md",
-        "schemas.openxmlformats.org", "www.w3.org",
-        "wordpress.org", "www.wordpress.org",
-        "nmap.org", "www.nmap.org",
-        "cvedetails.com", "www.cvedetails.com",
-        "exploit-db.com", "www.exploit-db.com",
-        "rapid7.com", "www.rapid7.com",
-        "tenable.com", "www.tenable.com",
-        "owasp.org", "www.owasp.org",
-        "mozilla.org", "www.mozilla.org",
-        "apache.org", "www.apache.org",
-        "microsoft.com", "www.microsoft.com",
-        "google.com", "www.google.com",
-        "portswigger.net", "www.portswigger.net",
-        "openssl.org", "www.openssl.org",
-        "php.net", "www.php.net",
-        "python.org", "www.python.org",
-        "jquery.com", "www.jquery.com",
-        "w3.org", "www.w3.org",
-        "iana.org", "www.iana.org",
-        "cve.mitre.org",
-        "nvd.nist.gov",
-    }
-    # Also filter common TLDs that are almost always vendor/reference sites
-    noise_tld_keywords = {
-        ".gov", ".edu", ".mil",
-    }
-    filtered_urls: set[str] = set()
-    for u in urls:
-        if u in noise_domains or len(u) <= 4:
-            continue
-        if any(u.endswith(tld) for tld in noise_tld_keywords):
-            continue
-        # Filter domains that are clearly not assessment targets
-        # (common tool/vendor patterns)
-        lower = u.lower()
-        if any(kw in lower for kw in (
-            "wordpress", "drupal", "joomla", "jquery", "bootstrap",
-            "cloudflare", "amazonaws", "azure", "googleapis",
-        )):
-            continue
-        filtered_urls.add(u)
-    urls = filtered_urls
-
-    # Remove URLs that duplicate hostnames already known from host frontmatter
-    urls -= hostnames
-
-    if not ips and not hostnames and not urls:
+    if not ips and not hostnames:
         return
 
     lines: list[str] = [
@@ -6669,16 +6953,6 @@ def _write_campaign_targets_note(
             lines.append(hn)
         lines += ["```", ""]
 
-    if urls:
-        lines += [
-            "## Domains / URLs",
-            "",
-            "```",
-        ]
-        for u in sorted(urls):
-            lines.append(u)
-        lines += ["```", ""]
-
     if hosts_entries:
         lines += [
             "## /etc/hosts",
@@ -6697,15 +6971,13 @@ def _write_campaign_targets_note(
         f"- **IPs:** {len(ips)}",
         f"- **Subnets:** {len(subnets)}",
         f"- **Hostnames:** {len(hostnames)}",
-        f"- **Domains:** {len(urls)}",
     ]
 
     targets_path = hosts_dir / "_Campaign Targets.md"
     targets_path.write_text("\n".join(lines), encoding="utf-8")
     logging.info(
         f"Wrote Campaign Targets note: {len(ips)} IPs, "
-        f"{len(subnets)} subnets, {len(hostnames)} hostnames, "
-        f"{len(urls)} domains"
+        f"{len(subnets)} subnets, {len(hostnames)} hostnames"
     )
 
 
@@ -6720,9 +6992,10 @@ def _collect_credential_access_map(
     """Build a map of username → list of access entries.
 
     Each access entry: {
-        "username", "password", "cred_type", "source_file",
+        "username", "password", "hash", "hash_type", "source_file",
         "host_key", "host_stem", "note", "confirmed_targets": [str],
     }
+    Includes standalone usernames (no password or hash).
     """
     access_map: dict[str, list[dict]] = {}
     if not loot_data:
@@ -6731,13 +7004,11 @@ def _collect_credential_access_map(
     hosts_dir = vault_dir / "Hosts"
     loot_dir = vault_dir / "Loot"
 
-    # Read credential annotations for confirmed access and per-cred notes
     creds_path = loot_dir / "Credentials.md"
     annotations = _read_credential_annotations(creds_path)
     confirmed = _parse_confirmed_hosts(annotations)
     row_notes = _read_credential_row_notes(creds_path)
 
-    # Build host_stem lookup
     host_stem_lookup: dict[str, str] = {}
     if hosts_dir.exists():
         for hp in hosts_dir.glob("*.md"):
@@ -6749,43 +7020,61 @@ def _collect_credential_access_map(
                 if hn:
                     host_stem_lookup[hn] = hp.stem
 
-    # Collect from host-associated loot
     for host_key, loot_files in loot_data.get("host_loot", {}).items():
         host_stem = host_stem_lookup.get(host_key, safe_filename(host_key))
         confirmed_targets = confirmed.get(host_key, [])
-        host_notes = row_notes.get(host_key, {})
-        for lf in loot_files:
-            for c in lf.get("credentials", []):
-                username = c["username"]
-                entry = {
-                    "username": username,
-                    "password": c["password"],
-                    "cred_type": c["cred_type"],
-                    "source_file": lf["filename"],
-                    "host_key": host_key,
-                    "host_stem": host_stem,
-                    "note": host_notes.get(username, ""),
-                    "confirmed_targets": confirmed_targets,
-                }
-                access_map.setdefault(username, []).append(entry)
-
-    # Collect from campaign-level loot
-    campaign_notes = row_notes.get("Campaign-Level", {})
-    for lf in loot_data.get("campaign_loot", []):
-        confirmed_targets = confirmed.get("Campaign-Level", [])
-        for c in lf.get("credentials", []):
-            username = c["username"]
+        host_row = row_notes.get(host_key, {})
+        rows = _build_cred_rows(loot_files)
+        for r in rows:
+            username = r["username"]
+            has_pw = bool(r["password"])
+            has_hash = bool(r["hash"])
+            if has_hash:
+                cred_type = r["hash_type"] or "hash"
+            elif has_pw:
+                cred_type = "cleartext"
+            else:
+                cred_type = "username only"
             entry = {
                 "username": username,
-                "password": c["password"],
-                "cred_type": c["cred_type"],
-                "source_file": lf["filename"],
-                "host_key": "_campaign",
-                "host_stem": "",
-                "note": campaign_notes.get(username, ""),
+                "password": r["password"],
+                "hash": r["hash"],
+                "hash_type": r["hash_type"],
+                "cred_type": cred_type,
+                "source_file": r["source"],
+                "host_key": host_key,
+                "host_stem": host_stem,
+                "note": host_row.get(username, ""),
                 "confirmed_targets": confirmed_targets,
             }
             access_map.setdefault(username, []).append(entry)
+
+    campaign_row = row_notes.get("Campaign-Level", {})
+    campaign_rows = _build_cred_rows(loot_data.get("campaign_loot", []))
+    confirmed_targets = confirmed.get("Campaign-Level", [])
+    for r in campaign_rows:
+        username = r["username"]
+        has_pw = bool(r["password"])
+        has_hash = bool(r["hash"])
+        if has_hash:
+            cred_type = r["hash_type"] or "hash"
+        elif has_pw:
+            cred_type = "cleartext"
+        else:
+            cred_type = "username only"
+        entry = {
+            "username": username,
+            "password": r["password"],
+            "hash": r["hash"],
+            "hash_type": r["hash_type"],
+            "cred_type": cred_type,
+            "source_file": r["source"],
+            "host_key": "_campaign",
+            "host_stem": "",
+            "note": campaign_row.get(username, ""),
+            "confirmed_targets": confirmed_targets,
+        }
+        access_map.setdefault(username, []).append(entry)
 
     return access_map
 
@@ -6848,7 +7137,7 @@ def build_users_canvas(
         "_Edges show where credentials were found or verified.\n"
         "Green = operator-confirmed access._"
     )
-    our_nodes.append(_text_node(title_id, title_text, -350, -200, 700, 160))
+    our_nodes.append(_text_node(title_id, title_text, -350, -280, 700, 160))
 
     # ── Group credentials by source host, not account type ──
     # Each source host becomes a group on the left.
@@ -6875,7 +7164,6 @@ def build_users_canvas(
     for username, entries in access_map.items():
         lines: list[str] = [f"**{username}**", ""]
 
-        # Deduplicate by (host_key, source_file)
         seen: set[tuple[str, str]] = set()
         for e in entries:
             key = (e["host_key"], e["source_file"])
@@ -6883,10 +7171,19 @@ def build_users_canvas(
                 continue
             seen.add(key)
             host_label = e["host_key"] if e["host_key"] != "_campaign" else "campaign-level"
-            line = f"- `{e['cred_type']}` from `{e['source_file']}` ({host_label})"
+            # Show what we have for this credential
+            detail_parts: list[str] = []
+            if e.get("password"):
+                detail_parts.append("password")
+            if e.get("hash"):
+                ht = e.get("hash_type", "hash")
+                detail_parts.append(ht if ht else "hash")
+            if not detail_parts:
+                detail_parts.append("username only")
+            detail = ", ".join(detail_parts)
+            line = f"- `{detail}` from `{e['source_file']}` ({host_label})"
             lines.append(line)
 
-        # Merge all notes for this user across entries
         notes = [e["note"] for e in entries if e.get("note")]
         if notes:
             unique_notes = list(dict.fromkeys(notes))
@@ -7915,7 +8212,7 @@ def _process_vault_changes(
 
     # ── Eat Me ──
     if eat_me_path in changed_files:
-        em_result = _process_eat_me_page(vault_dir)
+        em_result = _process_eat_me_page(vault_dir, args=args)
         if em_result:
             any_action = True
             if em_result["new_hosts"]:
@@ -8542,10 +8839,13 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         if operator_notes_lookup:
             logging.info(f"Loaded operator notes for {len(operator_notes_lookup)} host key(s)")
 
+    # Build known hosts lookup for content-based association in loot/misc
+    known_hosts_lookup = _build_known_hosts_lookup(vault_dir)
+
     # ------------------------------------------------------------------ #
     # Eat Me — process operator drop zone first                            #
     # ------------------------------------------------------------------ #
-    eat_me_result = _process_eat_me_page(vault_dir)
+    eat_me_result = _process_eat_me_page(vault_dir, args=args)
     if eat_me_result:
         scan_host_map[eat_me_result["scan_stem"]] = eat_me_result["host_stems"]
         if eat_me_result["new_hosts"]:
@@ -8960,7 +9260,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 loot_dir = candidate
 
         if loot_dir:
-            loot_data = parse_loot_dir(loot_dir)
+            loot_data = parse_loot_dir(loot_dir, known_hosts=known_hosts_lookup)
             all_loot_data = loot_data
 
             if not loot_data["summary"]["total_files"]:
@@ -9039,7 +9339,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 misc_dir = candidate
 
         if misc_dir:
-            misc_data = parse_misc_dir(misc_dir)
+            misc_data = parse_misc_dir(misc_dir, known_hosts=known_hosts_lookup)
             all_misc_data = misc_data
 
             if not misc_data["summary"]["total_files"]:
