@@ -1,6 +1,6 @@
 # mAIpper
 
-**mAIpper** is a pentesting workflow tool that ingests scan output, analyzes it with a local LLM via **Ollama**, and generates structured **Obsidian notes and Canvas visualizations**.
+**mAIpper** is a pentesting workflow tool that ingests scan output, analyzes it with a local LLM via **Ollama**, and generates structured **Obsidian notes and Canvas visualizations** — with optional **RAG** for cited references from your cybersecurity library.
 
 The goal is to automatically convert reconnaissance output into **organized operator notes and attack-path suggestions** with a human-in-the-loop feedback cycle.
 
@@ -12,6 +12,7 @@ Currently supported:
 - **AutoRecon** — automated multi-tool enumeration
 - **Loot** — operator-collected evidence (credentials, hashes, keys, sensitive files)
 - **Misc** — arbitrary tool text output for LLM interpretation
+- **RAG** — reference your PDF books and HackTricks for cited analysis
 
 ---
 
@@ -19,16 +20,24 @@ Currently supported:
 
 - Parse **Nmap XML**, **Nessus**, **Burp Suite**, and **AutoRecon** output
 - Ingest **operator-collected loot** (credentials, hashes, file listings) into centralized Loot pages
-- Process **miscellaneous tool output** with LLM interpretation
+- Process **miscellaneous tool output** with auto-detected tool type (25+ tools recognized)
 - Generate **per-host notes** in Obsidian with merged findings from all sources
-- **Deep dive checkboxes** — check a box next to any port or finding to trigger detailed analysis on next run
+- **On-demand analysis** — interactive mode starts fast (no LLM), analyze only what you check
+- **Investigation checkboxes** — check a box next to any port or finding to trigger detailed analysis
+- **Scan analysis checkboxes** — check a box on any scan note to request LLM analysis; scan-level operator notes injected into prompt automatically
+- **`/analyze-full`** — check all unchecked boxes and analyze everything in one command
+- **`/deepdive` cross-source correlation** — synthesizes Nmap + Nessus + Burp + AutoRecon + Loot per host into `## Cross-Source Analysis`
+- **Duplicate host note merging** — auto-detects when an IP note and hostname note refer to the same host; merges frontmatter, body, and canvas links
+- **RAG integration** — index your PDF security books and HackTricks clone for cited references in analysis
 - Produce **AI-assisted analysis** using Ollama with hallucination mitigation
-- **Operator Notes feedback loop** — manual observations feed back into AI analysis on re-runs
-- **Watch mode** — polls for new scan files and auto-processes
-- Suggest **enumeration tools and attack paths** with ready-to-run commands
-- Automatically create an **Obsidian Canvas visualization** with campaign overview, priority targets, and subnet grouping
+- **Operator Notes feedback loop** — manual observations in host notes and scan notes feed back into AI analysis
+- **Eat Me page** — paste anything (arp tables, tool output, host lists, usernames, credentials); IPs, creds, and standalone usernames extracted immediately to `Loot/Credentials.md`
+- **Campaign Targets** — auto-generated copy-paste target lists (IPs, subnets, hostnames, /etc/hosts)
+- **Users Canvas** — credential → host relationship graph with confirmed access edges
+- **Assessment Canvas** — campaign overview, priority targets, subnet grouping
+- **Nmap port merge** — overlapping scans consolidated, richest service info kept
+- **Vault change detection** — watches Obsidian for operator edits in real time
 - **Excel export** with per-scanner sheets and severity color-coding
-- **Priority Targets** ranking based on CVEs, services, loot, and operator notes
 
 ---
 
@@ -41,119 +50,69 @@ Currently supported:
 ```bash
 pip install requests          # required
 pip install openpyxl          # required only for --excel
+pip install pypdf             # required only for RAG with PDFs
 ```
 
-Recommended model:
+Recommended models:
 
-```
-qwen2.5:14b-instruct-q5_K_M
+```bash
+ollama pull qwen2.5:14b-instruct-q5_K_M    # chat/analysis
+ollama pull nomic-embed-text                 # RAG embeddings
 ```
 
 ---
 
-# Install Ollama
-
-Install Ollama: https://ollama.com
-
-After installation, download the recommended model:
+# Quick Start
 
 ```bash
-ollama pull qwen2.5:14b-instruct-q5_K_M
+# Initialize directory structure
+python mAIpper-v0.12.py --init
+
+# Drop scan files into scans/ subdirectories, then:
+python mAIpper-v0.12.py -i
 ```
 
-Start Ollama:
+Interactive mode starts instantly with Python-only processing. Use commands to control analysis:
 
-```bash
-ollama start
-```
+| Command | Description |
+|---------|-------------|
+| `/analyze` | Analyze checked `[x]` items (investigation + scan boxes) |
+| `/analyze-full` | Check ALL unchecked boxes then run full analysis |
+| `/deepdive` | Cross-source correlation per host → `## Cross-Source Analysis` |
+| `/merge` | Detect and merge duplicate host notes (IP + hostname → one note) |
+| `/refresh` | Re-process all scan files (no analysis) |
+| `/hosts` | List discovered hosts |
+| `/status` | Assessment summary |
+| `/rag` | Show RAG index status |
+| `/build-index` | Build or update RAG index |
+| `/paste` | Paste multiline data (hosts, creds, tool output) |
+| `+cred u:p` | Add credential (`+cred user:pass [host_ip]`) |
+| `<question>` | Ask the LLM about the assessment |
+| Enter | Check for changes; if pending items found, prompt `Analyze now? [Y/n]:` |
+| Ctrl+C | Cancel current operation / exit at prompt |
 
 ---
 
 # Scan Directory Layout
 
-Place scan output in a `scans` directory in the working folder. Use `--init` to auto-create the structure:
-
-```bash
-python mAIpper-v0.10.py --init
-```
+Use `--init` to auto-create the structure:
 
 ```
 project/
-├─ mAIpper-v0.10.py
+├─ mAIpper-v0.12.py
+├─ maipper.conf
+├─ docs/                          ← PDF reference books for RAG
+│   └─ hacktricks/                ← git clone HackTricks here
 ├─ scans/
-│   ├─ nmap/
-│   │   ├─ internal.xml
-│   │   └─ external.xml
-│   ├─ nessus/
-│   │   └─ internal_scan.nessus
-│   ├─ burp/
-│   │   └─ webapp_issues.xml
+│   ├─ nmap/*.xml
+│   ├─ nessus/*.nessus
+│   ├─ burp/*.xml
 │   ├─ nikto/
-│   │   └─ webapp_nikto.txt
-│   ├─ autorecon/
-│   │   └─ 10.10.10.5/
-│   │       └─ scans/
-│   │           ├─ xml/
-│   │           ├─ tcp80/
-│   │           └─ tcp445/
+│   ├─ autorecon/<target>/scans/
 │   ├─ loot/
-│   │   ├─ 10.10.10.5/
-│   │   │   ├─ ftp_listing.txt
-│   │   │   └─ creds.txt
-│   │   ├─ 10.10.10.10_smb_shares.txt
-│   │   └─ cracked_hashes.txt
 │   └─ misc/
-│       ├─ linpeas_output.txt
-│       └─ 10.10.10.5/
-│           └─ gobuster_results.txt
-```
-
-Supported formats:
-- `scans/nmap/*.xml` — Nmap XML output
-- `scans/nessus/*.nessus` — Nessus scan exports
-- `scans/burp/*.xml` — Burp Suite Issues XML
-- `scans/nikto/` — Nikto scan output
-- `scans/autorecon/<target>/scans/` — AutoRecon results
-- `scans/loot/` — Loot files (credentials, hashes, keys)
-- `scans/misc/` — Any tool's text output
-
----
-
-# Running mAIpper
-
-Basic usage:
-
-```bash
-python mAIpper-v0.10.py
-```
-
-This will:
-
-1. Load operator notes from existing vault (feedback loop)
-2. Parse all scans (Nmap, Nessus, Burp, AutoRecon)
-3. Parse loot files and extract credentials/hashes
-4. Process misc tool output
-5. Send summarized data to Ollama for AI analysis
-6. Validate AI output for hallucinations
-7. Process deep dive requests (checked investigation boxes)
-8. Generate Obsidian host notes, scan notes, Loot pages, and canvas
-9. Optionally export to Excel
-
-Interactive mode — watch for changes, chat with LLM, drop data:
-
-```bash
-python mAIpper-v0.10.py -i
-python mAIpper-v0.10.py -i --watch-interval 60
-```
-
-Unchanged files are automatically skipped (incremental analysis). Use `--reanalyze` to force a full re-run.
-
-## Configuration
-
-`--init` creates a `maipper.conf` file with all defaults. Edit to set your model, vault path, temperature, etc. CLI flags always override config values.
-
-```bash
-python mAIpper-v0.10.py --init   # creates maipper.conf + scans/ structure
+├─ .maipper_rag_index.json        ← RAG index (auto-generated)
+└─ .maipper_state.json            ← incremental state (in vault)
 ```
 
 ---
@@ -163,113 +122,159 @@ python mAIpper-v0.10.py --init   # creates maipper.conf + scans/ structure
 ```
 Obsidian/
 ├─ Hosts/
-│   ├─ 10.10.10.5.md
+│   ├─ _Campaign Targets.md       ← copy-paste target lists
 │   ├─ dc01.domain.local.md
 │   └─ web01.domain.local.md
 ├─ Scans/
 │   ├─ InternalScan - Nmap.md
 │   ├─ InternalScan - Nessus.md
-│   ├─ WebApp - Burp.md
-│   ├─ 10.10.10.5 - AutoRecon.md
 │   └─ linpeas_output - Misc.md
 ├─ Loot/
 │   ├─ Overview.md
-│   ├─ Credentials.md
+│   ├─ Credentials.md             ← separate Password/Hash/Type columns
 │   └─ Hashes.md
+├─ Eat Me.md                      ← operator drop zone
 ├─ Assessment Canvas.canvas
+├─ Users Canvas.canvas             ← credential → host graph
 └─ Export.xlsx
 ```
 
-Host notes include:
-- Open ports and service information (with investigation checkboxes)
-- Nessus vulnerability findings (severity-sorted, with investigation checkboxes)
-- Burp Suite web findings (with investigation checkboxes)
-- AutoRecon enumeration data (technologies, shares, users)
-- Loot summary (with links to centralized Loot pages)
-- Deep Dives (collapsible analysis results from checked investigation boxes)
-- Scan references (links to scan notes)
-- Operator Notes (manually editable, feeds back into AI)
+---
+
+# On-Demand Analysis
+
+Interactive mode starts with **no LLM analysis** — all structured data generates instantly.
+
+**Investigation checkboxes** (in host notes):
+1. `- [ ] Investigate: SMB (tcp/445)` — unchecked
+2. Check `[x]` in Obsidian → run `/analyze` → deep dive generated
+3. `- [/] Investigate: SMB (tcp/445)` — complete (green highlight)
+
+**Scan analysis checkboxes** (in scan notes):
+1. `- [ ] Analyze: Nmap` — unchecked
+2. Check `[x]` → run `/analyze` → `## Analysis` section filled by LLM (scan operator notes auto-injected)
+3. `- [/] Analyze: Nmap` — complete
+
+**`/analyze-full`** — checks every `[ ]` box across all host notes and scan notes, then runs the full analysis pass. One command to analyze everything that hasn't been looked at.
+
+**`/deepdive`** — reads all existing sections in each host note (ports, findings, loot, deep dives) and runs a single synthesis prompt per host. Writes `## Cross-Source Analysis` with correlated findings, attack chains, coverage gaps, and priority actions. Does not re-run individual scanners — works from what's already in the vault.
+
+**Batch mode** (`python mAIpper-v0.12.py` without `-i`) runs full analysis upfront.
+
+---
+
+# RAG — Reference Your Library
+
+Index your cybersecurity PDF books and a local HackTricks clone so LLM analysis includes cited references.
+
+### Setup
+
+```bash
+pip install pypdf
+ollama pull nomic-embed-text
+
+# Drop PDFs into docs/
+cp ~/books/RTFM.pdf docs/
+cp ~/books/PNPT-notes.pdf docs/
+
+# Clone HackTricks
+cd docs/
+git clone https://github.com/HackTricks-wiki/hacktricks
+cd ..
+
+# Build the index
+python mAIpper-v0.12.py --build-index
+```
+
+Or in interactive mode, mAIpper detects unindexed docs and prompts:
+```
+[*] RAG: Found 15 PDFs, 2000 HackTricks pages not yet indexed.
+    Build index now in background? (y/n): y
+[*] RAG: Building index in background — you can work while it runs.
+```
+
+### How It Works
+
+- Index builds once, saves to `.maipper_rag_index.json` (survives vault rebuilds)
+- Checkpoints every 200 chunks — Ctrl+C preserves progress
+- At analysis time: embeds the query, finds relevant chunks, injects as `[REF: source]` context
+- LLM cites references: `[REF: RTFM p.142]`, `[REF: HackTricks/windows/privilege-escalation/juicy-potato]`
+- Check progress anytime with `/rag`
+
+### Config
+
+```ini
+[rag]
+docs_dir = docs
+hacktricks_dir = docs/hacktricks
+embedding_model = nomic-embed-text
+max_chunks = 5
+auto_build = true
+```
+
+---
+
+# Eat Me Page
+
+`Eat Me.md` is a drop zone at the vault root. Paste anything — arp tables, tool output, host lists, credentials, bare usernames — and on next run:
+
+1. IPs, hostnames, credentials, and **standalone usernames** extracted by Python
+2. **Credentials and potential usernames written immediately to `Loot/Credentials.md`** — no separate loot pipeline needed
+3. New host notes created with ready-to-run nmap scan commands
+4. Content archived to `Scans/` with tool detection, `## Credentials Found`, `## Potential Usernames`, and a `- [ ] Analyze: Misc` checkbox
+5. Campaign Targets updated
+6. Eat Me page reset for next use
+
+---
+
+# Credentials & Users
+
+`Loot/Credentials.md` has separate columns for Username, Password, Hash, Hash Type, Source, and Notes.
+
+- Inline notes stripped from passwords (e.g., `password - (db only)` → password + note)
+- Standalone usernames extracted from context blocks in loot files **and from Eat Me pastes**
+- Hash types auto-identified (NTLM, SHA-256, SHA-512, bcrypt, etc.)
+- Per-credential Notes column preserved across re-runs
+- Content-based host association — mentions of hostnames in loot files associate creds with hosts
+- **Eat Me direct write** — paste a username list or credential dump into Eat Me and it's immediately appended to `Loot/Credentials.md` (Campaign-Level section); bare usernames marked `(potential)`
+- Confirmed access annotations (`- [x] Confirmed on 10.10.10.5`) create green edges in Users Canvas
+
+**Users Canvas** visualizes credential → host relationships grouped by source host.
 
 ---
 
 # Loot Workflow
 
-During an engagement, drop collected evidence into `scans/loot/`:
-
 ```bash
-# Associate loot with a specific host using subdirectories
-mkdir -p scans/loot/10.10.10.5
-echo "admin:P@ssw0rd" > scans/loot/10.10.10.5/ftp_creds.txt
+# Host-associated (subdirectory or filename prefix)
+echo "admin:P@ssw0rd" > scans/loot/10.10.10.5/creds.txt
 
-# Or use filename prefix
-echo "root:toor" > scans/loot/10.10.10.5_ssh_creds.txt
-
-# Campaign-wide loot (not host-specific)
-hashcat -m 1000 hashes.txt rockyou.txt --show > scans/loot/cracked_hashes.txt
-```
-
-mAIpper will:
-- Parse credentials (`user:pass`) and hashes (NTLM, bcrypt, SHA-256, SAM format)
-- Extract file listings (FTP/SMB style)
-- Write centralized `Loot/Credentials.md` and `Loot/Hashes.md` with per-host tables
-- Add lightweight loot summaries to host notes with links to Loot pages
-- Update Priority Targets ranking (hosts with confirmed creds rank highest)
-
----
-
-# Misc Tool Output
-
-Drop raw text output from any tool into `scans/misc/`:
-
-```bash
 # Campaign-wide
-cp linpeas_output.txt scans/misc/
-
-# Host-associated (by subdirectory)
-mkdir -p scans/misc/10.10.10.5
-cp gobuster_results.txt scans/misc/10.10.10.5/
+hashcat -m 1000 hashes.txt rockyou.txt --show > scans/loot/cracked.txt
 ```
 
-mAIpper sends each file to the LLM for interpretation, identifying the tool, extracting findings, and suggesting follow-up commands. Results go to `Scans/<filename> - Misc.md`.
+mAIpper parses credentials, hashes, file listings, and standalone usernames. Content-based host association resolves hosts from prose mentions ("verified creds for the server DANTE-WEB-NIX01").
 
 ---
 
-# Deep Dive Checkboxes
+# Campaign Targets
 
-Host notes include investigation checkboxes next to ports and findings:
+`Hosts/_Campaign Targets.md` — auto-generated, copy-paste-ready:
 
-```markdown
-## Open Ports
-- **tcp/445** — SMB microsoft-ds Windows 10 Pro
-  - [ ] Investigate: MICROSOFT-DS (tcp/445)
-- **tcp/80** — HTTP Apache httpd 2.4.49
-  - [ ] Investigate: HTTP (tcp/80)
-```
-
-Check a box in Obsidian, run mAIpper again (or press Enter in `-i` mode), and a detailed deep-dive analysis appears as a collapsible callout:
-
-```markdown
-  - [x] Investigate: HTTP (tcp/80) ✓ analyzed
-
-## Deep Dives
-> [!info]- Deep Dive: HTTP (tcp/80)
-> **Attack Surface Analysis:** ...
-> **Enumeration Commands:** ...
-```
+- **IPs** — all discovered, sorted numerically
+- **Subnets** — all /24s seen
+- **Hostnames** — from host note frontmatter only (no noise)
+- **/etc/hosts** — tab-separated IP→hostname entries
 
 ---
 
-# Operator Notes Feedback
+# Hallucination Mitigation
 
-Add manual observations to any host note's `## Operator Notes` section:
-
-```markdown
-## Operator Notes
-Confirmed anonymous FTP access - pulled employee list with 50+ usernames.
-SMB null session worked - enumerated domain users and password policy.
-```
-
-On the next mAIpper run, these notes are fed into the AI as `[OPERATOR]` context, improving analysis accuracy and attack path suggestions.
+1. **Python pre-processing** — structured fact extraction before LLM sees raw data
+2. **Prompt grounding rules** — `[CONFIRMED]`/`[INFERRED]`/`[ASSUMED]` tagging required
+3. **Low temperature** — default 0.15 for deterministic output
+4. **Post-processing validation** — cross-references CVEs, IPs, ports against source data
+5. **RAG grounding** — references from your own library replace model hallucinations
 
 ---
 
@@ -277,136 +282,51 @@ On the next mAIpper run, these notes are fed into the AI as `[OPERATOR]` context
 
 | Option | Description |
 |--------|-------------|
-| `--init` | Initialize scan directory structure and exit |
-| `-i`, `--interactive` | Interactive mode: watch, chat, drop data |
-| `--watch-interval SEC` | Seconds between polls in interactive mode (default: 30) |
-| `--reanalyze` | Force re-analysis of all files (ignore state) |
-| `--scans-dir` | Directory containing scan results (default: `./scans`) |
-| `--xml` | Process a single Nmap XML file |
-| `--vault` | Obsidian vault output directory (default: `./Obsidian`) |
-| `--model` | Ollama model to use |
-| `--ollama-url` | URL of Ollama API (default: `http://localhost:11434`) |
-| `--no-ollama` | Skip AI analysis |
+| `--init` | Initialize directory structure and exit |
+| `-i`, `--interactive` | Interactive mode (fast start, on-demand analysis) |
+| `--build-index` | Build or update RAG index and exit |
+| `--no-rag` | Disable RAG context injection |
+| `--rag-docs-dir DIR` | PDF reference books directory (default: `docs`) |
+| `--rag-hacktricks-dir DIR` | HackTricks markdown clone directory |
+| `--rag-embedding-model` | Embedding model (default: `nomic-embed-text`) |
+| `--reanalyze` | Force re-analysis of all files |
+| `--no-ollama` | Skip all AI analysis |
 | `--no-canvas` | Skip canvas generation |
-| `--no-nessus` | Skip Nessus processing |
-| `--no-burp` | Skip Burp Suite processing |
-| `--autorecon DIR` | AutoRecon results directory |
-| `--no-autorecon` | Skip AutoRecon processing |
-| `--loot DIR` | Loot directory |
-| `--no-loot` | Skip loot processing |
-| `--misc DIR` | Misc tool output directory |
-| `--no-misc` | Skip misc processing |
-| `--excel` | Generate Export.xlsx (requires openpyxl) |
-| `--temperature` | Ollama sampling temperature (default: 0.15) |
-| `--skip-validation` | Skip hallucination checks |
-| `--canvas-cols` | Host cards per row in canvas (default: 2) |
-| `--canvas-groups-per-row` | Subnet groups per row (default: 3) |
-| `-v` | Increase verbosity (INFO) |
-| `-vv` | Debug logging |
-
----
-
-# Example Commands
-
-Process all scans with defaults:
-
-```bash
-python mAIpper-v0.10.py
-```
-
-Initialize and start interactive mode:
-
-```bash
-python mAIpper-v0.10.py --init
-python mAIpper-v0.10.py -i
-```
-
-Process with explicit directories:
-
-```bash
-python mAIpper-v0.10.py --autorecon ~/autorecon_results --loot ~/engagement_loot --misc ~/tool_output
-```
-
-Skip AI, just parse and generate notes:
-
-```bash
-python mAIpper-v0.10.py --no-ollama
-```
-
-Full export with Excel:
-
-```bash
-python mAIpper-v0.10.py --excel
-```
-
-Use a remote Ollama server:
-
-```bash
-python mAIpper-v0.10.py --ollama-url http://10.10.10.5:11434
-```
+| `--no-users-canvas` | Skip Users Canvas |
+| `--excel` | Generate Export.xlsx |
+| `--temperature` | Sampling temperature (default: 0.15) |
+| `-v` / `-vv` | INFO / DEBUG logging |
 
 ---
 
 # Workflow Example
 
-Typical workflow during an engagement:
-
-1. Initialize and start interactive mode
-
 ```bash
-python mAIpper-v0.10.py -i
-```
+# 1. Initialize
+python mAIpper-v0.12.py --init
 
-2. Run scans (in another terminal)
+# 2. Set up RAG (optional)
+pip install pypdf
+ollama pull nomic-embed-text
+# Drop PDFs into docs/, clone HackTricks into docs/hacktricks
+python mAIpper-v0.12.py --build-index
 
-```bash
+# 3. Start interactive mode
+python mAIpper-v0.12.py -i
+
+# 4. Run scans in another terminal
 nmap -sC -sV -oX scans/nmap/internal.xml 10.10.10.0/24
-autorecon 10.10.10.5 -o scans/autorecon
+
+# 5. mAIpper auto-detects new files and generates vault
+#    Open Obsidian and browse findings
+
+# 6. Check investigation boxes on interesting ports/findings
+#    Run /analyze to get detailed analysis with RAG references
+
+# 7. Paste arp tables or tool output into Eat Me.md
+#    Press Enter — new hosts created with scan commands
+
+# 8. Add operator notes as you work — they feed into future analysis
 ```
-
-3. mAIpper automatically picks up new files and generates vault
-
-4. Open Obsidian and review findings — check investigation boxes for deep dives
-
-5. Add operator notes to host files as you work
-
-6. Collect loot during exploitation
-
-```bash
-echo "admin:CompanyPass123" > scans/loot/10.10.10.5/ftp_creds.txt
-```
-
-7. Drop misc tool output
-
-```bash
-cp linpeas.txt scans/misc/10.10.10.5/
-```
-
-8. Press Enter in interactive mode — mAIpper processes changes and deep dives
-
----
-
-# Hallucination Mitigation
-
-mAIpper uses a four-layer approach to ensure AI accuracy:
-
-1. **Python pre-processing** — structured fact extraction before the LLM sees raw data
-2. **Prompt grounding rules** — `[CONFIRMED]`/`[INFERRED]`/`[ASSUMED]` tagging required
-3. **Low temperature** — default 0.15 for deterministic output
-4. **Post-processing validation** — cross-references CVEs, IPs, ports, and hostnames against source data
-
----
-
-# Why mAIpper?
-
-Pentesters accumulate large amounts of scan output across many tools. mAIpper helps by:
-
-- Organizing results automatically across Nmap, Nessus, Burp, AutoRecon, loot, and misc tool output
-- Suggesting relevant enumeration techniques with ready-to-run commands
-- Building a persistent knowledge base with human-in-the-loop AI refinement
-- Enabling deep-dive analysis on demand via checkbox-driven investigation
-- Visualizing discovered assets in an Obsidian Canvas
-- Prioritizing targets based on confirmed vulnerabilities and collected evidence
-- Watching for new scan files and auto-processing in the background
 
 ---

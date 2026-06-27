@@ -6,6 +6,15 @@ scans/
 Obsidian/
 *.canvas
 
+# RAG index — large file, machine-specific
+.maipper_rag_index.db
+.maipper_rag_index.db-wal
+.maipper_rag_index.db-shm
+.maipper_rag_index.json
+
+# RAG reference docs — operator's own library
+docs/
+
 # Python
 __pycache__/
 *.py[cod]
