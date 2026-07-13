@@ -202,7 +202,8 @@ nxc_workspace = ~/.nxc/workspaces/default
 ```
 SMB   10.10.10.5  445  DC01  [+] CORP\administrator:Password123 (Pwn3d!)
 SMB   10.10.10.5  445  DC01  [*] Windows Server 2019 (name:DC01) (domain:CORP) (signing:True) (SMBv1:False)
-SMB   10.10.10.5  445  DC01  [*] .snappea             READ,WRITE
+SMB   10.10.10.5  445  DC01  [*] SYSVOL              READ
+SMB   10.10.10.5  445  DC01  [*] NETLOGON            READ
 ```
 
 mAIpper auto-detects NXC output and parses host flags (signing, SMBv1, ZeroLogon, PetitPotam), share enumeration, credentials, and admin access markers. Guest sessions are flagged as null sessions — not added to credentials.
