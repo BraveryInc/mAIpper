@@ -73,7 +73,7 @@ model = qwen2.5:32b-instruct-q5_K_M
 
 ```bash
 # Or per-run
-python mAIpper-v0.13.py --ollama-url http://<server-ip>:11434 --model qwen2.5:32b-instruct-q5_K_M
+python mAIpper.py --ollama-url http://<server-ip>:11434 --model qwen2.5:32b-instruct-q5_K_M
 ```
 
 The vault stays local per operator per engagement. Only the LLM calls go to the remote server.
@@ -95,15 +95,15 @@ Larger models produce noticeably better analysis, especially for cross-source co
 
 ```bash
 # 1. Initialize the directory structure and config file
-python mAIpper-v0.13.py --init
+python mAIpper.py --init
 
 # 2. Drop scan files into the appropriate folders (see Scan Inputs below)
 
 # 3a. Interactive mode — fast start, analyze on demand (recommended)
-python mAIpper-v0.13.py -i
+python mAIpper.py -i
 
 # 3b. Batch mode — parse everything and run LLM analysis upfront
-python mAIpper-v0.13.py
+python mAIpper.py
 
 # 4. Open the vault in Obsidian: File → Open Vault → select the Obsidian/ directory
 ```
@@ -150,7 +150,7 @@ scans/
 ## Interactive Mode
 
 ```bash
-python mAIpper-v0.13.py -i
+python mAIpper.py -i
 ```
 
 Starts immediately with no LLM calls — all parsing, host notes, and canvases are built from scan data in seconds. LLM analysis is triggered explicitly.
@@ -190,7 +190,7 @@ mAIpper imports NXC data from two sources, with DB data winning on conflicts.
 # Auto-discovered if smb.db is dropped into scans/nxc/
 
 # Or point at the live workspace
-python mAIpper-v0.13.py --nxc-workspace ~/.nxc/workspaces/default
+python mAIpper.py --nxc-workspace ~/.nxc/workspaces/default
 
 # Or set permanently in maipper.conf:
 [nxc]
@@ -252,7 +252,7 @@ auto_build = true
 ## Key Flags
 
 ```
-python mAIpper-v0.13.py [flags]
+python mAIpper.py [flags]
 
   --init                  Create scan directory structure and config file
   -i, --interactive       Interactive mode (fast start, on-demand analysis)
@@ -340,7 +340,7 @@ ollama pull nomic-embed-text
 git clone https://github.com/HackTricks-wiki/hacktricks docs/hacktricks
 
 # Build the index
-python mAIpper-v0.13.py --build-index
+python mAIpper.py --build-index
 ```
 
 The index saves to `.maipper_rag_index.db` (SQLite) in the working directory and survives vault rebuilds. Only re-embeds changed files on subsequent builds.

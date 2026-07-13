@@ -4,7 +4,7 @@ This file provides guidance when working with code in this repository.
 
 ## What This Is
 
-**mAIpper** is a single-file Python CLI tool (`mAIpper-v0.13.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
+**mAIpper** is a single-file Python CLI tool (`mAIpper.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
 
 Supported input formats:
 - **Nmap XML** (`scans/nmap/*.xml`)
@@ -19,14 +19,14 @@ Supported input formats:
 
 ```bash
 # Basic usage — processes all scan files with full LLM analysis
-python mAIpper-v0.13.py
+python mAIpper.py
 
 # Initialize scan directory structure + config file
-python mAIpper-v0.13.py --init
+python mAIpper.py --init
 
 # Interactive mode — fast start (no LLM), analyze on demand
-python mAIpper-v0.13.py -i
-python mAIpper-v0.13.py -i --watch-interval 60
+python mAIpper.py -i
+python mAIpper.py -i --watch-interval 60
 # Then in interactive mode:
 #   /analyze       — process checked [x] investigation/analysis boxes
 #   /analyze-full  — check all boxes then analyze everything
@@ -34,30 +34,30 @@ python mAIpper-v0.13.py -i --watch-interval 60
 #   /merge         — merge duplicate host notes (IP note + hostname note)
 
 # Single Nmap file
-python mAIpper-v0.13.py --xml scans/nmap/internal.xml
+python mAIpper.py --xml scans/nmap/internal.xml
 
 # Skip AI, skip canvas, custom vault output dir
-python mAIpper-v0.13.py --no-ollama --no-canvas --vault MyNotes
+python mAIpper.py --no-ollama --no-canvas --vault MyNotes
 
 # Skip specific parsers
-python mAIpper-v0.13.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
+python mAIpper.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
 
 # Remote Ollama instance, different model
-python mAIpper-v0.13.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
+python mAIpper.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
 
 # Export to Excel (requires openpyxl)
-python mAIpper-v0.13.py --excel
+python mAIpper.py --excel
 
 # Force re-analysis of all files (ignore incremental state)
-python mAIpper-v0.13.py --reanalyze
+python mAIpper.py --reanalyze
 
 # Hallucination mitigation tuning
-python mAIpper-v0.13.py --temperature 0.1    # lower = less creative (default: 0.15)
-python mAIpper-v0.13.py --skip-validation    # bypass post-processing validator
+python mAIpper.py --temperature 0.1    # lower = less creative (default: 0.15)
+python mAIpper.py --skip-validation    # bypass post-processing validator
 
 # Verbose / debug logging
-python mAIpper-v0.13.py -v      # INFO
-python mAIpper-v0.13.py -vv     # DEBUG
+python mAIpper.py -v      # INFO
+python mAIpper.py -vv     # DEBUG
 ```
 
 Dependencies beyond stdlib:
@@ -80,7 +80,7 @@ Set `interactive = true` in `[interactive]` to start in interactive mode by defa
 
 ## Architecture
 
-Everything lives in `mAIpper-v0.13.py`. The flow is linear:
+Everything lives in `mAIpper.py`. The flow is linear:
 
 1. **`main`** — loads config, parses args, handles `--init` and `-i` interactive mode, dispatches to `_run_processing`
 2. **`_run_processing`** — loads operator notes, resolves scan files across all parsers, skips unchanged files (incremental state), collects `scan_host_map` and `all_analyses`, processes deep dives, calls vault writers and canvas builder, optionally exports Excel
@@ -221,7 +221,7 @@ Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per
 
 **`/analyze-full`** — marks every unchecked `[ ]` box across all host notes and scan notes as `[x]`, then runs the full analysis pass. Equivalent to checking everything manually and running `/analyze`.
 
-**Batch mode** (`python mAIpper-v0.13.py` without `-i`) runs full analysis upfront as before. Checkboxes appear pre-set to `[/]`.
+**Batch mode** (`python mAIpper.py` without `-i`) runs full analysis upfront as before. Checkboxes appear pre-set to `[/]`.
 
 CSS snippet auto-installed in `.obsidian/` for yellow `[x]` and green `[/]` highlighting.
 
@@ -289,7 +289,7 @@ Nessus and AutoRecon use **two-pass analysis**: Pass 1 extracts facts, Pass 2 an
 - Obsidian internal links use `[[Hosts/<stem>|display]]` syntax — no `.md` extension.
 - Canvas file node paths are relative to the vault root, forward slashes only.
 - Ollama called with `stream: false`; response in `response.json()["response"]`.
-- **Versioning**: copy the file and increment the version number for each new version.
+- **Versioning**: the file is `mAIpper.py` (no version suffix). Increment the version string in the module docstring header, then create a git tag (`git tag vX.Y && git push origin vX.Y`).
 - Host association (loot and misc): subdirectory name > filename IP prefix > filename FQDN prefix > campaign-level.
 - `--init` creates all scan subdirectories + `maipper.conf`; partial directories auto-completed on every run.
 

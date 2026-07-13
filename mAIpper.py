@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.12 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.13 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.12:
+  - PlexTrac integration: auto-generates Findings/ notes from Nessus
+    (medium+) and Burp (medium+) scan data; one note per unique finding;
+    affected_assets accumulates across hosts; operator can edit all fields
+  - Findings/_Template.md: copy in Obsidian to create manual findings
+  - export_plextrac(): reads all Findings/*.md and writes
+    Findings/PlexTrac Export.csv matching PlexTrac CSV import format
+  - --plextrac flag: generate CSV at end of batch run
+  - --no-findings flag: skip auto-generation of finding notes from scanners
+  - /plextrac interactive command: export CSV on demand
 
 Changes from v0.11:
   - RAG (Retrieval Augmented Generation): index your PDF security books
@@ -24,7 +35,7 @@ Changes from v0.10:
     linpeas, etc.) from filename and content signatures; scales LLM effort
     to content value — real tool output gets full analysis, random notes
     get minimal treatment (key facts only, no deep analysis)
-  - Eat Me page: vault-root drop zone where assessors paste anything
+  - Injestor page: vault-root drop zone where assessors paste anything
     (arp tables, host lists, tool output, notes); processed on next run
     into host notes with next-step scan commands; archived to timestamped
     scan note; page resets for next use; works in batch and interactive
@@ -32,7 +43,7 @@ Changes from v0.10:
     copy-paste-ready lists of IPs, subnets, hostnames, and domains in
     fenced code blocks; extracts from all vault data + loot + misc sources
   - Vault change detection in interactive mode: watches host notes,
-    Eat Me, and Credentials.md for operator edits; auto-triggers deep
+    Injestor, and Credentials.md for operator edits; auto-triggers deep
     dives, operator notes reload, Users Canvas rebuild, and Campaign
     Targets update when vault files change in Obsidian
   - --no-users-canvas flag to skip Users Canvas generation
@@ -58,7 +69,7 @@ Changes from v0.9:
     filename prefix
   - Deep dive checkboxes: Investigate checkboxes next to ports, Nessus
     findings, and Burp issues; check a box, next run generates detailed
-    analysis in a collapsible callout under ## Deep Dives
+    analysis in a collapsible callout under ## Analysis
 
 Changes from v0.8:
   - Loot ingestion: assessors drop text files into scans/loot/ (or
@@ -119,6 +130,8 @@ Author: Zachary Levine
 from __future__ import annotations
 
 import argparse
+import collections
+import concurrent.futures
 import configparser
 import datetime as dt
 import hashlib
@@ -186,6 +199,28 @@ HASHCAT_FORMAT_RE = re.compile(r"^([^\s:]{1,64}):([a-fA-F0-9]{32,128}|\$\S+)$", 
 NTLM_HASH_RE     = re.compile(r"\b[a-fA-F0-9]{32}\b")
 BCRYPT_HASH_RE   = re.compile(r"\$2[aby]?\$\d{1,2}\$[./A-Za-z0-9]{53}")
 SHA256_HASH_RE   = re.compile(r"\b[a-fA-F0-9]{64}\b")
+
+# Credential host-context regexes (Injestor parsing)
+_HOST_CRED_BLOCK_RE = re.compile(
+    r"^(?:cred(?:ential)?s?\s+(?:for|on|from)|accounts?\s+(?:for|on))\s*[:\-]?\s*"
+    r"([a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253})\s*:?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CRED_WITH_HOST_INLINE_RE = re.compile(
+    r"^([^\s:/]{1,64}):([^\s]{1,128})\s+(?:on|for|→|->|@)\s+"
+    r"([a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253})\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# "username is frank", "user: frank" (inline, same line as context keyword)
+_INLINE_USERNAME_RE = re.compile(
+    r"(?:user(?:name)?|account|login)\s+(?:is\s+|:\s*)['\"]?(\w[\w.\-]{1,63})['\"]?",
+    re.IGNORECASE,
+)
+# Host identifier — IP or simple hostname/FQDN (used to validate Markdown headers as host sections)
+_HOST_IDENTIFIER_RE = re.compile(
+    r"^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9][a-zA-Z0-9.\-_]{1,253})$"
+)
 FTP_LISTING_RE   = re.compile(
     r"^([d\-rwxsStT]{10})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+"
     r"(\w+\s+\d+\s+[\d:]+)\s+(.+)$",
@@ -221,8 +256,8 @@ NESSUS_SEVERITY_CANVAS_COLORS: dict[int, str] = {
 OPERATOR_NOTES_SENTINEL = "## Operator Notes"
 OPERATOR_NOTES_HINT = "_Add your own findings, observations, and next steps below._"
 
-DEEP_DIVE_SECTION = "## Deep Dives"
-CROSS_SOURCE_SECTION = "## Cross-Source Analysis"
+DEEP_DIVE_SECTION = "## Analysis"        # per-port/finding level callouts
+CROSS_SOURCE_SECTION = "## Deep Dive"   # per-host synthesis from /deepdive
 DEEP_DIVE_CHECKBOX_RE = re.compile(
     r"^\s*- \[( |x|/)\] Investigate: (.+)$", re.MULTILINE
 )
@@ -232,6 +267,13 @@ ANALYZE_PENDING_RE = re.compile(
 DEEP_DIVE_PENDING_RE = re.compile(
     r"^\s*- \[x\] Investigate: (.+)$", re.MULTILINE
 )
+
+# Pending credential review — scan archive notes prefixed with [REVIEW]
+REVIEW_FILENAME_PREFIX = "[REVIEW] "
+REVIEW_CHECKBOX        = "- [ ] Review: Credentials"
+REVIEW_CHECKBOX_DONE   = "- [/] Review: Credentials"
+REVIEW_PENDING_RE      = re.compile(r"^\s*- \[x\] (.+)$", re.MULTILINE)  # checked rows in ## Pending Review
+REVIEW_SECTION         = "## Pending Review"
 
 # RAG constants
 RAG_INDEX_DB_FILENAME = ".maipper_rag_index.db"
@@ -249,13 +291,61 @@ _RAG_BUILDER = None  # _RagIndexBuilder | None
 _RAG_OLLAMA_URL: str = ""
 _RAG_EMBEDDING_MODEL: str = RAG_DEFAULT_EMBEDDING_MODEL
 
+# NXC (NetExec) stdout parsing regexes
+NXC_STATUS_LINE_RE = re.compile(
+    r"^(SMB|LDAP|WINRM|SSH|MSSQL|RDP|FTP|VNC|WMI|NFS)\s+"
+    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d+)\s+(\S+)\s+\[([*+\-])\]\s*(.*)",
+    re.IGNORECASE,
+)
+NXC_DATA_LINE_RE = re.compile(
+    r"^(SMB|LDAP|WINRM|SSH|MSSQL|RDP|FTP|VNC|WMI|NFS)\s+"
+    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d+)\s+(\S+)\s+(.*)",
+    re.IGNORECASE,
+)
+
+# Kiwi / secretsdump / mimikatz fast-path detection
+
+# Format 1: secretsdump / hashdump SAM line  Administrator:500:LMhash:NTLMhash:::
+SAM_DUMP_LINE_RE = re.compile(
+    r"^[^\s:]+:\d+:[a-fA-F0-9]{32}:[a-fA-F0-9]{32}:::\s*$",
+    re.MULTILINE,
+)
+# Format 2: kiwi sekurlsa::logonpasswords blocks  "         * Username : admin"
+KIWI_FIELD_RE = re.compile(
+    r"^\s*\*\s+(?:Username|NTLM|SHA1|Password)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Format 3: kiwi lsa_dump_sam / meterpreter  "  Hash NTLM: <32hex>"
+KIWI_HASH_LINE_RE = re.compile(
+    r"^\s+Hash NTLM:\s*[a-fA-F0-9]{32}",
+    re.MULTILINE,
+)
+# Shared header patterns across all kiwi/mimikatz formats
+MIMIKATZ_HEADER_RE = re.compile(
+    r"mimikatz|sekurlsa|lsadump|Authentication Id\s*:|kiwi|Dumping SAM|SysKey\s*:",
+    re.IGNORECASE,
+)
+
 # Canonical section order in host notes
+# Active system prompt — set by _load_assessment_config at startup.
+# ollama_chat reads this automatically so every LLM call gets it without
+# any caller needing to pass it explicitly.
+_active_system_prompt: str = ""
+_active_chat_persona:  str = ""   # used for interactive <question> prompts
+
+# Thread safety for parallel LLM calls
+_LLM_PRINT_LOCK = threading.Lock()
+_LLM_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_LLM_WRITE_LOCKS_MUTEX = threading.Lock()
+
 BODY_SECTION_ORDER = [
     "## Open Ports",
     "## Nessus Findings",
     "## Burp Suite Findings",
     "## AutoRecon Enumeration",
+    "## NXC Enumeration",
     "## Loot",
+    "## Access",
     DEEP_DIVE_SECTION,
     CROSS_SOURCE_SECTION,
     "## Scan References",
@@ -1500,6 +1590,19 @@ def _strip_password_note(pw: str) -> tuple[str, str]:
     return pw, ""
 
 
+def _classify_password(pw: str) -> str:
+    """Return cred_type string for a password/hash value."""
+    if NTLM_HASH_RE.fullmatch(pw):
+        return "NTLM_hash"
+    if BCRYPT_HASH_RE.match(pw):
+        return "bcrypt_hash"
+    if SHA256_HASH_RE.fullmatch(pw):
+        return "SHA256_hash"
+    if re.fullmatch(r"[a-fA-F0-9]{32,128}", pw):
+        return "hash"
+    return "cleartext"
+
+
 def _extract_credentials(text: str) -> list[dict]:
     """Extract credential pairs from loot text."""
     creds: list[dict] = []
@@ -1576,48 +1679,215 @@ def _extract_usernames(text: str, known_users: set[str] | None = None) -> list[s
 
     Handles:
     - key=value patterns: username=admin
-    - Bare names on their own lines after a context line mentioning 'users'/'usernames'
+    - "user is frank" / "username: frank" inline patterns
+    - Bare single-token lines after a context header mentioning users/usernames
+    - Comma-separated lists on the same context line: "Users: frank, john, sarah"
+
+    Deliberately conservative — only extracts when the format is unambiguous.
+    Does NOT split sentences into individual words to avoid false positives.
     """
     known = {u.lower() for u in (known_users or set())}
     usernames: list[str] = []
     seen: set[str] = set()
 
-    # Pattern 1: key=value
-    for m in _USERNAME_LINE_RE.finditer(text):
-        user = m.group(1).strip()
-        if user.lower() not in known and user.lower() not in seen:
-            if len(user) <= 64 and " " not in user and not user.startswith("/"):
-                seen.add(user.lower())
-                usernames.append(user)
+    _bad_starts = ("/", "#", "-", "*", "\\", "~")
+    # Extended skip list — common English words that appear in loot file prose
+    _skip_words = {
+        "the", "a", "an", "that", "this", "it", "is", "are", "was", "were",
+        "and", "or", "on", "in", "at", "to", "for", "of", "from", "with",
+        "found", "page", "web", "app", "about", "us", "these", "those",
+        "potential", "verified", "server", "host", "machine", "below", "above",
+        "following", "note", "notes", "only", "also", "just", "some", "all",
+        "any", "not", "no", "yes", "be", "by", "as", "if", "so", "up",
+        "have", "has", "had", "do", "did", "will", "would", "could", "should",
+        "may", "might", "can", "use", "used", "get", "set", "see", "via",
+    }
 
-    # Pattern 2: bare names after context lines
+    def _looks_like_username(w: str) -> bool:
+        """True only if the token could plausibly be a username."""
+        w = w.strip("'\",;.()")
+        if not w or len(w) < 2 or len(w) > 64:
+            return False
+        if " " in w:
+            return False
+        if w.startswith(_bad_starts):
+            return False
+        if ":" in w or "=" in w or "@" in w:
+            return False
+        if w.lower() in known or w.lower() in seen or w.lower() in _skip_words:
+            return False
+        if w.isdigit():
+            return False
+        # Reject bare common English words (all lowercase, no digits/specials)
+        # Allow things like "jsmith", "j.smith", "john_doe", "user01"
+        if w.isalpha() and w.lower() == w and len(w) <= 5 and w.lower() in _skip_words:
+            return False
+        return True
+
+    def _add(word: str) -> None:
+        w = word.strip("'\",;.()")
+        if _looks_like_username(w):
+            seen.add(w.lower())
+            usernames.append(w)
+
+    # Pattern 1: key=value  (username=frank)
+    for m in _USERNAME_LINE_RE.finditer(text):
+        _add(m.group(1))
+
+    # Pattern 2: "user is frank" / "username: frank" inline
+    for m in _INLINE_USERNAME_RE.finditer(text):
+        _add(m.group(1))
+
+    # Pattern 3: single-token lines after a context header
+    # Rules:
+    #   - Context line must contain a username keyword AND end with ":" or have
+    #     only comma-separated names after the keyword (not a prose sentence)
+    #   - In-block lines must be a SINGLE token or a comma/"and"-separated list
+    #     of tokens. A line with multiple space-separated words is prose → exits block.
     lines = text.splitlines()
     in_username_block = False
     for line in lines:
         stripped = line.strip()
-        if not stripped:
-            if in_username_block:
-                in_username_block = False
-            continue
 
-        if ":" in stripped:
+        if not stripped:
+            # Blank line ends the block
             in_username_block = False
             continue
 
-        if _USERNAME_CONTEXT_RE.search(stripped) and len(stripped) > 10:
-            in_username_block = True
+        # A line with a colon that isn't a list-style entry exits the block
+        if ":" in stripped and not stripped.startswith("-"):
+            in_username_block = False
+
+            # But check: "Usernames: frank, john" — colon followed by names on same line
+            if _USERNAME_CONTEXT_RE.search(stripped):
+                colon_idx = stripped.index(":")
+                after_colon = stripped[colon_idx + 1:].strip()
+                if after_colon:
+                    # Split on commas/and only — never on bare spaces
+                    for tok in re.split(r"\s*,\s*|\s+and\s+", after_colon):
+                        tok = tok.strip()
+                        if tok and " " not in tok:
+                            _add(tok)
+                else:
+                    # "Usernames:" with nothing after — start block
+                    in_username_block = True
+            continue
+
+        if _USERNAME_CONTEXT_RE.search(stripped):
+            # Context line without a colon — check if the rest is a comma list
+            after_keyword = _USERNAME_CONTEXT_RE.sub("", stripped, count=1).strip()
+            after_keyword = after_keyword.lstrip(":").strip()
+
+            if not after_keyword:
+                # Just the keyword alone — start block for next lines
+                in_username_block = True
+            elif "," in after_keyword or re.search(r"\s+and\s+", after_keyword):
+                # Comma/and list on the same line — extract, start block
+                for tok in re.split(r"\s*,\s*|\s+and\s+", after_keyword):
+                    tok = tok.strip()
+                    if tok and " " not in tok:
+                        _add(tok)
+                in_username_block = True
+            else:
+                # Prose sentence after the keyword — don't extract from this line,
+                # but DO enter block mode so bare single-token lines below are captured
+                in_username_block = True
             continue
 
         if in_username_block:
-            word = stripped.split()[0] if stripped.split() else ""
-            if (word and len(word) <= 32 and len(stripped.split()) <= 2
-                    and word.lower() not in known and word.lower() not in seen
-                    and not word.startswith(("/", "#", "-", "*"))
-                    and ":" not in word and "=" not in word):
-                seen.add(word.lower())
-                usernames.append(word)
+            # Accept only lines that are a single token or comma/and-separated list
+            # A line with bare spaces between words is prose → exit block
+            if "," in stripped or re.search(r"\s+and\s+", stripped):
+                # Comma/and list
+                for tok in re.split(r"\s*,\s*|\s+and\s+", stripped):
+                    tok = tok.strip()
+                    if tok and " " not in tok:
+                        _add(tok)
+            elif " " not in stripped:
+                # Single bare token — exactly what we want
+                _add(stripped)
+            else:
+                # Multi-word line with no comma/and separator — it's prose, exit block
+                in_username_block = False
 
-    return usernames[:50]
+    return usernames[:100]
+
+
+def _parse_injestor_creds_with_host(text: str) -> list[dict]:
+    """Parse credentials from Injestor content with host context detection.
+
+    Supports:
+      ## <hostname/ip>          — Markdown header sets host for following creds
+      creds for <host>:         — block header sets host
+      user:pass on <host>       — inline host annotation
+      user:pass                 — uses current host context (or None = Campaign-Level)
+    """
+    creds: list[dict] = []
+    seen: set[tuple] = set()
+    current_host: str | None = None
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        i += 1
+
+        if not stripped or stripped.startswith("#!"):
+            continue
+
+        # Markdown section header → set host context if it looks like a host
+        if stripped.startswith("## "):
+            header = stripped[3:].strip()
+            if (header and not header.startswith("Campaign")
+                    and _HOST_IDENTIFIER_RE.match(header)):
+                current_host = header
+            else:
+                current_host = None
+            continue
+
+        # "creds for server2:" block header
+        m = _HOST_CRED_BLOCK_RE.match(stripped)
+        if m:
+            current_host = m.group(1)
+            continue
+
+        # "user:pass on server2" inline host
+        m = _CRED_WITH_HOST_INLINE_RE.match(stripped)
+        if m:
+            user, pw_raw, host = m.group(1), m.group(2), m.group(3)
+            pw, note = _strip_password_note(pw_raw)
+            if pw and user and not user.startswith("/") and "://" not in stripped:
+                key = (user.lower(), pw, host.lower())
+                if key not in seen:
+                    seen.add(key)
+                    creds.append({
+                        "username": user, "password": pw,
+                        "cred_type": _classify_password(pw),
+                        "host": host, "notes": note,
+                        "source_pattern": "inline_host",
+                    })
+            continue
+
+        # Regular user:pass — use current_host
+        if ":" in stripped and "://" not in stripped and not stripped.startswith("#"):
+            parts = stripped.split(":", 1)
+            user, pw_raw = parts[0].strip(), parts[1].strip()
+            if (user and pw_raw and len(user) <= 64 and len(pw_raw) <= 128
+                    and " " not in user and not user.startswith("/")
+                    and not (all(c in "0123456789abcdefABCDEF" for c in user) and len(user) > 20)):
+                pw, note = _strip_password_note(pw_raw)
+                if pw:
+                    key = (user.lower(), pw, (current_host or "").lower())
+                    if key not in seen:
+                        seen.add(key)
+                        creds.append({
+                            "username": user, "password": pw,
+                            "cred_type": _classify_password(pw),
+                            "host": current_host, "notes": note,
+                            "source_pattern": "colon",
+                        })
+
+    return creds
 
 
 def _extract_hashes(text: str) -> list[dict]:
@@ -2025,6 +2295,440 @@ def parse_misc_dir(misc_dir: Path, known_hosts: dict[str, str] | None = None) ->
         f"tools={tool_breakdown}"
     )
     return misc_data
+
+
+# ============================================================
+# NXC (NetExec) parser
+# ============================================================
+
+def _nxc_empty_host(ip: str, hostname: str, protocol: str) -> dict:
+    return {
+        "ip": ip, "hostname": hostname, "domain": "", "os": "",
+        "dc": False, "signing": None, "smbv1": None,
+        "zerologon": False, "petitpotam": False,
+        "null_session": False, "shares": [],
+        "protocol": protocol.lower(), "source": "stdout",
+    }
+
+
+def _nxc_parse_host_info(host: dict, message: str) -> None:
+    """Parse OS string and (key:value) attribute pairs from a NXC [*] host info line."""
+    os_m = re.match(r"^([^\(]+)", message)
+    if os_m:
+        host["os"] = os_m.group(1).strip()
+    for key, val in re.findall(r"\((\w[^:)]*):([^\)]*)\)", message):
+        key = key.strip().lower().replace(" ", "_")
+        val = val.strip()
+        if key == "name" and val and val != host["ip"]:
+            host["hostname"] = val
+        elif key == "domain":
+            host["domain"] = val
+        elif key == "signing":
+            host["signing"] = val.lower() == "true"
+        elif key == "smbv1":
+            host["smbv1"] = val.lower() == "true"
+        elif key == "null_auth":
+            if val.lower() == "true":
+                host["null_session"] = True
+
+
+def _nxc_parse_success(message: str, ip: str, protocol: str, creds: list, hosts: dict) -> None:
+    """Parse a NXC [+] success line. Guest sessions flagged on host, not added as credentials."""
+    result = ""
+    m = re.search(r"\(([^\)]+)\)\s*$", message)
+    if m:
+        result = m.group(1).strip()
+        cred_part = message[:m.start()].strip()
+    else:
+        cred_part = message.strip()
+
+    if result.lower() == "guest":
+        hosts[ip]["null_session"] = True
+        return
+
+    domain = ""
+    username = ""
+    password = ""
+    if "\\" in cred_part:
+        dom_user, _, password = cred_part.partition(":")
+        domain, _, username = dom_user.partition("\\")
+    else:
+        username, _, password = cred_part.partition(":")
+
+    username = username.strip()
+    password = password.strip()
+    if not username:
+        return
+
+    creds.append({
+        "username": username,
+        "password": password,
+        "domain": domain.strip(),
+        "cred_type": "plaintext",
+        "admin_on": [ip] if "pwn3d" in result.lower() else [],
+        "pillaged_from": None,
+        "protocol": protocol.lower(),
+        "source": "stdout",
+        "source_ip": ip,
+    })
+
+
+def _nxc_parse_share_row(content: str, host: dict) -> None:
+    """Parse one share table data row from NXC output."""
+    stripped = content.strip()
+    if not stripped or stripped.startswith("Share") or stripped.startswith("-----"):
+        return
+    parts = re.split(r"\s{2,}", stripped)
+    name = parts[0].strip()
+    if not name:
+        return
+    perms = parts[1].strip() if len(parts) > 1 else ""
+    remark = parts[2].strip() if len(parts) > 2 else ""
+    host["shares"].append({
+        "name": name,
+        "read": "READ" in perms.upper(),
+        "write": "WRITE" in perms.upper(),
+        "remark": remark,
+    })
+
+
+def parse_nxc_stdout(text: str) -> dict:
+    """Parse NetExec (nxc) console stdout into structured host and credential data.
+
+    Skips failed auth lines entirely. Guest sessions are flagged on the host but
+    not added as credentials. Handles interleaved multi-host output correctly.
+    """
+    hosts: dict[str, dict] = {}
+    creds: list[dict] = []
+    share_mode: set[str] = set()  # IPs currently emitting share table rows
+
+    for line in text.splitlines():
+        if "━" in line or "Running nxc" in line or "Running netexec" in line:
+            continue
+
+        m = NXC_STATUS_LINE_RE.match(line)
+        if m:
+            protocol, ip, _port, hostname, status, message = m.groups()
+            protocol = protocol.upper()
+            share_mode.discard(ip)
+
+            if ip not in hosts:
+                hosts[ip] = _nxc_empty_host(ip, hostname, protocol)
+            elif hostname and hostname != ip:
+                hosts[ip]["hostname"] = hostname
+
+            if status == "*":
+                if "Enumerated shares" in message:
+                    share_mode.add(ip)
+                elif any(k in message for k in ("Windows", "Unix", "Linux", "Server", "Build")):
+                    _nxc_parse_host_info(hosts[ip], message)
+            elif status == "+":
+                _nxc_parse_success(message, ip, protocol, creds, hosts)
+            # status "-": ignore failures entirely
+            continue
+
+        # Data line (no bracket) — share table rows interleaved with other hosts
+        m2 = NXC_DATA_LINE_RE.match(line)
+        if m2:
+            _proto, ip, _port, _host, content = m2.groups()
+            if ip in share_mode and ip in hosts:
+                _nxc_parse_share_row(content, hosts[ip])
+
+    return {
+        "hosts": hosts,
+        "creds": creds,
+        "source": "stdout",
+        "parsed_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def parse_nxc_db(workspace_dir: Path) -> dict:
+    """Parse NXC per-protocol SQLite databases from a workspace directory.
+
+    Reads smb.db (richest — admin_relations, shares, vuln flags, DPAPI),
+    ldap.db (DC identification, enumerated usernames), and other protocol DBs.
+    """
+    hosts: dict[str, dict] = {}
+    creds: list[dict] = []
+
+    smb_db = workspace_dir / "smb.db"
+    if smb_db.exists() and smb_db.stat().st_size > 0:
+        _parse_nxc_smb_db(smb_db, hosts, creds)
+
+    ldap_db = workspace_dir / "ldap.db"
+    if ldap_db.exists() and ldap_db.stat().st_size > 0:
+        _parse_nxc_ldap_db(ldap_db, hosts, creds)
+
+    for proto in ("winrm", "ssh", "mssql", "rdp", "ftp"):
+        db = workspace_dir / f"{proto}.db"
+        if db.exists() and db.stat().st_size > 0:
+            _parse_nxc_generic_db(db, proto, hosts, creds)
+
+    return {
+        "hosts": hosts,
+        "creds": creds,
+        "source": "db",
+        "workspace_dir": str(workspace_dir),
+        "parsed_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _parse_nxc_smb_db(db_path: Path, hosts: dict, creds: list) -> None:
+    """Parse smb.db: hosts, users, admin_relations, shares, DPAPI secrets."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        host_id_map: dict[int, str] = {}
+        cur.execute(
+            "SELECT id, ip, hostname, domain, os, dc, smbv1, signing, zerologon, petitpotam FROM hosts"
+        )
+        for row in cur.fetchall():
+            ip = row["ip"]
+            if not ip:
+                continue
+            host_id_map[row["id"]] = ip
+            hosts[ip] = {
+                "ip": ip,
+                "hostname": row["hostname"] or "",
+                "domain": row["domain"] or "",
+                "os": row["os"] or "",
+                "dc": bool(row["dc"]),
+                "signing": (bool(row["signing"]) if row["signing"] is not None else None),
+                "smbv1": (bool(row["smbv1"]) if row["smbv1"] is not None else None),
+                "zerologon": bool(row["zerologon"]),
+                "petitpotam": bool(row["petitpotam"]),
+                "null_session": False,
+                "shares": [],
+                "protocol": "smb",
+                "source": "db",
+            }
+
+        admin_map: dict[int, list[str]] = {}
+        cur.execute("SELECT userid, hostid FROM admin_relations")
+        for row in cur.fetchall():
+            target_ip = host_id_map.get(row["hostid"])
+            if target_ip:
+                admin_map.setdefault(row["userid"], []).append(target_ip)
+
+        cur.execute(
+            "SELECT id, domain, username, password, credtype, pillaged_from_hostid FROM users"
+        )
+        for row in cur.fetchall():
+            if not row["username"]:
+                continue
+            pillaged_ip = host_id_map.get(row["pillaged_from_hostid"]) if row["pillaged_from_hostid"] else None
+            creds.append({
+                "username": row["username"],
+                "password": row["password"] or "",
+                "domain": row["domain"] or "",
+                "cred_type": row["credtype"] or "plaintext",
+                "admin_on": admin_map.get(row["id"], []),
+                "pillaged_from": pillaged_ip,
+                "protocol": "smb",
+                "source": "db",
+                "source_ip": pillaged_ip,
+            })
+
+        cur.execute("SELECT hostid, name, remark, read, write FROM shares")
+        for row in cur.fetchall():
+            try:
+                hid = int(row["hostid"])
+            except (TypeError, ValueError):
+                continue
+            ip = host_id_map.get(hid)
+            if ip and ip in hosts:
+                hosts[ip]["shares"].append({
+                    "name": row["name"],
+                    "read": bool(row["read"]),
+                    "write": bool(row["write"]),
+                    "remark": row["remark"] or "",
+                })
+
+        try:
+            cur.execute(
+                "SELECT host, dpapi_type, windows_user, username, password FROM dpapi_secrets"
+            )
+            for row in cur.fetchall():
+                if not row["username"]:
+                    continue
+                creds.append({
+                    "username": row["username"],
+                    "password": row["password"] or "",
+                    "domain": "",
+                    "cred_type": f"dpapi_{row['dpapi_type']}",
+                    "admin_on": [],
+                    "pillaged_from": row["host"],
+                    "protocol": "smb",
+                    "source": "db",
+                    "source_ip": row["host"],
+                })
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception as exc:
+        logging.warning(f"Failed to parse smb.db ({db_path}): {exc}")
+
+
+def _parse_nxc_ldap_db(db_path: Path, hosts: dict, creds: list) -> None:
+    """Parse ldap.db: DC host enumeration and pillaged/enumerated user accounts."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        host_id_map: dict[int, str] = {}
+        cur.execute("SELECT id, ip, hostname, domain, os FROM hosts")
+        for row in cur.fetchall():
+            ip = row["ip"]
+            if not ip:
+                continue
+            host_id_map[row["id"]] = ip
+            if ip not in hosts:
+                hosts[ip] = {
+                    "ip": ip,
+                    "hostname": row["hostname"] or "",
+                    "domain": row["domain"] or "",
+                    "os": row["os"] or "",
+                    "dc": True,
+                    "signing": None, "smbv1": None,
+                    "zerologon": False, "petitpotam": False,
+                    "null_session": False, "shares": [],
+                    "protocol": "ldap", "source": "db",
+                }
+            else:
+                if not hosts[ip]["domain"] and row["domain"]:
+                    hosts[ip]["domain"] = row["domain"]
+                if not hosts[ip]["hostname"] and row["hostname"]:
+                    hosts[ip]["hostname"] = row["hostname"]
+
+        cur.execute(
+            "SELECT domain, username, password, credtype, pillaged_from_hostid FROM users"
+        )
+        for row in cur.fetchall():
+            if not row["username"]:
+                continue
+            pillaged_ip = host_id_map.get(row["pillaged_from_hostid"]) if row["pillaged_from_hostid"] else None
+            is_enum = not row["password"]
+            creds.append({
+                "username": row["username"],
+                "password": row["password"] or "",
+                "domain": row["domain"] or "",
+                "cred_type": row["credtype"] or ("enumerated" if is_enum else "plaintext"),
+                "admin_on": [],
+                "pillaged_from": pillaged_ip,
+                "protocol": "ldap",
+                "source": "db",
+                "source_ip": pillaged_ip,
+                "enumerated_only": is_enum,
+            })
+
+        conn.close()
+    except Exception as exc:
+        logging.warning(f"Failed to parse ldap.db ({db_path}): {exc}")
+
+
+def _parse_nxc_generic_db(db_path: Path, proto: str, hosts: dict, creds: list) -> None:
+    """Parse a non-SMB/LDAP NXC protocol DB for additional hosts and credentials."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        host_id_map: dict[int, str] = {}
+        try:
+            cur.execute("SELECT id, ip, hostname, domain, os FROM hosts")
+            for row in cur.fetchall():
+                ip = row["ip"]
+                if not ip:
+                    continue
+                host_id_map[row["id"]] = ip
+                if ip not in hosts:
+                    hosts[ip] = {
+                        "ip": ip,
+                        "hostname": row["hostname"] or "",
+                        "domain": row["domain"] or "",
+                        "os": row["os"] or "",
+                        "dc": False, "signing": None, "smbv1": None,
+                        "zerologon": False, "petitpotam": False,
+                        "null_session": False, "shares": [],
+                        "protocol": proto, "source": "db",
+                    }
+        except Exception:
+            pass
+
+        try:
+            cur.execute(
+                "SELECT domain, username, password, credtype, pillaged_from_hostid FROM users"
+            )
+            for row in cur.fetchall():
+                if not row["username"] or not row["password"]:
+                    continue
+                pillaged_ip = host_id_map.get(row["pillaged_from_hostid"]) if row["pillaged_from_hostid"] else None
+                creds.append({
+                    "username": row["username"],
+                    "password": row["password"],
+                    "domain": row["domain"] or "",
+                    "cred_type": row["credtype"] or "plaintext",
+                    "admin_on": [],
+                    "pillaged_from": pillaged_ip,
+                    "protocol": proto,
+                    "source": "db",
+                    "source_ip": pillaged_ip,
+                })
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception as exc:
+        logging.warning(f"Failed to parse {proto}.db ({db_path}): {exc}")
+
+
+def _merge_nxc_results(stdout_data: dict | None, db_data: dict | None) -> dict:
+    """Merge stdout and DB NXC results. DB wins on host record conflicts."""
+    empty: dict = {"hosts": {}, "creds": [], "parsed_at": dt.datetime.now().isoformat(timespec="seconds")}
+    if not stdout_data and not db_data:
+        return empty
+    if not stdout_data:
+        return db_data  # type: ignore[return-value]
+    if not db_data:
+        return stdout_data
+
+    merged_hosts: dict[str, dict] = dict(stdout_data["hosts"])
+    merged_hosts.update(db_data["hosts"])
+
+    # Merge shares for hosts appearing in both sources (add stdout shares not in DB)
+    for ip in db_data["hosts"]:
+        stdout_host = stdout_data["hosts"].get(ip)
+        if stdout_host:
+            db_names = {s["name"] for s in merged_hosts[ip]["shares"]}
+            for sh in stdout_host.get("shares", []):
+                if sh["name"] not in db_names:
+                    merged_hosts[ip]["shares"].append(sh)
+
+    seen: set[tuple] = set()
+    merged_creds: list[dict] = []
+    for c in db_data.get("creds", []):
+        key = (c["username"].lower(), c["password"], c.get("domain", "").lower())
+        if key not in seen:
+            seen.add(key)
+            merged_creds.append(c)
+    for c in stdout_data.get("creds", []):
+        key = (c["username"].lower(), c["password"], c.get("domain", "").lower())
+        if key not in seen:
+            seen.add(key)
+            merged_creds.append(c)
+
+    return {
+        "hosts": merged_hosts,
+        "creds": merged_creds,
+        "parsed_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 # ============================================================
@@ -3358,20 +4062,68 @@ class _Spinner:
         return time.time() - self._start_time
 
 
-def ollama_chat(base_url: str, model: str, prompt: str, temperature: float = 0.15) -> str:
-    url = base_url.rstrip("/") + "/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False, "temperature": temperature}
+def ollama_chat(
+    base_url: str,
+    model: str,
+    prompt: str,
+    temperature: float = 0.15,
+    system: str | None = None,
+    history: list[dict] | None = None,
+) -> str:
+    """Send a prompt to Ollama via /api/chat.
+
+    system  — system role content; defaults to _active_system_prompt if not passed.
+    history — list of {"q": ..., "a": ...} dicts for conversation continuity.
+    """
+    effective_system = system if system is not None else _active_system_prompt
+
+    messages: list[dict] = []
+    if effective_system:
+        messages.append({"role": "system", "content": effective_system})
+    for h in (history or []):
+        messages.append({"role": "user",      "content": h["q"]})
+        messages.append({"role": "assistant", "content": h["a"]})
+    messages.append({"role": "user", "content": prompt})
+
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model":   model,
+        "messages": messages,
+        "stream":  False,
+        "options": {"temperature": temperature},
+    }
 
     spinner = _Spinner("Querying Ollama")
     spinner.start()
     try:
         r = requests.post(url, json=payload, timeout=300)
         r.raise_for_status()
-        response_text = r.json().get("response", "")
+        response_text = r.json().get("message", {}).get("content", "")
     except KeyboardInterrupt:
         spinner.stop()
         logging.warning("LLM call cancelled by user (Ctrl+C)")
         raise
+    except Exception:
+        # Fallback: some older Ollama builds may not support /api/chat
+        spinner.stop()
+        try:
+            url_gen = base_url.rstrip("/") + "/api/generate"
+            full_prompt = ""
+            if effective_system:
+                full_prompt = effective_system + "\n\n"
+            full_prompt += prompt
+            payload_gen = {"model": model, "prompt": full_prompt,
+                           "stream": False, "temperature": temperature}
+            spinner2 = _Spinner("Querying Ollama (fallback)")
+            spinner2.start()
+            r2 = requests.post(url_gen, json=payload_gen, timeout=300)
+            r2.raise_for_status()
+            response_text = r2.json().get("response", "")
+            spinner2.stop()
+        except Exception as exc2:
+            raise exc2
+        logging.info(f"Ollama responded via fallback ({len(response_text):,} chars)")
+        return response_text
     finally:
         elapsed = spinner.stop()
 
@@ -4248,6 +5000,8 @@ def _preserve_scan_note_operator_notes(scan_path: Path, scan_lines: list[str]) -
 
 _UNCHECKED_INVESTIGATE_RE = re.compile(r"^(\s*- )\[ \] (Investigate: .+)$", re.MULTILINE)
 _UNCHECKED_ANALYZE_RE     = re.compile(r"^(\s*- )\[ \] (Analyze: .+)$",     re.MULTILINE)
+_DONE_INVESTIGATE_RE      = re.compile(r"^(\s*- )\[/\] (Investigate: .+)$", re.MULTILINE)
+_DONE_ANALYZE_RE          = re.compile(r"^(\s*- )\[/\] (Analyze: .+)$",     re.MULTILINE)
 
 
 def _check_all_pending_boxes(vault_dir: Path) -> tuple[int, int]:
@@ -4285,6 +5039,43 @@ def _check_all_pending_boxes(vault_dir: Path) -> tuple[int, int]:
             analyze_checked += n
 
     return investigate_checked, analyze_checked
+
+
+def _reset_done_boxes(vault_dir: Path) -> tuple[int, int]:
+    """Reset all completed [/] Investigate and Analyze boxes back to [ ].
+
+    Called by /reanalyze before re-checking everything. Returns (investigate_count, analyze_count).
+    """
+    investigate_reset = 0
+    analyze_reset = 0
+
+    hosts_dir = vault_dir / "Hosts"
+    if hosts_dir.exists():
+        for host_path in sorted(hosts_dir.glob("*.md")):
+            text = host_path.read_text(encoding="utf-8")
+            new_text, n = _DONE_INVESTIGATE_RE.subn(r"\1[ ] \2", text)
+            if n:
+                host_path.write_text(new_text, encoding="utf-8")
+                investigate_reset += n
+
+    scans_dir = vault_dir / "Scans"
+    if scans_dir.exists():
+        for scan_path in sorted(scans_dir.glob("*.md")):
+            text = scan_path.read_text(encoding="utf-8")
+            new_text, n = _DONE_ANALYZE_RE.subn(r"\1[ ] \2", text)
+            if n:
+                scan_path.write_text(new_text, encoding="utf-8")
+                analyze_reset += n
+
+    loot_overview = vault_dir / "Loot" / "Overview.md"
+    if loot_overview.exists():
+        text = loot_overview.read_text(encoding="utf-8")
+        new_text, n = _DONE_ANALYZE_RE.subn(r"\1[ ] \2", text)
+        if n:
+            loot_overview.write_text(new_text, encoding="utf-8")
+            analyze_reset += n
+
+    return investigate_reset, analyze_reset
 
 
 # ============================================================
@@ -4382,6 +5173,15 @@ HOST CONTEXT:
     return prompt
 
 
+def _get_file_write_lock(path: Path) -> threading.Lock:
+    """Return a per-file lock to prevent concurrent writes to the same host note."""
+    key = str(path)
+    with _LLM_WRITE_LOCKS_MUTEX:
+        if key not in _LLM_WRITE_LOCKS:
+            _LLM_WRITE_LOCKS[key] = threading.Lock()
+        return _LLM_WRITE_LOCKS[key]
+
+
 def _process_deep_dives(
     vault_dir: Path,
     ollama_url: str,
@@ -4389,11 +5189,22 @@ def _process_deep_dives(
     temperature: float,
     skip_validation: bool,
     operator_notes_lookup: dict[str, str],
+    workers: int = 1,
 ) -> int:
-    """Scan all host notes for checked deep-dive boxes, run analysis, write results."""
+    """Scan all host notes for checked investigation boxes, run analysis, write results.
+
+    Auto-merges duplicate host notes (IP + hostname for the same host) before
+    processing so each analysis has complete cross-note context.
+    When workers > 1, analyses run in parallel threads (one LLM call per thread).
+    """
     hosts_dir = vault_dir / "Hosts"
     if not hosts_dir.exists():
         return 0
+
+    # Merge duplicate host notes first so analysis sees complete context
+    merge_reports = _detect_and_merge_host_notes(vault_dir)
+    for msg in merge_reports:
+        logging.info(f"[Analysis] Auto-merged before analysis: {msg}")
 
     all_requests: list[dict] = []
     for host_path in sorted(hosts_dir.glob("*.md")):
@@ -4402,14 +5213,17 @@ def _process_deep_dives(
     if not all_requests:
         return 0
 
-    logging.info(f"[Deep Dive] Found {len(all_requests)} checked investigation(s)")
+    logging.info(f"[Analysis] Found {len(all_requests)} checked investigation(s)")
+    if workers > 1:
+        print(f"  [*] Running {len(all_requests)} deep dives with {workers} parallel workers...")
 
-    processed = 0
-    for req in all_requests:
+    def _run_one(req: dict) -> bool:
         topic = req["topic"]
         ip = req["ip"]
         host_path: Path = req["host_path"]
-        logging.info(f"[Deep Dive] {req['host_stem']}: {topic}")
+
+        with _LLM_PRINT_LOCK:
+            logging.info(f"[Analysis] {req['host_stem']}: {topic}")
 
         host_context = _collect_deep_dive_context(req["body"], topic)
         op_notes = operator_notes_lookup.get(ip, "")
@@ -4419,24 +5233,34 @@ def _process_deep_dives(
             raw = ollama_chat(ollama_url, model, prompt, temperature)
 
             if not skip_validation:
-                raw, warnings = validate_ai_output(
-                    raw, {"hosts": []}, "nmap"
-                )
+                raw, warnings = validate_ai_output(raw, {"hosts": []}, "nmap")
                 for w in warnings:
-                    logging.warning(f"[Deep Dive Validation] {w}")
+                    with _LLM_PRINT_LOCK:
+                        logging.warning(f"[Analysis Validation] {w}")
 
-            _write_deep_dive_result(host_path, topic, raw)
-            processed += 1
+            file_lock = _get_file_write_lock(host_path)
+            with file_lock:
+                _write_deep_dive_result(host_path, topic, raw)
         except Exception as exc:
-            logging.warning(f"[Deep Dive] Failed for {topic} on {ip}: {exc}")
-            _write_deep_dive_result(host_path, topic, f"_Deep dive failed: {exc}_")
-            processed += 1
+            with _LLM_PRINT_LOCK:
+                logging.warning(f"[Analysis] Failed for {topic} on {ip}: {exc}")
+            file_lock = _get_file_write_lock(host_path)
+            with file_lock:
+                _write_deep_dive_result(host_path, topic, f"_Deep dive failed: {exc}_")
+        return True
 
-    return processed
+    if workers <= 1:
+        for req in all_requests:
+            _run_one(req)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_run_one, all_requests))
+
+    return len(all_requests)
 
 
 def _write_deep_dive_result(host_path: Path, topic: str, analysis: str) -> None:
-    """Mark the checkbox as done and append the result to the Deep Dives section."""
+    """Mark the checkbox as done and append the result to the ## Analysis section."""
     text = host_path.read_text(encoding="utf-8")
 
     # Mark the checkbox as investigated: [x] → [/] (green in CSS)
@@ -4450,13 +5274,13 @@ def _write_deep_dive_result(host_path: Path, topic: str, analysis: str) -> None:
 
     # Build the callout block
     callout_lines = [
-        f"> [!info]- Deep Dive: {topic}",
+        f"> [!info]- Analysis: {topic}",
     ]
     for line in analysis.strip().splitlines():
         callout_lines.append(f"> {line}")
     callout_block = "\n".join(callout_lines)
 
-    # Insert into Deep Dives section, or create it
+    # Insert into ## Analysis section, or create it
     if DEEP_DIVE_SECTION in text:
         section_content = extract_body_section(text, DEEP_DIVE_SECTION)
         old_section = f"{DEEP_DIVE_SECTION}\n{section_content}" if section_content else DEEP_DIVE_SECTION
@@ -4472,7 +5296,7 @@ def _write_deep_dive_result(host_path: Path, topic: str, analysis: str) -> None:
             text += f"\n\n{DEEP_DIVE_SECTION}\n{callout_block}"
 
     host_path.write_text(text, encoding="utf-8")
-    logging.info(f"[Deep Dive] Wrote result for: {topic}")
+    logging.info(f"[Analysis] Wrote result for: {topic}")
 
 
 # ============================================================
@@ -4573,22 +5397,27 @@ def _write_cross_source_result(host_path: Path, analysis: str) -> None:
             text += f"\n\n{new_section}"
 
     host_path.write_text(text, encoding="utf-8")
-    logging.info(f"[DeepDive] Wrote cross-source analysis for: {host_path.stem}")
+    logging.info(f"[DeepDive] Wrote deep dive for: {host_path.stem}")
 
 
 def _run_cross_source_deepdive(
     vault_dir: Path,
     args,
     operator_notes_lookup: dict[str, str],
+    workers: int = 1,
 ) -> int:
-    """Run cross-source correlation analysis for every host note in the vault."""
+    """Run cross-source correlation analysis for every host note in the vault.
+
+    When workers > 1 each host analysis runs in a separate thread.
+    """
     hosts_dir = vault_dir / "Hosts"
     if not hosts_dir.exists():
         return 0
 
-    processed = 0
     host_paths = sorted(p for p in hosts_dir.glob("*.md") if not p.stem.startswith("_"))
 
+    # Build work items first (fast read pass, single-threaded)
+    work_items: list[tuple[Path, str, list, str]] = []
     for host_path in host_paths:
         try:
             text = host_path.read_text(encoding="utf-8")
@@ -4622,22 +5451,46 @@ def _run_cross_source_deepdive(
             logging.debug(f"[DeepDive] Skipping {host_path.stem} — no scan data to correlate")
             continue
 
-        logging.info(f"[DeepDive] Cross-source analysis: {host_path.stem}")
-        print(f"  [*] Cross-source: {host_path.stem}...")
+        work_items.append((host_path, ip, hostnames, prompt))
+
+    if not work_items:
+        return 0
+
+    if workers > 1:
+        print(f"  [*] Cross-source: {len(work_items)} hosts with {workers} parallel workers...")
+
+    processed_count = threading.local()
+
+    def _run_one_cross(item: tuple) -> bool:
+        host_path, ip, hostnames, prompt = item
+        with _LLM_PRINT_LOCK:
+            logging.info(f"[DeepDive] Cross-source analysis: {host_path.stem}")
+            print(f"  [*] Cross-source: {host_path.stem}...")
         try:
             raw = ollama_chat(args.ollama_url, args.model, prompt, args.temperature)
             if not args.skip_validation:
                 raw, warnings = validate_ai_output(raw, {"hosts": []}, "nmap")
                 for w in warnings:
-                    logging.warning(f"[DeepDive Validation] {w}")
-            _write_cross_source_result(host_path, raw)
-            processed += 1
+                    with _LLM_PRINT_LOCK:
+                        logging.warning(f"[DeepDive Validation] {w}")
+            file_lock = _get_file_write_lock(host_path)
+            with file_lock:
+                _write_cross_source_result(host_path, raw)
+            return True
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            logging.warning(f"[DeepDive] Failed for {host_path.stem}: {exc}")
+            with _LLM_PRINT_LOCK:
+                logging.warning(f"[DeepDive] Failed for {host_path.stem}: {exc}")
+            return False
 
-    return processed
+    if workers <= 1:
+        results = [_run_one_cross(item) for item in work_items]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_run_one_cross, work_items))
+
+    return sum(1 for r in results if r)
 
 
 # ============================================================
@@ -5528,6 +6381,7 @@ def create_nessus_vault(
     analysis_text: str | None,
     model_name: str | None,
     validation_warnings: list[str] | None = None,
+    no_findings: bool = False,
 ) -> dict:
     """Write Nessus host note sections and scan note."""
     logging.info(f"Writing Nessus vault content: {vault_dir}")
@@ -5591,6 +6445,9 @@ def create_nessus_vault(
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
     logging.info(f"Wrote Nessus scan note: {scan_path.name}")
+
+    if not no_findings:
+        _write_nessus_finding_notes(vault_dir, nessus_data, scan_source)
 
     return {
         "scan_note":    str(scan_path),
@@ -5735,6 +6592,7 @@ def create_burp_vault(
     analysis_text: str | None,
     model_name: str | None,
     validation_warnings: list[str] | None = None,
+    no_findings: bool = False,
 ) -> dict:
     """Write Burp Suite host note sections and scan note."""
     logging.info(f"Writing Burp vault content: {vault_dir}")
@@ -5793,6 +6651,9 @@ def create_burp_vault(
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
     logging.info(f"Wrote Burp scan note: {scan_path.name}")
+
+    if not no_findings:
+        _write_burp_finding_notes(vault_dir, burp_data, scan_source)
 
     return {
         "scan_note":    str(scan_path),
@@ -6624,6 +7485,7 @@ def _write_loot_credentials_page(
         lines.append("_No credentials or users found._")
 
     page_path.write_text("\n".join(lines), encoding="utf-8")
+    _rebuild_campaign_aggregates(page_path)
     logging.info(f"Wrote Loot/Credentials.md ({total_creds} entries)")
 
 
@@ -7504,6 +8366,516 @@ def _build_next_steps(all_analyses: list[tuple[str, str]], max_items: int = 14) 
 
 
 # ============================================================
+# NXC vault writer
+# ============================================================
+
+def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> str | None:
+    """Create or update a host note with NXC enumeration data.
+
+    Reads all existing sections, updates frontmatter with NXC metadata,
+    writes/replaces ## NXC Enumeration, and preserves everything else.
+    """
+    ip = host.get("ip", "")
+    if not ip:
+        return None
+
+    hostname = host.get("hostname", "")
+    domain = host.get("domain", "")
+    protocol = host.get("protocol", "smb").upper()
+    source_label = f"{scan_label} - {protocol}"
+
+    # Find or create note path
+    existing_path = _find_host_note_by_ip(hosts_dir, ip)
+    if not existing_path:
+        for hp in hosts_dir.glob("*.md"):
+            if hp.stem.lower() == safe_filename(hostname or ip).lower():
+                existing_path = hp
+                break
+
+    if existing_path:
+        host_path = existing_path
+    else:
+        display = hostname if hostname and is_probable_fqdn(hostname) else ip
+        host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
+
+    # Read all existing sections
+    existing_fm: dict = {}
+    existing_op_notes = ""
+    existing_preamble_lines: list[str] = []
+    sec_open_ports = sec_nessus = sec_burp = sec_autorecon = ""
+    sec_loot = sec_deep_dive = sec_cross = ""
+
+    if host_path.exists():
+        old_text = host_path.read_text(encoding="utf-8")
+        existing_fm, old_body = read_frontmatter(old_text)
+        existing_op_notes = extract_operator_notes(old_body)
+        sec_open_ports  = extract_body_section(old_body, "## Open Ports")
+        sec_nessus      = extract_body_section(old_body, "## Nessus Findings")
+        sec_burp        = extract_body_section(old_body, "## Burp Suite Findings")
+        sec_autorecon   = extract_body_section(old_body, "## AutoRecon Enumeration")
+        sec_loot        = extract_body_section(old_body, "## Loot")
+        sec_deep_dive   = extract_body_section(old_body, DEEP_DIVE_SECTION)
+        sec_cross       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
+        for line in old_body.splitlines():
+            if line.startswith("## "):
+                break
+            existing_preamble_lines.append(line)
+    else:
+        existing_preamble_lines.append(f"**IP:** {ip}")
+        if hostname and hostname != ip:
+            existing_preamble_lines.append(f"**Hostname:** {hostname}")
+
+    # Update frontmatter
+    existing_hostnames: list = existing_fm.get("hostnames", [])
+    if isinstance(existing_hostnames, str):
+        existing_hostnames = [existing_hostnames] if existing_hostnames else []
+    if hostname and hostname.lower() not in [h.lower() for h in existing_hostnames]:
+        existing_hostnames.append(hostname)
+
+    existing_tags: list = existing_fm.get("tags", [])
+    if isinstance(existing_tags, str):
+        existing_tags = [existing_tags] if existing_tags else []
+    tag_set = set(existing_tags)
+    tag_set.add(protocol.lower())
+    if host.get("dc"):
+        tag_set.add("domain-controller")
+    if host.get("signing") is False:
+        tag_set.add("smb-signing-disabled")
+    if host.get("smbv1"):
+        tag_set.add("smbv1-enabled")
+    if host.get("zerologon"):
+        tag_set.add("zerologon")
+    if host.get("petitpotam"):
+        tag_set.add("petitpotam")
+    if host.get("null_session"):
+        tag_set.add("null-session")
+
+    existing_sources: list = existing_fm.get("sources", [])
+    if isinstance(existing_sources, str):
+        existing_sources = [existing_sources] if existing_sources else []
+    if source_label not in existing_sources:
+        existing_sources.append(source_label)
+
+    fm: dict = {
+        "ip": ip,
+        "hostnames": existing_hostnames,
+        "status": existing_fm.get("status", "not-started"),
+        "tags": sorted(tag_set),
+        "sources": existing_sources,
+        "nessus_max_severity": existing_fm.get("nessus_max_severity", 0),
+    }
+    if domain and not existing_fm.get("domain"):
+        fm["domain"] = domain
+    for k in ("autorecon_tools_run", "loot_file_count", "loot_credential_count", "loot_hash_count"):
+        if k in existing_fm:
+            fm[k] = existing_fm[k]
+
+    # Build ## NXC Enumeration section content
+    nxc_lines: list[str] = [
+        "| Field | Value |",
+        "|-------|-------|",
+        f"| Protocol | {protocol} |",
+    ]
+    if host.get("os"):
+        nxc_lines.append(f"| OS | {host['os']} |")
+    if domain:
+        nxc_lines.append(f"| Domain | {domain} |")
+    nxc_lines.append(f"| Domain Controller | {'Yes' if host.get('dc') else 'No'} |")
+    if protocol == "SMB":
+        signing_str = ("Disabled" if host.get("signing") is False
+                       else "Enabled" if host.get("signing") is True else "Unknown")
+        smbv1_str = ("Enabled" if host.get("smbv1")
+                     else "Disabled" if host.get("smbv1") is False else "Unknown")
+        nxc_lines += [f"| SMB Signing | {signing_str} |", f"| SMBv1 | {smbv1_str} |"]
+    nxc_lines.append(f"| Null Session | {'Yes' if host.get('null_session') else 'No'} |")
+    nxc_lines.append("")
+
+    if host.get("zerologon"):
+        nxc_lines += [
+            "> [!danger] ZeroLogon Detected — CVE-2020-1472",
+            "> NXC confirmed this host is vulnerable to ZeroLogon. Domain Controller impersonation and full domain compromise may be possible.",
+            "",
+        ]
+    if host.get("petitpotam"):
+        nxc_lines += [
+            "> [!danger] PetitPotam Detected — CVE-2021-36942",
+            "> NXC confirmed this host is vulnerable to PetitPotam. NTLM coercion and relay attacks are likely viable.",
+            "",
+        ]
+
+    shares = host.get("shares", [])
+    if shares:
+        nxc_lines += [
+            "### Shares",
+            "",
+            "| Share | Read | Write | Remark |",
+            "|-------|------|-------|--------|",
+        ]
+        for sh in shares:
+            r = "✓" if sh.get("read") else ""
+            w = "✓" if sh.get("write") else ""
+            nxc_lines.append(f"| {sh['name']} | {r} | {w} | {sh.get('remark', '')} |")
+        nxc_lines.append("")
+
+    nxc_content = "\n".join(nxc_lines).rstrip()
+
+    # Rebuild body in canonical order
+    preamble = "\n".join(existing_preamble_lines).rstrip()
+    body_parts: list[str] = []
+    if preamble:
+        body_parts.append(preamble)
+
+    for sec_header, sec_content in [
+        ("## Open Ports", sec_open_ports),
+        ("## Nessus Findings", sec_nessus),
+        ("## Burp Suite Findings", sec_burp),
+        ("## AutoRecon Enumeration", sec_autorecon),
+    ]:
+        if sec_content:
+            body_parts += ["", sec_header, sec_content]
+
+    body_parts += ["", "## NXC Enumeration", nxc_content]
+
+    for sec_header, sec_content in [
+        ("## Loot", sec_loot),
+        (DEEP_DIVE_SECTION, sec_deep_dive),
+        (CROSS_SOURCE_SECTION, sec_cross),
+    ]:
+        if sec_content:
+            body_parts += ["", sec_header, sec_content]
+
+    body_parts += ["", "## Scan References"]
+    for src in fm["sources"]:
+        body_parts.append(f"- [[Scans/{safe_filename(src)}|{src}]]")
+
+    body_parts += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
+    if existing_op_notes:
+        body_parts += ["", existing_op_notes]
+
+    host_path.write_text(
+        write_frontmatter(fm) + "\n" + "\n".join(body_parts),
+        encoding="utf-8",
+    )
+    logging.info(f"NXC: {'updated' if existing_path else 'created'} host note {host_path.name}")
+    return host_path.stem
+
+
+def _write_nxc_credentials(vault_dir: Path, creds: list[dict], scan_label: str) -> None:
+    """Append NXC credentials and enumerated usernames to Loot/Credentials.md."""
+    injestor_creds: list[dict] = []
+    injestor_usernames: list[str] = []
+
+    for c in creds:
+        username = c.get("username", "")
+        password = c.get("password", "")
+        domain = c.get("domain", "")
+        admin_on = c.get("admin_on", [])
+        cred_type = c.get("cred_type", "plaintext")
+        source_ip = c.get("source_ip") or c.get("pillaged_from") or ""
+        proto = c.get("protocol", "smb").upper()
+        is_enum = c.get("enumerated_only", False)
+
+        display_user = f"{domain}\\{username}" if domain else username
+
+        if is_enum:
+            injestor_usernames.append(display_user)
+            continue
+
+        notes = ""
+        if admin_on:
+            notes = f"Admin on: {', '.join(admin_on)}"
+        elif source_ip:
+            notes = f"Pillaged from {source_ip}"
+
+        injestor_creds.append({
+            "username": display_user,
+            "password": password,
+            "cred_type": cred_type,
+            "source": f"{scan_label} - {proto}",
+            "notes": notes,
+        })
+
+    if injestor_creds or injestor_usernames:
+        _append_injestor_to_credentials_md(vault_dir, injestor_creds, injestor_usernames, scan_label)
+
+
+def _write_nxc_scan_note(vault_dir: Path, nxc_data: dict, scan_stem: str, scan_label: str) -> None:
+    """Write or update Scans/<scan_stem>.md for NXC results."""
+    scans_dir = vault_dir / "Scans"
+    scans_dir.mkdir(exist_ok=True)
+    scan_path = scans_dir / ensure_md_suffix(scan_stem)
+
+    existing_op_notes = ""
+    existing_analysis = ""
+    if scan_path.exists():
+        existing = scan_path.read_text(encoding="utf-8")
+        existing_op_notes = extract_body_section(existing, OPERATOR_NOTES_SENTINEL).strip()
+        existing_analysis = extract_body_section(existing, "## Analysis").strip()
+
+    hosts = nxc_data.get("hosts", {})
+    creds = nxc_data.get("creds", [])
+    admin_creds = [c for c in creds if c.get("admin_on")]
+    protocols = sorted({h["protocol"].upper() for h in hosts.values()}) if hosts else ["SMB"]
+    source_info = nxc_data.get("workspace_dir") or nxc_data.get("source", "stdout")
+
+    lines: list[str] = [
+        f"# {scan_label} — {', '.join(protocols)}",
+        "",
+        f"- [ ] Analyze: {scan_label}",
+        "",
+        f"**Source:** `{source_info}`",
+        f"**Parsed:** {nxc_data.get('parsed_at', '')}",
+        f"**Protocol(s):** {', '.join(protocols)}",
+        f"**Hosts discovered:** {len(hosts)}",
+        f"**Credentials found:** {len(creds)}"
+        + (f"  ·  **Admin access confirmed:** {len(admin_creds)}" if admin_creds else ""),
+        "",
+    ]
+
+    if hosts:
+        lines += [
+            "## Hosts",
+            "",
+            "| IP | Hostname | Domain | OS | DC | Signing | Flags |",
+            "|----|----------|--------|----|----|---------|-------|",
+        ]
+        for ip, h in sorted(hosts.items()):
+            hostname = h.get("hostname", "")
+            domain = h.get("domain", "")
+            os_short = (h.get("os", "") or "")[:40]
+            dc = "DC" if h.get("dc") else ""
+            signing = ("Disabled" if h.get("signing") is False
+                       else "Enabled" if h.get("signing") is True else "")
+            flags = []
+            if h.get("zerologon"):
+                flags.append("ZeroLogon")
+            if h.get("petitpotam"):
+                flags.append("PetitPotam")
+            if h.get("null_session"):
+                flags.append("NullSession")
+            if h.get("smbv1"):
+                flags.append("SMBv1")
+            lines.append(
+                f"| {ip} | {hostname} | {domain} | {os_short} | {dc} | {signing} | {', '.join(flags)} |"
+            )
+        lines.append("")
+
+    if admin_creds:
+        lines += ["## Admin Access Confirmed", ""]
+        for c in admin_creds:
+            user = f"{c.get('domain', '')}\\{c['username']}" if c.get("domain") else c["username"]
+            lines.append(f"- **{user}** → local admin on: {', '.join(c['admin_on'])}")
+        lines.append("")
+
+    if existing_analysis:
+        lines += ["## Analysis", "", existing_analysis, ""]
+
+    lines += [OPERATOR_NOTES_SENTINEL, ""]
+    lines.append(existing_op_notes if existing_op_notes else OPERATOR_NOTES_HINT)
+
+    scan_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _resolve_nxc_workspace(args, base: Path) -> Path | None:
+    """Resolve the NXC workspace directory from args or auto-discovery in scans/nxc/.
+
+    Returns None if no workspace is found (safe — DB parsing is optional).
+    """
+    # Explicit --nxcdb flag (file or directory)
+    if getattr(args, "nxcdb", None):
+        p = Path(args.nxcdb).resolve()
+        if p.is_dir():
+            return p
+        if p.is_file():
+            return p.parent
+
+    # Explicit --nxc-workspace config
+    ws = getattr(args, "nxc_workspace", None)
+    if ws:
+        p = Path(ws).expanduser().resolve()
+        if p.exists():
+            return p
+
+    # Auto-discover: scans/nxc/ drop folder
+    for candidate in [base / "nxc", base / "NXC"]:
+        if candidate.exists():
+            # Check for smb.db directly or one level deep
+            for smb_path in [candidate / "smb.db"] + list(candidate.rglob("smb.db")):
+                if smb_path.exists() and smb_path.stat().st_size > 0:
+                    return smb_path.parent
+
+    return None
+
+
+def detect_kiwi_secretsdump(text: str) -> str | None:
+    """Detect kiwi/mimikatz/secretsdump format. Returns format tag or None.
+
+    Format tags:
+      'sam'          — secretsdump/hashdump: user:RID:LM:NTLM:::
+      'kiwi_sekurlsa'— sekurlsa::logonpasswords: * Username / * NTLM blocks
+      'kiwi_lsa_dump'— meterpreter lsa_dump_sam:  User: / Hash NTLM: blocks
+    """
+    if SAM_DUMP_LINE_RE.search(text):
+        return "sam"
+    if KIWI_FIELD_RE.search(text) and MIMIKATZ_HEADER_RE.search(text):
+        return "kiwi_sekurlsa"
+    if (KIWI_HASH_LINE_RE.search(text)
+            and re.search(r"^\s*User\s*:", text, re.MULTILINE)):
+        return "kiwi_lsa_dump"
+    return None
+
+
+def parse_kiwi_secretsdump(text: str, host: str = "") -> dict:
+    """Parse kiwi / secretsdump / mimikatz output into structured credentials.
+
+    Handles three formats:
+    1. secretsdump / hashdump SAM lines:  Administrator:500:LM32:NTLM32:::
+    2. kiwi sekurlsa::logonpasswords:     * Username / * NTLM / * Password blocks
+    3. kiwi lsa_dump_sam (meterpreter):   RID / User / Hash NTLM block structure
+
+    Returns {"credentials": [...]} — each entry compatible with
+    _append_injestor_to_credentials_md (username, password, hash, hash_type, host, source, notes).
+    """
+    creds: list[dict] = []
+    seen: set[str] = set()
+    empty_lm = "aad3b435b51404eeaad3b435b51404ee"
+    empty_ntlm = "31d6cfe0d16ae931b73c59d7e0c089c0"
+
+    def _add(username: str, password: str, h: str, htype: str, h_host: str, notes: str = "") -> None:
+        key = (username.lower(), (h or password).lower())
+        if key in seen:
+            return
+        seen.add(key)
+        creds.append({
+            "username": username,
+            "password": password,
+            "hash": h,
+            "hash_type": htype,
+            "host": h_host or host,
+            "source": "Injestor (kiwi/secretsdump)",
+            "notes": notes,
+        })
+
+    # ── Format 1: secretsdump / hashdump  user:RID:LMhash:NTLMhash::: ──
+    for m in SAM_DUMP_LINE_RE.finditer(text):
+        parts = m.group(0).strip().split(":")
+        if len(parts) < 4:
+            continue
+        username, lm_hash, ntlm_hash = parts[0], parts[2], parts[3].rstrip(":")
+        if ntlm_hash and ntlm_hash != empty_ntlm:
+            _add(username, "", ntlm_hash, "NTLM", host)
+        if lm_hash and lm_hash != empty_lm:
+            _add(username, "", lm_hash, "LM", host)
+
+    # ── Format 2: kiwi sekurlsa::logonpasswords  * Username / * NTLM / * Password ──
+    _sekurlsa_field_re = re.compile(
+        r"^\s*\*\s+(?P<key>Username|Domain|NTLM|SHA1|Password)\s*:\s*(?P<val>.+)$",
+        re.IGNORECASE,
+    )
+    _auth_id_re = re.compile(r"Authentication Id\s*:", re.IGNORECASE)
+    cur: dict = {}
+
+    def _flush_sekurlsa() -> None:
+        u = cur.get("username", "")
+        if not u or u in ("(null)", ""):
+            cur.clear()
+            return
+        domain = cur.get("domain", "")
+        ntlm   = cur.get("ntlm", "")
+        pw     = cur.get("password", "")
+        notes  = f"domain: {domain}" if domain else ""
+        if ntlm and ntlm not in ("(null)", ""):
+            _add(u, pw if pw and pw != "(null)" else "", ntlm, "NTLM", host, notes)
+        elif pw and pw not in ("(null)", ""):
+            _add(u, pw, "", "", host, notes)
+        cur.clear()
+
+    if KIWI_FIELD_RE.search(text):
+        for line in text.splitlines():
+            if _auth_id_re.search(line):
+                _flush_sekurlsa()
+                continue
+            fm = _sekurlsa_field_re.match(line)
+            if fm:
+                key = fm.group("key").lower()
+                val = fm.group("val").strip()
+                if key == "username":
+                    if cur.get("username"):
+                        _flush_sekurlsa()
+                    cur["username"] = val
+                else:
+                    cur[key] = val
+        _flush_sekurlsa()
+
+    # ── Format 3: kiwi lsa_dump_sam (meterpreter)  RID / User / Hash NTLM ──
+    # Block structure:
+    #   Domain : DANTE-WS03
+    #   RID  : 000001f4 (500)
+    #   User : Administrator
+    #     Hash NTLM: c55ed3c3d34c4576bcd33c76420be934
+    if KIWI_HASH_LINE_RE.search(text):
+        _rid_re    = re.compile(r"^\s*RID\s*:\s*[0-9a-fA-F]+\s*\(\d+\)", re.IGNORECASE)
+        _user_re   = re.compile(r"^\s*User\s*:\s*(\S+)", re.IGNORECASE)
+        _hash_re   = re.compile(r"^\s+Hash NTLM:\s*([a-fA-F0-9]{32})", re.IGNORECASE)
+        _domain_re = re.compile(r"^\s*Domain\s*:\s*(\S+)", re.IGNORECASE)
+
+        domain_ctx = ""
+        cur_user   = None
+
+        for line in text.splitlines():
+            dm = _domain_re.match(line)
+            if dm and not domain_ctx:
+                domain_ctx = dm.group(1)
+                continue
+
+            if _rid_re.match(line):
+                cur_user = None
+                continue
+
+            um = _user_re.match(line)
+            if um:
+                cur_user = um.group(1)
+                continue
+
+            hm = _hash_re.match(line)
+            if hm and cur_user:
+                ntlm = hm.group(1)
+                if ntlm != empty_ntlm:
+                    notes = f"domain: {domain_ctx}" if domain_ctx else ""
+                    _add(cur_user, "", ntlm, "NTLM", host, notes)
+
+    return {"credentials": creds}
+
+
+def create_nxc_vault(vault_dir: Path, nxc_data: dict, scan_label: str = "NXC") -> dict:
+    """Write NXC results into the vault: enrich host notes, update loot, write scan note."""
+    logging.info(
+        f"Writing NXC vault content ({len(nxc_data.get('hosts', {}))} hosts, "
+        f"{len(nxc_data.get('creds', []))} creds)"
+    )
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    hosts_dir = vault_dir / "Hosts"
+    hosts_dir.mkdir(exist_ok=True)
+    (vault_dir / "Loot").mkdir(exist_ok=True)
+
+    host_stems: list[str] = []
+    for ip, host in nxc_data.get("hosts", {}).items():
+        stem = _write_nxc_host_enrichment(hosts_dir, host, scan_label)
+        if stem:
+            host_stems.append(stem)
+
+    if nxc_data.get("creds"):
+        _write_nxc_credentials(vault_dir, nxc_data["creds"], scan_label)
+
+    protocols = (sorted({h["protocol"].upper() for h in nxc_data["hosts"].values()})
+                 if nxc_data.get("hosts") else ["SMB"])
+    scan_stem = safe_filename(f"{scan_label} - {', '.join(protocols)}")
+    _write_nxc_scan_note(vault_dir, nxc_data, scan_stem, scan_label)
+
+    return {"scan_stem": scan_stem, "host_stems": host_stems}
+
+
+# ============================================================
 # Canvas layout engine
 # ============================================================
 
@@ -7706,44 +9078,583 @@ def build_canvas(
 
 
 # ============================================================
-# Eat Me — operator drop zone
+# Injestor — operator drop zone
 # ============================================================
 
-_EAT_ME_TEMPLATE = """\
-# Eat Me
+_INJESTOR_TEMPLATE = """\
+# Injestor
 
-_Paste anything here — IPs, tool output, notes, arp tables, host lists._
-_On next mAIpper run, content is processed and moved to a scan note._
+_Processed on next mAIpper run or interactive Enter. Content is archived to Scans/ and this page is reset._
+_Each section is handled differently — paste into the right section for best results._
 
 ---
 
+## Notes
+
+_Free-text observations, ARP tables, IP/hostname lists, scan summaries._
+_Only IPs and hostnames are extracted here. No credential or username parsing._
+
+
+
+---
+
+## Tool Output
+
+_Paste raw tool output here for LLM-assisted extraction._
+_Supported: /etc/passwd, /etc/shadow, secretsdump, hashdump, Responder logs, NXC output,_
+_LaZagne, mimikatz, ldapsearch, enum4linux, any credential-bearing output._
+_The LLM identifies the tool, extracts credentials/usernames/hashes, and flags confidence._
+_Low-confidence items go to a Pending Review section for you to confirm before they hit Loot._
+
+
+
+---
+
+## Access
+
+_Record shells and access gained. One entry per line: `user@host PRIVILEGE METHOD [session] [notes]`_
+_Privilege examples: SYSTEM, root, LocalAdmin, DomainAdmin, User_
+_Method examples: meterpreter, psexec, ssh, evil-winrm, rdp_
+_Processed automatically into ## Access sections in host notes._
+
+
 """
+
+_INJESTOR_NOTES_HEADERS       = {"notes", "notes / tool output", "paste here", "free-text"}
+_INJESTOR_TOOL_OUTPUT_HEADERS = {"tool output", "raw output", "tool output / raw data"}
+_INJESTOR_CRED_HEADERS        = {"credentials", "creds", "credentials / users"}
+_INJESTOR_ACCESS_HEADERS      = {"access", "access gained", "shells", "access / shells"}
+_INJESTOR_TEMPLATE_HINTS = {
+    "_processed on", "_each section", "_free-text observations", "_only ips and hostnames",
+    "_paste raw tool output", "_supported:", "_the llm identifies", "_low-confidence items",
+    "_record shells", "_privilege examples", "_method examples", "_processed automatically",
+    "_one credential per line", "_lazagne,", "_lazagne ", "_mimikatz",
+    "_responder", "_secretsdump", "_hashdump", "_ldapsearch", "_enum4linux",
+}
+
+
+def _parse_injestor_sections(raw: str) -> dict:
+    """Split structured Injestor template into freeform and credential sections.
+
+    Returns:
+        {
+            "freeform": str,                           # Notes / Tool Output content
+            "credentials": {                           # Credentials section, keyed by host
+                "Campaign-Level": "user:pass\\n...",
+                "10.10.10.5": "frank:pass\\n...",
+            },
+            "has_credential_section": bool,            # True if ## Credentials was present
+        }
+    """
+    result: dict = {
+        "notes": "",                    # ## Notes — IP/hostname extraction only
+        "tool_output": "",              # ## Tool Output — LLM extraction
+        "credentials": {},              # ## Credentials — direct structured entry
+        "access": [],                   # ## Access — access tracking entries
+        "has_credential_section": False,
+        "has_tool_output_section": False,
+        "has_access_section": False,
+        # Legacy: populated when no template sections found (plain freeform paste)
+        "freeform": "",
+    }
+    notes_lines: list[str] = []
+    tool_output_lines: list[str] = []
+    cred_host_lines: dict[str, list[str]] = collections.defaultdict(list)
+    access_lines: list[str] = []
+
+    in_section: str | None = None   # "notes" | "tool_output" | "credentials" | "access" | None
+    current_host = "Campaign-Level"
+    found_any_section = False
+
+    def _is_template_hint(line: str) -> bool:
+        low = line.strip().lower()
+        return any(low.startswith(h) for h in _INJESTOR_TEMPLATE_HINTS)
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+
+        # Always skip the page title and dividers
+        if low in ("# injestor", "# eat me", "---"):
+            continue
+        if not stripped:
+            if in_section in ("notes", "tool_output", None):
+                (tool_output_lines if in_section == "tool_output" else notes_lines).append(line)
+            continue
+
+        # Skip template hint lines (italicised instructions)
+        if _is_template_hint(line):
+            continue
+
+        # Skip markdown table separator rows (|---|---| etc.)
+        if re.match(r"^\|[\s\-|:]+\|$", stripped):
+            if in_section == "credentials":
+                continue  # skip separator inside cred table
+
+        # ## Level headers — switch top-level section
+        if stripped.startswith("## ") and not stripped.startswith("### "):
+            header_name = stripped[3:].strip().lower()
+            found_any_section = True
+            if header_name in _INJESTOR_NOTES_HEADERS:
+                in_section = "notes"
+            elif header_name in _INJESTOR_TOOL_OUTPUT_HEADERS:
+                in_section = "tool_output"
+                result["has_tool_output_section"] = True
+            elif header_name in _INJESTOR_CRED_HEADERS:
+                in_section = "credentials"
+                current_host = "Campaign-Level"
+                result["has_credential_section"] = True
+            elif header_name in _INJESTOR_ACCESS_HEADERS:
+                in_section = "access"
+                result["has_access_section"] = True
+            else:
+                # Unknown section — treat as notes
+                in_section = "notes"
+            continue
+
+        # ### Level headers — host subsection inside Credentials
+        if stripped.startswith("### ") and in_section == "credentials":
+            host = stripped[4:].strip()
+            if host and not host.startswith("<") and host.lower() != "campaign-level":
+                current_host = host
+            else:
+                current_host = "Campaign-Level"
+            continue
+
+        # Content routing
+        if in_section == "tool_output":
+            tool_output_lines.append(line)
+        elif in_section == "credentials":
+            # Accept table rows (| col | col |) and bare user:pass lines
+            if stripped and stripped != "|":
+                # Skip empty table rows (| | | | | | |)
+                if stripped.startswith("|"):
+                    cols = [c.strip() for c in stripped.strip("|").split("|")]
+                    if any(c for c in cols):
+                        cred_host_lines[current_host].append(stripped)
+                else:
+                    cred_host_lines[current_host].append(stripped)
+        elif in_section == "access":
+            if stripped:
+                access_lines.append(stripped)
+        else:
+            # Notes section or pre-header freeform
+            notes_lines.append(line)
+
+    result["notes"] = "\n".join(notes_lines).strip()
+    result["tool_output"] = "\n".join(tool_output_lines).strip()
+    result["credentials"] = {k: "\n".join(v) for k, v in cred_host_lines.items() if v}
+    result["access"] = access_lines
+
+    # Legacy freeform: if no template sections were found, treat everything as notes
+    if not found_any_section:
+        result["freeform"] = result["notes"]
+        result["notes"] = ""
+
+    return result
+
 
 _ARP_LINE_RE = re.compile(
     r"[?\s]*\(?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)?\s+"
     r"(?:at\s+)?([0-9a-fA-F:.\-]{11,17})",
 )
 
-_EAT_ME_PROCESSED_SENTINEL = "---\n"
+_INJESTOR_PROCESSED_SENTINEL = "---\n"
 
 
-def _install_eat_me_page(vault_dir: Path) -> None:
-    """Create the Eat Me page if it doesn't exist."""
-    eat_me_path = vault_dir / "Eat Me.md"
-    if not eat_me_path.exists():
-        eat_me_path.write_text(_EAT_ME_TEMPLATE, encoding="utf-8")
-        logging.info("Created Eat Me page")
+_ASSESSMENT_CONFIG_FILENAME = "_Assessment Config.md"
+
+_ASSESSMENT_CONFIG_TEMPLATE = """\
+# Assessment Config
+
+_Loaded by mAIpper on every run. Edit here to tune LLM behavior in real time._
+_Changes take effect on the next /analyze, /deepdive, or analysis run — no restart needed._
+_Lines beginning with _ (italics) are treated as hints and ignored by the parser._
+
+---
+
+## System Prompt
+
+You are an experienced penetration tester conducting a professional engagement
+under a signed Rules of Engagement.
+
+Your job is to produce practical, concise, operator-focused analysis.
+Accuracy matters more than completeness. When in doubt, say so explicitly.
+
+GROUNDING RULES — follow these strictly:
+- Respond ONLY in English.
+- NEVER fabricate, invent, or hallucinate data. If data is insufficient, say so explicitly.
+- Only reference IPs, ports, services, hostnames, CVEs, and findings explicitly
+  present in the data you are given. Do not infer version numbers or CVE IDs
+  that are not shown.
+- If evidence is insufficient to make a claim, state "insufficient data" rather
+  than guessing.
+- Tag every finding, suggestion, or conclusion as one of:
+    [CONFIRMED]  — directly present in the provided data
+    [INFERRED]   — reasonable conclusion from the provided data
+    [ASSUMED]    — requires verification; state why
+- Do not suggest an attack path is viable unless the data supports each step.
+- Do not repeat data verbatim — synthesize and prioritize.
+- Keep responses concise and operator-focused.
+
+---
+
+## Engagement Context
+
+_Fill in details about the current engagement. Injected into every analysis prompt._
+_Leave a field blank or delete lines you don't need. Blank fields are ignored._
+
+Assessment type:
+Client environment:
+Compliance scope:
+Engagement notes:
+
+---
+
+## Chat Persona
+
+_Optional: customize how the LLM responds to direct questions in interactive mode._
+_If this section is blank, the System Prompt above is used for chat questions too._
+_Example: "Be terse. Return commands only, no explanation unless asked."_
+
+"""
+
+_ASSESSMENT_CONFIG_HINT_PREFIXES = ("_", "---")
 
 
-def _append_eat_me_to_credentials_md(
+def _install_assessment_config(vault_dir: Path) -> None:
+    """Create _Assessment Config.md in the vault root if it does not exist."""
+    cfg_path = vault_dir / _ASSESSMENT_CONFIG_FILENAME
+    if not cfg_path.exists():
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(_ASSESSMENT_CONFIG_TEMPLATE, encoding="utf-8")
+        logging.info(f"Created {_ASSESSMENT_CONFIG_FILENAME}")
+
+
+def _load_assessment_config(vault_dir: Path) -> dict:
+    """Read _Assessment Config.md and populate the active system prompt globals.
+
+    Returns a dict with keys: system_prompt, engagement_context, chat_persona,
+    effective_system (system_prompt + engagement_context combined), raw.
+
+    Safe to call when the file is missing — installs it first.
+    """
+    global _active_system_prompt, _active_chat_persona
+
+    _install_assessment_config(vault_dir)
+    cfg_path = vault_dir / _ASSESSMENT_CONFIG_FILENAME
+
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logging.warning(f"Could not read {_ASSESSMENT_CONFIG_FILENAME}: {exc}")
+        return {"system_prompt": "", "engagement_context": "",
+                "chat_persona": "", "effective_system": "", "raw": ""}
+
+    # ── Parse sections ──────────────────────────────────────────────────────
+    sections: dict[str, list[str]] = {}
+    current_key: str | None = None
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        # Top-level ## section headers
+        if stripped.startswith("## ") and not stripped.startswith("### "):
+            current_key = stripped[3:].strip().lower()
+            sections.setdefault(current_key, [])
+            continue
+        # Skip page title, dividers, and hint lines
+        if stripped == f"# {_ASSESSMENT_CONFIG_FILENAME[:-3].strip('_').strip()}":
+            continue
+        if stripped == "# Assessment Config":
+            continue
+        if stripped in ("---",):
+            continue
+        if any(stripped.startswith(p) for p in _ASSESSMENT_CONFIG_HINT_PREFIXES):
+            continue
+        if current_key is not None:
+            sections[current_key].append(line)
+
+    def _extract(key: str) -> str:
+        lines = sections.get(key, [])
+        # Strip trailing blank lines
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines).strip()
+
+    system_prompt = _extract("system prompt")
+    chat_persona  = _extract("chat persona")
+
+    # Engagement context: filter out blank key: lines (unfilled template fields)
+    ctx_lines = sections.get("engagement context", [])
+    ctx_filled: list[str] = []
+    for line in ctx_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # "Assessment type:" with nothing after — template placeholder, skip
+        if re.match(r"^[A-Za-z ]+:\s*$", stripped):
+            continue
+        ctx_filled.append(line)
+    engagement_context = "\n".join(ctx_filled).strip()
+
+    # Combine into effective system prompt
+    effective_system = system_prompt
+    if engagement_context:
+        effective_system = effective_system + "\n\n[ENGAGEMENT CONTEXT]\n" + engagement_context
+
+    # Set module globals — every subsequent ollama_chat call picks these up
+    _active_system_prompt = effective_system
+    _active_chat_persona  = chat_persona if chat_persona else effective_system
+
+    if effective_system:
+        ctx_note = f" + engagement context ({len(engagement_context)} chars)" if engagement_context else ""
+        logging.info(f"Loaded system prompt ({len(system_prompt)} chars){ctx_note}")
+
+    return {
+        "system_prompt":      system_prompt,
+        "engagement_context": engagement_context,
+        "chat_persona":       chat_persona,
+        "effective_system":   effective_system,
+        "raw":                raw,
+    }
+
+
+def _install_injestor(vault_dir: Path) -> None:
+    """Create the Injestor page if it doesn't exist."""
+    injestor_path = vault_dir / "Injestor.md"
+    if not injestor_path.exists():
+        injestor_path.write_text(_INJESTOR_TEMPLATE, encoding="utf-8")
+        logging.info("Created Injestor page")
+
+
+def _parse_credentials_md_sections(text: str) -> dict:
+    """Parse Credentials.md into a dict of sections for manipulation.
+
+    Returns:
+      {
+        "preamble": [lines before first ## section],
+        "sections": [
+          {
+            "key": "10.10.10.5",           # normalised section name
+            "header": "## [[Hosts/...|10.10.10.5]]",
+            "table_header": [...],         # the | Username | ... header lines
+            "rows": [                      # parsed row dicts
+              {"username": ..., "password": ..., "hash": ..., "hash_type": ...,
+               "source": ..., "notes": ..., "raw": "| ... |"}
+            ],
+            "operator_notes": "...",       # text under ### Operator Notes
+            "is_aggregate": False,         # True for Campaign-All-* sections
+          },
+          ...
+        ],
+      }
+    """
+    lines = text.splitlines()
+    preamble: list[str] = []
+    sections: list[dict] = []
+    current: dict | None = None
+    in_operator_notes = False
+    in_table = False
+
+    def _flush():
+        nonlocal current, in_operator_notes, in_table
+        if current is not None:
+            sections.append(current)
+        current = None
+        in_operator_notes = False
+        in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("## "):
+            _flush()
+            header_text = stripped[3:].strip()
+            # Normalise key: strip Obsidian link syntax [[Hosts/stem|key]]
+            key = header_text
+            if key.startswith("[["):
+                pipe = key.find("|")
+                bracket = key.find("]]")
+                if pipe != -1 and bracket != -1:
+                    key = key[pipe + 1:bracket]
+                else:
+                    key = key.lstrip("[").rstrip("]")
+            is_agg = key.startswith("Campaign - ")
+            current = {
+                "key": key,
+                "header": line,
+                "table_header": [],
+                "rows": [],
+                "operator_notes": "",
+                "trailing": [],
+                "is_aggregate": is_agg,
+            }
+            in_table = False
+            in_operator_notes = False
+            continue
+
+        if current is None:
+            preamble.append(line)
+            continue
+
+        if stripped == _CRED_NOTES_SENTINEL:
+            in_operator_notes = True
+            in_table = False
+            continue
+
+        if in_operator_notes:
+            if stripped == _CRED_NOTES_HINT:
+                continue
+            current["operator_notes"] += line + "\n"
+            continue
+
+        if stripped.startswith("| Username"):
+            in_table = True
+            current["table_header"] = [line]
+            continue
+
+        if in_table and stripped.startswith("|---"):
+            current["table_header"].append(line)
+            continue
+
+        if in_table and stripped.startswith("|") and stripped.endswith("|"):
+            m = _CRED_TABLE_ROW_RE.match(line)
+            if m:
+                current["rows"].append({
+                    "username": m.group(1),
+                    "password": m.group(2).strip("`").strip() if m.group(2).strip() not in ("—", "-") else "",
+                    "hash": m.group(3).strip("`").strip() if m.group(3).strip() not in ("—", "-") else "",
+                    "hash_type": m.group(4).strip() if m.group(4).strip() not in ("—", "-") else "",
+                    "source": m.group(5).strip(),
+                    "notes": m.group(6).strip() if m.group(6).strip() not in ("—", "-") else "",
+                    "raw": line,
+                })
+            else:
+                current["trailing"].append(line)
+            continue
+
+        current["trailing"].append(line)
+
+    _flush()
+    return {"preamble": preamble, "sections": sections}
+
+
+def _render_cred_row(username: str, password: str, hash_val: str, hash_type: str,
+                     source: str, notes: str) -> str:
+    """Render one credential table row."""
+    is_hash = hash_type and hash_type not in ("—", "-")
+    pw_col = "—" if (is_hash or not password) else f"`{password[:60]}`"
+    hsh_col = f"`{hash_val[:40]}`" if hash_val else "—"
+    ht_col = hash_type if hash_type else "—"
+    notes_col = notes if notes else "—"
+    return f"| `{username}` | {pw_col} | {hsh_col} | {ht_col} | {source} | {notes_col} |"
+
+
+def _sections_to_text(parsed: dict) -> str:
+    """Render parsed Credentials.md sections back to text."""
+    out: list[str] = list(parsed["preamble"])
+    table_header_default = [
+        "| Username | Password | Hash | Hash Type | Source | Notes |",
+        "|----------|----------|------|-----------|--------|-------|",
+    ]
+    for sec in parsed["sections"]:
+        out.append("")
+        out.append(sec["header"])
+        out.append("")
+        if not sec["is_aggregate"]:
+            th = sec["table_header"] if sec["table_header"] else table_header_default
+            out.extend(th)
+            for row in sec["rows"]:
+                out.append(row["raw"])
+            out.extend(sec.get("trailing", []))
+            out.append("")
+            out.append(_CRED_NOTES_SENTINEL)
+            out.append(_CRED_NOTES_HINT)
+            op = sec["operator_notes"].strip()
+            if op:
+                out.append("")
+                out.append(op)
+        else:
+            # Aggregate section — raw trailing contains the fenced block
+            out.extend(sec.get("trailing", []))
+        out.append("")
+    return "\n".join(out)
+
+
+def _rebuild_campaign_aggregates(page_path: Path) -> None:
+    """Regenerate Campaign - All Usernames and Campaign - All Passwords sections.
+
+    These are copy-paste lists at the bottom of Credentials.md for use in tools.
+    Reads all credential rows from every section, deduplicates, and writes/replaces
+    the two aggregate sections.
+    """
+    if not page_path.exists():
+        return
+
+    text = page_path.read_text(encoding="utf-8")
+    parsed = _parse_credentials_md_sections(text)
+
+    all_usernames: list[str] = []
+    all_passwords: list[str] = []
+    seen_users: set[str] = set()
+    seen_pws: set[str] = set()
+
+    for sec in parsed["sections"]:
+        if sec["is_aggregate"]:
+            continue
+        for row in sec["rows"]:
+            u = row["username"]
+            if u and u.lower() not in seen_users:
+                seen_users.add(u.lower())
+                all_usernames.append(u)
+            pw = row["password"]
+            if pw and pw.lower() not in seen_pws and not _classify_password(pw).endswith("hash"):
+                seen_pws.add(pw.lower())
+                all_passwords.append(pw)
+
+    # Remove old aggregate sections
+    parsed["sections"] = [s for s in parsed["sections"] if not s["is_aggregate"]]
+
+    # Build new aggregate sections
+    if all_usernames:
+        users_block = ["```"] + sorted(all_usernames) + ["```"]
+        parsed["sections"].append({
+            "key": "Campaign - All Usernames",
+            "header": "## Campaign - All Usernames",
+            "table_header": [],
+            "rows": [],
+            "operator_notes": "",
+            "trailing": users_block,
+            "is_aggregate": True,
+        })
+
+    if all_passwords:
+        pws_block = ["```"] + sorted(all_passwords) + ["```"]
+        parsed["sections"].append({
+            "key": "Campaign - All Passwords",
+            "header": "## Campaign - All Passwords",
+            "table_header": [],
+            "rows": [],
+            "operator_notes": "",
+            "trailing": pws_block,
+            "is_aggregate": True,
+        })
+
+    page_path.write_text(_sections_to_text(parsed), encoding="utf-8")
+
+
+def _append_injestor_to_credentials_md(
     vault_dir: Path,
     creds: list[dict],
     usernames: list[str],
     source_label: str,
 ) -> int:
-    """Append Eat Me credentials and potential usernames to Loot/Credentials.md.
+    """Upsert Injestor credentials into Loot/Credentials.md.
 
-    Returns the count of new entries added. Skips duplicates by username (case-insensitive).
+    Supports per-host sections (creds with a 'host' key), cross-host note updates,
+    and campaign-level fallback. Regenerates aggregate lists at the end.
+
+    Returns count of new rows added.
     """
     if not creds and not usernames:
         return 0
@@ -7754,170 +9665,933 @@ def _append_eat_me_to_credentials_md(
 
     existing_text = page_path.read_text(encoding="utf-8") if page_path.exists() else ""
 
-    # Collect already-known usernames to skip duplicates
-    known_users: set[str] = set()
-    for line in existing_text.splitlines():
-        m = re.match(r"\|\s*`([^`]+)`\s*\|", line)
-        if m:
-            known_users.add(m.group(1).lower())
-
-    # Build new table rows
-    new_rows: list[str] = []
-    for c in creds:
-        if c["username"].lower() in known_users:
-            continue
-        known_users.add(c["username"].lower())
-        if c["cred_type"] in ("NTLM_hash", "bcrypt_hash", "SHA256_hash", "hash", "bcrypt_hash"):
-            pw_col = "—"
-            hsh_col = f"`{c['password'][:40]}`"
-            ht_col = c["cred_type"]
-        else:
-            pw_col = f"`{c['password'][:50]}`"
-            hsh_col = "—"
-            ht_col = "—"
-        new_rows.append(f"| `{c['username']}` | {pw_col} | {hsh_col} | {ht_col} | {source_label} | — |")
-
-    for user in usernames:
-        if user.lower() in known_users:
-            continue
-        known_users.add(user.lower())
-        new_rows.append(f"| `{user}` | — | — | — | {source_label} (potential) | — |")
-
-    if not new_rows:
-        return 0
-
-    table_header = [
+    table_header_default = [
         "| Username | Password | Hash | Hash Type | Source | Notes |",
         "|----------|----------|------|-----------|--------|-------|",
     ]
 
     if not existing_text.strip():
+        # Bootstrap empty file
         lines = [
             "# Credentials & Users",
             "",
             f"_Last updated: {dt.datetime.now().isoformat(timespec='seconds')}_",
             "",
-            "## Campaign-Level",
-            "",
-        ] + table_header + new_rows + ["", _CRED_NOTES_SENTINEL, _CRED_NOTES_HINT, ""]
+        ]
         page_path.write_text("\n".join(lines), encoding="utf-8")
-        return len(new_rows)
+        existing_text = "\n".join(lines)
 
-    # File exists — find the Campaign-Level section and insert rows before its Operator Notes
-    lines = existing_text.splitlines()
-    in_campaign = False
-    table_header_found = False
-    insert_idx: int | None = None
+    parsed = _parse_credentials_md_sections(existing_text)
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped == "## Campaign-Level":
-            in_campaign = True
-            table_header_found = False
-            continue
-        if in_campaign and stripped.startswith("## ") and stripped != "## Campaign-Level":
-            insert_idx = i
-            break
-        if in_campaign and stripped.startswith("|---"):
-            table_header_found = True
-            continue
-        if in_campaign and table_header_found and stripped == _CRED_NOTES_SENTINEL:
-            insert_idx = i
-            break
+    def _find_section(key: str) -> dict | None:
+        for s in parsed["sections"]:
+            if s["key"].lower() == key.lower():
+                return s
+            # Also match by IP embedded in the key (loot-generated sections use IP as display)
+            if key.lower() in s["key"].lower():
+                return s
+        return None
 
-    if insert_idx is not None:
-        new_lines = lines[:insert_idx] + new_rows + lines[insert_idx:]
-    elif in_campaign:
-        # Reached end of file inside Campaign-Level with no sentinel
-        new_lines = lines + new_rows
+    def _get_or_create_section(key: str) -> dict:
+        sec = _find_section(key)
+        if sec:
+            return sec
+        new_sec = {
+            "key": key,
+            "header": f"## {key}",
+            "table_header": list(table_header_default),
+            "rows": [],
+            "operator_notes": "",
+            "trailing": [],
+            "is_aggregate": False,
+        }
+        # Insert before Campaign-Level or at end (before aggregates)
+        insert_at = len(parsed["sections"])
+        for idx, s in enumerate(parsed["sections"]):
+            if s["key"] == "Campaign-Level" or s["is_aggregate"]:
+                insert_at = idx
+                break
+        parsed["sections"].insert(insert_at, new_sec)
+        return new_sec
+
+    added = 0
+
+    # Group creds by host (None → Campaign-Level)
+    by_host: dict[str | None, list[dict]] = collections.defaultdict(list)
+    for c in creds:
+        by_host[c.get("host")].append(c)
+
+    for host_key, host_creds in by_host.items():
+        section_name = host_key if host_key else "Campaign-Level"
+        sec = _get_or_create_section(section_name)
+        existing_usernames = {r["username"].lower(): r for r in sec["rows"]}
+
+        for c in host_creds:
+            uname_lower = c["username"].lower()
+            if uname_lower in existing_usernames:
+                # Update Notes column if we have new info
+                existing_row = existing_usernames[uname_lower]
+                new_note = c.get("notes", "")
+                if new_note and new_note not in (existing_row.get("notes") or ""):
+                    old_note = existing_row.get("notes") or ""
+                    combined = f"{old_note}; {new_note}".strip("; ")
+                    existing_row["notes"] = combined
+                    # Rebuild raw
+                    existing_row["raw"] = _render_cred_row(
+                        existing_row["username"], existing_row["password"],
+                        existing_row["hash"], existing_row["hash_type"],
+                        existing_row["source"], combined,
+                    )
+                continue
+
+            existing_usernames[uname_lower] = {"username": c["username"]}
+            is_hash = c["cred_type"].endswith("hash") or c["cred_type"] == "hash"
+            new_row = {
+                "username": c["username"],
+                "password": "" if is_hash else c["password"],
+                "hash": c["password"] if is_hash else "",
+                "hash_type": c["cred_type"] if is_hash else "",
+                "source": source_label,
+                "notes": c.get("notes") or "",
+                "raw": _render_cred_row(
+                    c["username"],
+                    "" if is_hash else c["password"],
+                    c["password"] if is_hash else "",
+                    c["cred_type"] if is_hash else "",
+                    source_label,
+                    c.get("notes") or "",
+                ),
+            }
+            sec["rows"].append(new_row)
+            if not sec["table_header"]:
+                sec["table_header"] = list(table_header_default)
+            added += 1
+
+    # Standalone usernames → Campaign-Level
+    if usernames:
+        sec = _get_or_create_section("Campaign-Level")
+        existing_usernames = {r["username"].lower() for r in sec["rows"]}
+        for user in usernames:
+            if user.lower() not in existing_usernames:
+                existing_usernames.add(user.lower())
+                row = {
+                    "username": user, "password": "", "hash": "",
+                    "hash_type": "", "source": f"{source_label} (potential)", "notes": "",
+                    "raw": _render_cred_row(user, "", "", "", f"{source_label} (potential)", ""),
+                }
+                sec["rows"].append(row)
+                if not sec["table_header"]:
+                    sec["table_header"] = list(table_header_default)
+                added += 1
+
+    page_path.write_text(_sections_to_text(parsed), encoding="utf-8")
+    _rebuild_campaign_aggregates(page_path)
+    return added
+
+
+# ============================================================
+# Post-exploitation / access tracking
+# ============================================================
+
+_ACCESS_TABLE_HEADER = (
+    "| User | Privilege | Method | Session | Notes |\n"
+    "|------|-----------|--------|---------|-------|\n"
+)
+
+_ACCESS_SECTION = "## Access"
+
+# Regex: parse a "+access" command line
+# Examples:
+#   +access administrator@10.10.10.5 SYSTEM meterpreter
+#   +access svc_sql@dc01 LocalAdmin psexec "DB service account"
+_ACCESS_CMD_RE = re.compile(
+    r"^(?:\+access\s+)?(?P<user>[^\s@]+)@(?P<host>[^\s]+)\s+"
+    r"(?P<priv>\S+)\s+(?P<method>\S+)"
+    r"(?:\s+(?P<session>\S+))?"
+    r"(?:\s+\"?(?P<notes>.+?)\"?\s*)?$",
+    re.IGNORECASE,
+)
+
+
+def _find_host_note_by_key(hosts_dir: Path, host_key: str) -> Path | None:
+    """Find a host note by IP or hostname, case-insensitive."""
+    target = safe_filename(host_key).lower()
+    for p in hosts_dir.glob("*.md"):
+        if p.stem.lower() == target:
+            return p
+        # Check frontmatter ip field
+        try:
+            text = p.read_text(encoding="utf-8")
+            fm, _ = read_frontmatter(text)
+            if fm.get("ip", "").lower() == host_key.lower():
+                return p
+            hostnames = fm.get("hostnames", []) or []
+            if any(h.lower() == host_key.lower() for h in hostnames):
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def _add_host_access(
+    hosts_dir: Path,
+    host_key: str,
+    user: str,
+    privilege: str,
+    method: str,
+    session: str = "",
+    notes: str = "",
+    source: str = "Manual",
+) -> bool:
+    """Add an access entry to a host note's ## Access section.
+
+    Creates the section if it doesn't exist. Updates the host's status to
+    'exploited' if privilege is SYSTEM, root, or Administrator.
+    Returns True if the note was updated.
+    """
+    host_note = _find_host_note_by_key(hosts_dir, host_key)
+    if not host_note:
+        return False
+
+    text = host_note.read_text(encoding="utf-8")
+    fm, body = read_frontmatter(text)
+
+    # Build the new table row
+    row = f"| {user} | {privilege} | {method} | {session or '-'} | {notes or '-'} |"
+
+    if _ACCESS_SECTION in body:
+        section_content = extract_body_section(body, _ACCESS_SECTION)
+        # Check for duplicate (same user + method)
+        if f"| {user} |" in section_content and f"| {method} |" in section_content:
+            return False
+        # Append row — if table header exists just add row, else create table
+        if "| User |" in section_content:
+            old_section_text = f"{_ACCESS_SECTION}\n{section_content}" if section_content else _ACCESS_SECTION
+            new_section_text = old_section_text.rstrip() + f"\n{row}"
+        else:
+            old_section_text = f"{_ACCESS_SECTION}\n{section_content}" if section_content else _ACCESS_SECTION
+            new_section_text = (
+                f"{_ACCESS_SECTION}\n{_ACCESS_TABLE_HEADER}{row}"
+            )
+        body = body.replace(old_section_text, new_section_text, 1)
     else:
-        # No Campaign-Level section — append one
-        new_lines = lines + [
-            "",
-            "## Campaign-Level",
-            "",
-        ] + table_header + new_rows + ["", _CRED_NOTES_SENTINEL, _CRED_NOTES_HINT, ""]
+        access_block = f"{_ACCESS_SECTION}\n{_ACCESS_TABLE_HEADER}{row}"
+        # Insert before Deep Dives or Operator Notes
+        inserted = False
+        for anchor in [DEEP_DIVE_SECTION, CROSS_SOURCE_SECTION, "## Scan References", OPERATOR_NOTES_SENTINEL]:
+            idx = body.find(f"\n{anchor}")
+            if idx == -1:
+                idx = body.find(anchor)
+            if idx != -1:
+                body = body[:idx] + f"\n\n{access_block}" + body[idx:]
+                inserted = True
+                break
+        if not inserted:
+            body = body.rstrip() + f"\n\n{access_block}\n"
 
-    page_path.write_text("\n".join(new_lines), encoding="utf-8")
-    return len(new_rows)
+    # Auto-update status to exploited for high-privilege access
+    high_priv = {"system", "root", "administrator", "admin", "nt authority\\system"}
+    if privilege.lower() in high_priv:
+        fm["status"] = "exploited"
+
+    # Rebuild the note
+    new_text = write_frontmatter(fm) + "\n" + body
+    host_note.write_text(new_text, encoding="utf-8")
+    logging.info(f"[Access] Added {user}@{host_key} ({privilege} via {method})")
+    return True
 
 
-def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
-    """Process the Eat Me page: extract IPs, hostnames, creds, etc.
+def _get_all_access(vault_dir: Path) -> list[dict]:
+    """Collect all access entries from all host notes."""
+    hosts_dir = vault_dir / "Hosts"
+    if not hosts_dir.exists():
+        return []
+
+    all_entries: list[dict] = []
+    for host_path in sorted(hosts_dir.glob("*.md")):
+        if host_path.stem.startswith("_"):
+            continue
+        try:
+            text = host_path.read_text(encoding="utf-8")
+            fm, body = read_frontmatter(text)
+        except Exception:
+            continue
+
+        section = extract_body_section(body, _ACCESS_SECTION)
+        if not section:
+            continue
+
+        ip = fm.get("ip", host_path.stem)
+        for line in section.splitlines():
+            line = line.strip()
+            if not line.startswith("|") or "User" in line or "---" in line:
+                continue
+            cols = [c.strip() for c in line.strip("|").split("|")]
+            if len(cols) >= 5:
+                all_entries.append({
+                    "host": ip,
+                    "host_stem": host_path.stem,
+                    "user": cols[0],
+                    "privilege": cols[1],
+                    "method": cols[2],
+                    "session": cols[3],
+                    "notes": cols[4],
+                })
+
+    return all_entries
+
+
+def _print_access_summary(vault_dir: Path) -> None:
+    """Print a campaign-level access summary to stdout."""
+    entries = _get_all_access(vault_dir)
+    if not entries:
+        print("  No access entries recorded. Use '+access user@host priv method' to add.")
+        return
+
+    print(f"\n  {'HOST':<20} {'USER':<20} {'PRIV':<14} {'METHOD':<16} NOTES")
+    print(f"  {'-'*20} {'-'*20} {'-'*14} {'-'*16} {'-'*20}")
+    for e in sorted(entries, key=lambda x: (x["host"], x["privilege"])):
+        print(f"  {e['host']:<20} {e['user']:<20} {e['privilege']:<14} {e['method']:<16} {e['notes']}")
+    print()
+
+
+def _link_injestor_creds_to_host_note(
+    hosts_dir: Path, host_key: str, cred_count: int, source_label: str
+) -> None:
+    """Update the ## Loot section of a host note to reference Injestor credentials."""
+    # Find note by IP or by stem name
+    host_note = _find_host_note_by_ip(hosts_dir, host_key)
+    if not host_note:
+        for f in hosts_dir.glob("*.md"):
+            if f.stem.lower() == host_key.lower() or f.stem.lower() == safe_filename(host_key).lower():
+                host_note = f
+                break
+    if not host_note or not host_note.exists():
+        return
+
+    try:
+        text = host_note.read_text(encoding="utf-8")
+    except Exception:
+        return
+
+    fm_text, body = split_frontmatter(text)
+    existing_loot = extract_body_section(body, "## Loot")
+    tag = f"Injestor ({source_label})"
+    cred_line = (
+        f"**Credentials ({tag}):** {cred_count} entr{'y' if cred_count == 1 else 'ies'}"
+        f" — [[Loot/Credentials|View in Credentials]]"
+    )
+
+    if existing_loot.strip():
+        # Replace existing tag line or append
+        loot_lines = existing_loot.splitlines()
+        replaced = False
+        for idx, l in enumerate(loot_lines):
+            if f"Credentials ({tag})" in l:
+                loot_lines[idx] = cred_line
+                replaced = True
+                break
+        if not replaced:
+            loot_lines.append("")
+            loot_lines.append(cred_line)
+        new_loot = "\n".join(loot_lines)
+    else:
+        new_loot = cred_line
+
+    # Rebuild body sections preserving all existing content
+    body_without_loot = re.sub(
+        r"(?m)^## Loot\n.*?(?=^## |\Z)", "", body, flags=re.DOTALL
+    ).strip()
+
+    # Find insert position — before ## Deep Dives or ## Operator Notes
+    insert_before = ["## Deep Dives", "## Cross-Source Analysis", "## Scan References",
+                     "## Operator Notes"]
+    insert_idx = len(body_without_loot)
+    for marker in insert_before:
+        pos = body_without_loot.find(f"\n{marker}")
+        if pos != -1 and pos < insert_idx:
+            insert_idx = pos
+
+    if insert_idx < len(body_without_loot):
+        new_body = (
+            body_without_loot[:insert_idx].rstrip()
+            + "\n\n## Loot\n\n" + new_loot
+            + "\n\n" + body_without_loot[insert_idx:].lstrip()
+        )
+    else:
+        new_body = body_without_loot.rstrip() + "\n\n## Loot\n\n" + new_loot + "\n"
+
+    host_note.write_text(fm_text + "\n" + new_body, encoding="utf-8")
+    logging.debug(f"Updated Loot section in {host_note.name} with {cred_count} Injestor credentials")
+
+
+def _parse_cred_table_rows(text: str) -> list[dict]:
+    """Parse Credentials section content into cred dicts.
+
+    Accepts:
+    - Markdown table rows: | username | password | hash | hash_type | host | notes |
+    - Bare lines:          username:password  or  username:NTLMhash
+    """
+    creds: list[dict] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("|---"):
+            continue
+        if stripped.startswith("|"):
+            # Table row
+            cols = [c.strip() for c in stripped.strip("|").split("|")]
+            # Skip header rows
+            if cols and cols[0].lower() in ("username", "user"):
+                continue
+            if len(cols) >= 1 and cols[0]:
+                username  = cols[0] if len(cols) > 0 else ""
+                password  = cols[1] if len(cols) > 1 else ""
+                hash_val  = cols[2] if len(cols) > 2 else ""
+                hash_type = cols[3] if len(cols) > 3 else ""
+                host      = cols[4] if len(cols) > 4 else ""
+                notes     = cols[5] if len(cols) > 5 else ""
+                if not username:
+                    continue
+                cred_type = "plaintext"
+                if hash_val and not password:
+                    cred_type = hash_type or _classify_hash(hash_val)
+                creds.append({
+                    "username": username,
+                    "password": password or hash_val,
+                    "cred_type": cred_type,
+                    "host": host or None,
+                    "notes": notes,
+                    "confidence": "high",
+                })
+        elif ":" in stripped:
+            # Bare user:pass or user:hash line
+            parsed = _extract_credentials(stripped)
+            creds.extend(parsed)
+    return creds
+
+
+def _classify_hash(h: str) -> str:
+    """Return a hash type label from a hash string."""
+    h = h.strip()
+    if len(h) == 32 and all(c in "0123456789abcdefABCDEF" for c in h):
+        return "NTLM"
+    if len(h) == 40 and all(c in "0123456789abcdefABCDEF" for c in h):
+        return "SHA1"
+    if h.startswith("$2") and len(h) > 20:
+        return "bcrypt"
+    if h.startswith("$6$"):
+        return "sha512crypt"
+    if h.startswith("$1$"):
+        return "md5crypt"
+    if ":".join([""] * 7) and len(h) > 50:
+        return "NTLM"
+    return "hash"
+
+
+_LLM_EXTRACT_CREDS_PROMPT = """\
+GROUNDING RULES:
+- Return ONLY valid JSON. No markdown fences, no explanation, no commentary.
+- Extract ONLY what is EXPLICITLY present in the tool output.
+- Do NOT invent, guess, or hallucinate credentials, usernames, or hosts.
+- confidence "high"  = format is unambiguous (secretsdump line, /etc/passwd entry, Responder NTLM capture)
+- confidence "medium" = probable credential but context has some ambiguity
+- confidence "low"   = might be a username but could be a hostname, service name, or other identifier
+- If a value looks like a machine account (ends in $) or a hostname, set confidence "low".
+- hash_type must be one of: NTLM, NTLMv2, NetNTLMv2, SHA1, SHA256, bcrypt, sha512crypt, md5crypt, DCC2, AS-REP, TGS, plaintext, unknown
+
+Tool output to analyze:
+---
+{content}
+---
+
+Return JSON with this exact structure (omit empty arrays):
+{{
+  "tool": "tool name (e.g. secretsdump, /etc/passwd, responder, mimikatz, hashdump, ldapsearch, unknown)",
+  "credentials": [
+    {{"username": "...", "password": "...", "hash": "...", "hash_type": "...", "host": "...", "confidence": "high|medium|low", "notes": "..."}}
+  ],
+  "usernames": [
+    {{"username": "...", "context": "brief description of where found", "confidence": "high|medium|low"}}
+  ]
+}}
+"""
+
+
+def _llm_extract_tool_output(content: str, args) -> dict:
+    """Send tool output to LLM for structured credential extraction.
+
+    Returns dict with keys: tool, credentials (list), usernames (list).
+    Falls back to empty result on any failure.
+    """
+    empty = {"tool": "unknown", "credentials": [], "usernames": []}
+
+    if not content.strip() or getattr(args, "no_ollama", True):
+        return empty
+
+    # Require minimum content — reject if it's just a few words (likely leaked hint text)
+    word_count = len(content.split())
+    if word_count < 10:
+        logging.debug(f"[Injestor] Tool output too short ({word_count} words) — skipping LLM extraction")
+        return empty
+
+    # Reject if content looks like it's still template hint text (no real data)
+    low = content.lower()
+    hint_signals = ["lazagne, mimikatz", "credential-bearing output", "paste raw tool"]
+    if any(sig in low for sig in hint_signals):
+        logging.debug("[Injestor] Tool output contains template hint text — skipping LLM extraction")
+        return empty
+
+    # Truncate very large outputs to keep prompt manageable
+    if len(content) > 8000:
+        content = content[:8000] + "\n... [truncated]"
+
+    prompt = _LLM_EXTRACT_CREDS_PROMPT.format(content=content)
+    try:
+        raw = ollama_chat(args.ollama_url, args.model, prompt, temperature=0.05)
+    except Exception as exc:
+        logging.warning(f"[Injestor] LLM extraction failed: {exc}")
+        return {"tool": "unknown", "credentials": [], "usernames": []}
+
+    # Strip markdown fences if model wrapped output anyway
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract just the JSON object
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                logging.warning(f"[Injestor] Could not parse LLM JSON response")
+                return {"tool": "unknown", "credentials": [], "usernames": []}
+        else:
+            return {"tool": "unknown", "credentials": [], "usernames": []}
+
+    return {
+        "tool": data.get("tool", "unknown"),
+        "credentials": data.get("credentials", []),
+        "usernames": data.get("usernames", []),
+    }
+
+
+def _build_pending_review_section(extracted: dict, source_label: str) -> str:
+    """Render the ## Pending Review section for a scan archive note."""
+    tool = extracted.get("tool", "unknown")
+    creds = extracted.get("credentials", [])
+    usernames = extracted.get("usernames", [])
+
+    lines = [
+        REVIEW_SECTION,
+        "",
+        f"_LLM-extracted from {tool} output ({source_label})._",
+        "_Check [x] each row to approve. Uncheck or delete rows to discard._",
+        "_Run /review (or hit Enter) to promote approved entries to Loot/Credentials.md._",
+        "",
+    ]
+
+    if creds:
+        lines += ["**Credentials**", ""]
+        for c in creds:
+            user     = c.get("username", "")
+            pw       = c.get("password", "")
+            hash_val = c.get("hash", "")
+            htype    = c.get("hash_type", "")
+            host     = c.get("host", "")
+            conf     = c.get("confidence", "medium")
+            notes    = c.get("notes", "")
+            secret   = hash_val or pw
+            type_str = htype if htype else ("plaintext" if pw and not hash_val else "hash")
+            host_str = f" | host: `{host}`" if host else ""
+            note_str = f" | {notes}" if notes else ""
+            conf_str = f" | confidence: {conf}" if conf != "high" else ""
+            lines.append(
+                f"- [ ] `{user}` | `{secret[:60]}{'...' if len(secret) > 60 else ''}` "
+                f"| {type_str}{host_str}{note_str}{conf_str}"
+            )
+
+    if usernames:
+        lines += ["", "**Usernames** _(no password found)_", ""]
+        for u in usernames:
+            uname = u.get("username", "")
+            ctx   = u.get("context", "")
+            conf  = u.get("confidence", "medium")
+            conf_str = f" | confidence: {conf}" if conf != "high" else ""
+            ctx_str  = f" | {ctx}" if ctx else ""
+            lines.append(f"- [ ] `{uname}`{ctx_str}{conf_str}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _count_pending_reviews(vault_dir: Path) -> int:
+    """Count scan archive notes with checked review rows ready to promote."""
+    scans_dir = vault_dir / "Scans"
+    if not scans_dir.exists():
+        return 0
+    count = 0
+    for p in scans_dir.glob(f"{REVIEW_FILENAME_PREFIX}*.md"):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        section = extract_body_section(text, REVIEW_SECTION)
+        if section and REVIEW_PENDING_RE.search(section):
+            count += 1
+    return count
+
+
+def _parse_pending_review_row(line: str) -> dict | None:
+    """Parse a checked pending review row back into a cred/username dict.
+
+    Row formats:
+      - [x] `user` | `secret` | NTLM | host: `10.10.10.5` | confidence: high
+      - [x] `user` | context | confidence: low   (username-only)
+    """
+    # Strip checkbox prefix
+    m = re.match(r"^\s*- \[x\]\s+(.+)$", line)
+    if not m:
+        return None
+    content = m.group(1).strip()
+
+    # Split on | delimiter
+    parts = [p.strip() for p in content.split("|")]
+
+    # Extract username (always first backtick-quoted token)
+    um = re.match(r"`([^`]+)`", parts[0]) if parts else None
+    if not um:
+        return None
+    username = um.group(1)
+
+    if len(parts) < 2:
+        return {"username": username, "password": "", "hash": "", "hash_type": "",
+                "host": "", "cred_type": "potential", "notes": ""}
+
+    # Second field is the secret (password or hash)
+    sm = re.match(r"`([^`]+)`", parts[1]) if len(parts) > 1 else None
+    secret = sm.group(1) if sm else parts[1] if len(parts) > 1 else ""
+
+    # Remaining parts as key:value pairs
+    kv: dict[str, str] = {}
+    for part in parts[2:]:
+        if ":" in part:
+            k, _, v = part.partition(":")
+            kv[k.strip().lower()] = v.strip().strip("`")
+        else:
+            # bare value — treat as hash type or notes
+            if not kv.get("type"):
+                kv["type"] = part.strip()
+
+    host      = kv.get("host", "")
+    hash_type = kv.get("type", kv.get("hash_type", ""))
+    notes     = kv.get("notes", "")
+
+    # Determine if secret is hash or password
+    is_hash = (hash_type and hash_type.lower() not in ("plaintext",)) or (
+        len(secret) in (32, 40) and all(c in "0123456789abcdefABCDEF" for c in secret)
+    )
+
+    return {
+        "username":  username,
+        "password":  "" if is_hash else secret,
+        "hash":      secret if is_hash else "",
+        "hash_type": hash_type if is_hash else "",
+        "host":      host or None,
+        "cred_type": hash_type if is_hash else "plaintext",
+        "notes":     notes,
+    }
+
+
+def _process_review_requests(vault_dir: Path) -> int:
+    """Promote confirmed (checked) entries from [REVIEW] scan notes to Loot files.
+
+    For each [REVIEW] *.md scan note with at least one checked row in ## Pending Review:
+    1. Parse checked rows → cred dicts
+    2. Write to Loot/Credentials.md and Loot/Hashes.md
+    3. Update host notes (## Loot section)
+    4. Rename file to strip [REVIEW] prefix
+    5. Mark [/] Review: Credentials
+    """
+    scans_dir = vault_dir / "Scans"
+    if not scans_dir.exists():
+        return 0
+
+    promoted_total = 0
+
+    for review_path in sorted(scans_dir.glob(f"{REVIEW_FILENAME_PREFIX}*.md")):
+        try:
+            text = review_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        section = extract_body_section(text, REVIEW_SECTION)
+        if not section:
+            continue
+
+        # Collect checked rows
+        checked_lines = [ln for ln in section.splitlines()
+                         if re.match(r"^\s*- \[x\]", ln)]
+        if not checked_lines:
+            continue
+
+        # Parse into cred dicts
+        creds: list[dict] = []
+        usernames: list[str] = []
+        for line in checked_lines:
+            parsed = _parse_pending_review_row(line)
+            if parsed:
+                if parsed["password"] or parsed["hash"]:
+                    creds.append(parsed)
+                else:
+                    usernames.append(parsed["username"])
+
+        source_label = review_path.stem.removeprefix(REVIEW_FILENAME_PREFIX)
+
+        if creds or usernames:
+            added = _append_injestor_to_credentials_md(
+                vault_dir, creds, usernames, source_label,
+            )
+            promoted_total += added
+            logging.info(f"[Review] Promoted {added} entries from {review_path.name}")
+
+            # Update host notes for host-specific creds
+            hosts_dir = vault_dir / "Hosts"
+            host_cred_counts: dict[str, int] = collections.defaultdict(int)
+            for c in creds:
+                if c.get("host"):
+                    host_cred_counts[c["host"]] += 1
+            for host_key, count in host_cred_counts.items():
+                _link_injestor_creds_to_host_note(hosts_dir, host_key, count, source_label)
+
+        # Mark checkbox done and remove [REVIEW] prefix from filename
+        new_text = text.replace(
+            "- [ ] Review: Credentials", REVIEW_CHECKBOX_DONE, 1
+        ).replace(
+            "- [x] Review: Credentials", REVIEW_CHECKBOX_DONE, 1
+        )
+        # Mark all promoted rows as done [/]
+        def _mark_promoted(m: re.Match) -> str:
+            line = m.group(0)
+            parsed = _parse_pending_review_row(line)
+            return line.replace("- [x]", "- [/]", 1) if parsed else line
+
+        new_section = re.sub(r"^\s*- \[x\].+$", _mark_promoted, section, flags=re.MULTILINE)
+        new_text = new_text.replace(section, new_section, 1)
+
+        # Write updated content to file without the [REVIEW] prefix
+        new_name = review_path.name.removeprefix(REVIEW_FILENAME_PREFIX)
+        new_path = scans_dir / new_name
+        new_path.write_text(new_text, encoding="utf-8")
+        review_path.unlink()
+        logging.info(f"[Review] Renamed {review_path.name} → {new_name}")
+
+    return promoted_total
+
+
+def _process_injestor(vault_dir: Path, args=None) -> dict | None:
+    """Process the Injestor page: extract IPs, hostnames, creds, etc.
 
     Returns a dict of extracted data, or None if nothing to process.
     Moves processed content to Scans/ and resets the page.
     """
-    eat_me_path = vault_dir / "Eat Me.md"
-    if not eat_me_path.exists():
+    injestor_path = vault_dir / "Injestor.md"
+    if not injestor_path.exists():
         return None
 
     try:
-        raw = eat_me_path.read_text(encoding="utf-8")
+        raw = injestor_path.read_text(encoding="utf-8")
     except Exception:
         return None
 
-    # Strip template boilerplate to find user content
-    content = raw
-    for prefix in [
-        "# Eat Me\n",
-        "_Paste anything here",
-        "_On next mAIpper run",
-        "---",
-    ]:
-        idx = content.find(prefix)
-        if idx != -1:
-            newline = content.find("\n", idx)
-            if newline != -1:
-                content = content[newline + 1:]
+    # Parse structured template sections or fall back to freeform
+    injestor_parsed = _parse_injestor_sections(raw)
 
-    content = content.strip()
-    if not content:
+    # Determine what content is available in each section
+    notes_content   = injestor_parsed.get("notes", "") or injestor_parsed.get("freeform", "")
+    tool_output     = injestor_parsed.get("tool_output", "")
+    has_cred_content = any(v.strip() for v in injestor_parsed["credentials"].values())
+    has_tool_output  = bool(tool_output.strip())
+    has_notes        = bool(notes_content.strip())
+
+    # For legacy freeform (no template sections found), treat everything as notes
+    is_legacy = not (injestor_parsed.get("has_credential_section") or
+                     injestor_parsed.get("has_tool_output_section") or
+                     injestor_parsed.get("has_access_section"))
+    if is_legacy:
+        # Strip template boilerplate if user left it in
+        raw_stripped = raw
+        for prefix in ["# Injestor\n", "# Eat Me\n", "_Paste anything here", "_On next mAIpper run"]:
+            idx = raw_stripped.find(prefix)
+            if idx != -1:
+                newline = raw_stripped.find("\n", idx)
+                if newline != -1:
+                    raw_stripped = raw_stripped[newline + 1:]
+        notes_content = raw_stripped.strip()
+        has_notes = bool(notes_content)
+
+    if not has_notes and not has_cred_content and not has_tool_output and not injestor_parsed.get("access"):
         return None
 
-    logging.info(f"Eat Me: processing {len(content)} chars of operator input")
+    logging.info(
+        f"Injestor: processing — "
+        f"notes={len(notes_content)}c, "
+        f"tool_output={len(tool_output)}c, "
+        f"cred_sections={len(injestor_parsed['credentials'])}, "
+        f"access_entries={len(injestor_parsed.get('access', []))}"
+    )
 
-    # ── Extract data ──
+    # ── IP/hostname extraction — Notes section only ──
     discovered_ips: set[str] = set()
     discovered_hostnames: set[str] = set()
     discovered_urls: set[str] = set()
-    discovered_creds: list[dict] = []
     ip_mac_map: dict[str, str] = {}
-
-    # Parse arp -a output (Linux and Windows formats)
-    for m in _ARP_LINE_RE.finditer(content):
-        ip = m.group(1)
-        mac = m.group(2)
-        if _is_target_ip(ip):
-            discovered_ips.add(ip)
-            ip_mac_map[ip] = mac
-
-    # Parse plain IPs
-    for ip in IP_IN_TEXT_RE.findall(content):
-        if _is_target_ip(ip):
-            discovered_ips.add(ip)
-
-    # Parse FQDNs
-    for m in FQDN_IN_TEXT_RE.finditer(content):
-        fqdn = m.group(0).lower().rstrip(".")
-        if is_probable_fqdn(fqdn) and "." in fqdn:
-            discovered_hostnames.add(fqdn)
-
-    # Parse URLs (extract domain)
     url_re = re.compile(r"https?://([a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)+)(?:[:/]|$)", re.IGNORECASE)
-    for m in url_re.finditer(content):
-        domain = m.group(1).lower()
-        if not IPV4_RE.match(domain):
-            discovered_urls.add(domain)
-            discovered_hostnames.add(domain)
 
-    # Parse credentials and standalone usernames
-    discovered_creds = _extract_credentials(content)
-    known_cred_users = {c["username"] for c in discovered_creds}
-    discovered_usernames = _extract_usernames(content, known_cred_users)
+    for scan_content in [notes_content, tool_output]:
+        if not scan_content:
+            continue
+        for m in _ARP_LINE_RE.finditer(scan_content):
+            ip, mac = m.group(1), m.group(2)
+            if _is_target_ip(ip):
+                discovered_ips.add(ip)
+                ip_mac_map[ip] = mac
+        for ip in IP_IN_TEXT_RE.findall(scan_content):
+            if _is_target_ip(ip):
+                discovered_ips.add(ip)
+        for m in FQDN_IN_TEXT_RE.finditer(scan_content):
+            fqdn = m.group(0).lower().rstrip(".")
+            if is_probable_fqdn(fqdn) and "." in fqdn:
+                discovered_hostnames.add(fqdn)
+        for m in url_re.finditer(scan_content):
+            domain = m.group(1).lower()
+            if not IPV4_RE.match(domain):
+                discovered_urls.add(domain)
+                discovered_hostnames.add(domain)
 
-    if not discovered_ips and not discovered_hostnames and not discovered_creds and not discovered_usernames:
-        logging.info("Eat Me: no structured data found, saving as misc")
+    # ── Credential extraction — three independent paths ──
+
+    # Path 1: ## Credentials — structured table/line input (Python only, high confidence)
+    discovered_creds: list[dict] = []
+    for host_key, cred_text in injestor_parsed["credentials"].items():
+        host_val = None if host_key == "Campaign-Level" else host_key
+        table_creds = _parse_cred_table_rows(cred_text)
+        if table_creds:
+            for c in table_creds:
+                c["host"] = c.get("host") or host_val
+                discovered_creds.append(c)
+        else:
+            # Fall back to line-by-line parsing for bare user:pass lines
+            for c in _parse_injestor_creds_with_host(cred_text):
+                c["host"] = host_val
+                discovered_creds.append(c)
+        for ip in IP_IN_TEXT_RE.findall(cred_text):
+            if _is_target_ip(ip):
+                discovered_ips.add(ip)
+
+    # Path 2: Notes content — smart detection
+    #   - Legacy (no template): extract explicit user:pass lines + username lists (Python, direct to Loot)
+    #   - NXC detected: Python fast-path → direct to Loot (no LLM, no review)
+    #   - Kiwi/secretsdump detected: Python fast-path → direct to Loot (no LLM, no review)
+    #   - Substantive freeform / unknown tool: queue for LLM → Pending Review
+    discovered_usernames: list[str] = []
+    _nxc_injestor_data: dict | None = None
+    _kiwi_fast_pathed = False
+    notes_for_llm = ""
+
+    def _run_kiwi_fastpath(content: str, label: str) -> None:
+        nonlocal _kiwi_fast_pathed
+        host_hint = next(
+            (ip for ip in IP_IN_TEXT_RE.findall(content) if _is_target_ip(ip)), ""
+        )
+        kiwi_result = parse_kiwi_secretsdump(content, host=host_hint)
+        kiwi_creds = kiwi_result["credentials"]
+        if kiwi_creds:
+            discovered_creds.extend(kiwi_creds)
+            _kiwi_fast_pathed = True
+            logging.info(
+                f"Injestor: kiwi/secretsdump detected in {label} — "
+                f"{len(kiwi_creds)} credential/hash entries extracted"
+            )
+            print(f"  [+] Kiwi/secretsdump parsed from {label}: "
+                  f"{len(kiwi_creds)} entries → Loot/Credentials.md (no review needed)")
+
+    if notes_content:
+        # Legacy mode: explicit user:pass pairs and bare username lists are unambiguous
+        if is_legacy:
+            legacy_creds = _parse_injestor_creds_with_host(notes_content)
+            discovered_creds.extend(legacy_creds)
+            known_cred_users = {c["username"] for c in discovered_creds}
+            discovered_usernames = _extract_usernames(notes_content, known_cred_users)
+
+        # NXC fast-path — structured output, no LLM needed
+        if NXC_STATUS_LINE_RE.search(notes_content):
+            _nxc_injestor_data = parse_nxc_stdout(notes_content)
+            for _nxc_ip in _nxc_injestor_data.get("hosts", {}):
+                if _is_target_ip(_nxc_ip):
+                    discovered_ips.add(_nxc_ip)
+            logging.info(
+                f"Injestor: NXC detected in Notes — "
+                f"{len(_nxc_injestor_data['hosts'])} hosts, "
+                f"{len(_nxc_injestor_data.get('creds', []))} credentials"
+            )
+        # Kiwi/secretsdump fast-path
+        elif detect_kiwi_secretsdump(notes_content):
+            _run_kiwi_fastpath(notes_content, "Notes")
+        else:
+            # Check if Notes has substantive content beyond bare IP/hostname lists
+            non_ip_words = [
+                w for w in notes_content.split()
+                if not IP_IN_TEXT_RE.match(w.strip(".,;:/"))
+                and len(w.strip(".,;:/")) > 2
+            ]
+            if len(non_ip_words) >= 8:
+                # Freeform or unrecognised tool — queue for LLM → Pending Review
+                notes_for_llm = notes_content
+
+    # Path 3: LLM extraction on Notes (if substantive) + Tool Output → Pending Review
+    # Fast-paths (NXC, kiwi) on Tool Output run first; remaining content goes to LLM
+    llm_extracted: dict = {"tool": "unknown", "credentials": [], "usernames": []}
+
+    if has_tool_output:
+        if not _nxc_injestor_data and NXC_STATUS_LINE_RE.search(tool_output):
+            _nxc_injestor_data = parse_nxc_stdout(tool_output)
+            for _nxc_ip in _nxc_injestor_data.get("hosts", {}):
+                if _is_target_ip(_nxc_ip):
+                    discovered_ips.add(_nxc_ip)
+            logging.info(
+                f"Injestor: NXC detected in Tool Output — "
+                f"{len(_nxc_injestor_data['hosts'])} hosts, "
+                f"{len(_nxc_injestor_data.get('creds', []))} credentials"
+            )
+        elif not _kiwi_fast_pathed and detect_kiwi_secretsdump(tool_output):
+            _run_kiwi_fastpath(tool_output, "Tool Output")
+        else:
+            # Non-fast-path tool output goes to LLM
+            notes_for_llm = "\n\n".join(filter(None, [notes_for_llm, tool_output]))
+
+    # Run LLM on the combined input (Notes + Tool Output where applicable)
+    if notes_for_llm and args and not getattr(args, "no_ollama", True):
+        sources = []
+        if notes_content and notes_for_llm.startswith(notes_content[:40].strip()):
+            sources.append("Notes")
+        if has_tool_output and not _nxc_injestor_data:
+            sources.append("Tool Output")
+        source_label_llm = " + ".join(sources) if sources else "input"
+        print(f"  [*] LLM extracting credentials from {source_label_llm}...")
+        llm_extracted = _llm_extract_tool_output(notes_for_llm, args)
+        logging.info(
+            f"Injestor: LLM extracted {len(llm_extracted['credentials'])} credentials, "
+            f"{len(llm_extracted['usernames'])} usernames"
+        )
+
+    has_llm_extractions = bool(llm_extracted["credentials"] or llm_extracted["usernames"])
+
+    if not discovered_ips and not discovered_hostnames and not discovered_creds and not has_llm_extractions:
+        logging.info("Injestor: no structured data found, saving as misc")
 
     # ── Create host notes for new IPs ──
     hosts_dir = vault_dir / "Hosts"
@@ -7927,7 +10601,7 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
     for ip in sorted(discovered_ips):
         existing = _find_host_note_by_ip(hosts_dir, ip)
         if existing:
-            logging.debug(f"Eat Me: host {ip} already exists ({existing.stem})")
+            logging.debug(f"Injestor: host {ip} already exists ({existing.stem})")
             continue
 
         new_hosts.append(ip)
@@ -7946,7 +10620,7 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
                 associated_hostnames.append(hn)
                 break
 
-        tags: list[str] = ["eat-me"]
+        tags: list[str] = ["injestor"]
         mac = ip_mac_map.get(ip, "")
 
         fm = {
@@ -7954,7 +10628,7 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
             "hostnames": associated_hostnames,
             "status": "not-started",
             "tags": tags,
-            "sources": ["Eat Me"],
+            "sources": ["Injestor"],
         }
 
         body_lines = [
@@ -7981,12 +10655,16 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
             OPERATOR_NOTES_SENTINEL,
             OPERATOR_NOTES_HINT,
             "",
-            "_Discovered via Eat Me page._",
+            "_Discovered via Injestor._",
         ]
 
         body = "\n".join(body_lines)
         host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
-        logging.info(f"Eat Me: created host note for {ip}")
+        logging.info(f"Injestor: created host note for {ip}")
+
+    # ── NXC enrichment (adds shares, signing, vuln flags to existing/new notes) ──
+    if _nxc_injestor_data:
+        create_nxc_vault(vault_dir, _nxc_injestor_data, "NXC")
 
     # ── Write scan note with the original content ──
     scans_dir = vault_dir / "Scans"
@@ -7994,11 +10672,17 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
 
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    # Name the note — try LLM for accuracy, fall back to Python heuristic
+    # Name the note — use LLM tool detection label or Python heuristic
+    # Prefer tool output for naming (it's more specific than notes)
+    naming_content = tool_output or notes_content
     content_label = None
-    if args and not getattr(args, "no_ollama", True):
+
+    # Use LLM-detected tool name if available
+    if llm_extracted.get("tool") and llm_extracted["tool"] not in ("unknown", ""):
+        content_label = f"{llm_extracted['tool'].title()} Output"
+    elif args and not getattr(args, "no_ollama", True) and naming_content:
         try:
-            preview = content[:3000]
+            preview = naming_content[:3000]
             naming_prompt = (
                 "You are naming a file for a penetration testing engagement notebook. "
                 "Read the content below and respond with ONLY a short descriptive title "
@@ -8012,35 +10696,40 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
             ).strip().strip("'\"").strip()
             if raw_name and len(raw_name) <= 60 and "\n" not in raw_name:
                 content_label = raw_name
-                logging.info(f"Eat Me: LLM named note '{content_label}'")
+                logging.info(f"Injestor: LLM named note '{content_label}'")
         except Exception as exc:
-            logging.debug(f"Eat Me: LLM naming failed, using heuristic: {exc}")
+            logging.debug(f"Injestor: LLM naming failed, using heuristic: {exc}")
 
     if not content_label:
         content_label = "Notes"
-        arp_lines = len(_ARP_LINE_RE.findall(content))
+        arp_lines = len(_ARP_LINE_RE.findall(notes_content))
         if arp_lines >= 3:
             content_label = "ARP Table"
+        elif has_tool_output:
+            tool_type, _ = _detect_misc_tool("injestor", tool_output)
+            content_label = f"{tool_type.title()} Output" if tool_type not in ("unknown", "notes") else "Tool Output"
         elif discovered_creds and not discovered_ips:
             content_label = "Credentials"
         elif len(discovered_ips) >= 3 and not discovered_creds:
             content_label = "Host List"
         elif discovered_creds and discovered_ips:
             content_label = "Recon Data"
-        else:
-            tool_type, _ = _detect_misc_tool("eat_me", content)
-            if tool_type not in ("unknown", "notes"):
-                content_label = f"{tool_type.title()} Output"
-            elif len(discovered_ips) > 0:
-                content_label = "Host Discovery"
-            elif discovered_hostnames:
-                content_label = "DNS Info"
+        elif len(discovered_ips) > 0:
+            content_label = "Host Discovery"
+        elif discovered_hostnames:
+            content_label = "DNS Info"
 
     scan_display = f"{content_label} - {timestamp}"
     scan_stem = safe_filename(scan_display)
-    scan_path = scans_dir / ensure_md_suffix(scan_stem)
 
-    eat_me_tool_type, eat_me_analysis_level = _detect_misc_tool(content_label, content)
+    # Prefix filename with [REVIEW] if LLM found things that need review
+    if has_llm_extractions:
+        scan_stem = safe_filename(f"{REVIEW_FILENAME_PREFIX}{content_label} - {timestamp}")
+        scan_path = scans_dir / ensure_md_suffix(scan_stem)
+    else:
+        scan_path = scans_dir / ensure_md_suffix(scan_stem)
+
+    injestor_tool_type, injestor_analysis_level = _detect_misc_tool(content_label, naming_content)
 
     scan_lines = [
         f"# {scan_display}",
@@ -8049,10 +10738,12 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
         f"- **IPs found:** {len(discovered_ips)}",
         f"- **New hosts created:** {len(new_hosts)}",
         f"- **Hostnames found:** {len(discovered_hostnames)}",
-        f"- **Credentials found:** {len(discovered_creds)}",
+        f"- **Credentials (structured):** {len(discovered_creds)}",
         f"- **Usernames found:** {len(discovered_usernames)}",
-        f"- **Detected tool:** {eat_me_tool_type}",
-        f"- **Analysis level:** {eat_me_analysis_level}",
+        f"- **LLM extractions pending review:** {len(llm_extracted['credentials']) + len(llm_extracted['usernames'])}",
+        f"- **Access entries:** {len(injestor_parsed.get('access', []))}",
+        f"- **Detected tool:** {injestor_tool_type}",
+        f"- **Analysis level:** {injestor_analysis_level}",
         "",
     ]
 
@@ -8096,40 +10787,103 @@ def _process_eat_me_page(vault_dir: Path, args=None) -> dict | None:
             scan_lines.append(f"- `{u}`")
         scan_lines.append("")
 
-    # Analysis checkbox + analysis section + original content
-    scan_lines += [
-        "",
-        "- [ ] Analyze: Misc",
-        "",
-        "## Analysis",
-        "",
-        "_No AI analysis generated._",
-        "",
-        "## Original Input",
-        "",
-        "<details>",
-        "<summary>Click to expand</summary>",
-        "",
-        "```",
-        content,
-        "```",
-        "",
-        "</details>",
-    ]
+    if injestor_parsed.get("access"):
+        scan_lines += ["## Access Entries", ""]
+        scan_lines.append("_These access entries were added to host notes._")
+        scan_lines.append("")
+        for entry in injestor_parsed["access"]:
+            scan_lines.append(f"- `{entry}`")
+        scan_lines.append("")
+
+    # ── Pending Review section (LLM-extracted, awaiting operator confirmation) ──
+    if has_llm_extractions:
+        scan_lines += [
+            REVIEW_CHECKBOX,
+            "",
+            _build_pending_review_section(llm_extracted, scan_display),
+        ]
+
+    # Analysis checkbox + analysis section + original input
+    scan_lines += ["", "- [ ] Analyze: Misc", "", "## Analysis", "", "_No AI analysis generated._", ""]
+
+    if tool_output:
+        scan_lines += [
+            "## Tool Output",
+            "",
+            "<details>",
+            "<summary>Click to expand</summary>",
+            "",
+            "```",
+            tool_output,
+            "```",
+            "",
+            "</details>",
+            "",
+        ]
+
+    if notes_content:
+        scan_lines += [
+            "## Notes",
+            "",
+            "<details>",
+            "<summary>Click to expand</summary>",
+            "",
+            notes_content,
+            "",
+            "</details>",
+        ]
 
     scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
-    logging.info(f"Eat Me: wrote scan note {scan_path.name}")
+    logging.info(f"Injestor: wrote scan note {scan_path.name}")
 
-    # ── Save credentials and usernames directly to Loot/Credentials.md ──
-    added = _append_eat_me_to_credentials_md(
-        vault_dir, discovered_creds, discovered_usernames, scan_display
+    # ── Save structured credentials directly to Loot/Credentials.md ──
+    # (LLM-extracted creds stay in Pending Review — promoted only via /review)
+    added = _append_injestor_to_credentials_md(
+        vault_dir, discovered_creds, discovered_usernames, scan_display,
     )
     if added:
-        logging.info(f"Eat Me: added {added} entries to Loot/Credentials.md")
+        logging.info(f"Injestor: added {added} structured entries to Loot/Credentials.md")
+    if has_llm_extractions:
+        print(f"  [*] {len(llm_extracted['credentials'])} credential(s) and "
+              f"{len(llm_extracted['usernames'])} username(s) pending review — "
+              f"check [x] in Obsidian then hit Enter or run /review")
 
-    # ── Reset the Eat Me page ──
-    eat_me_path.write_text(_EAT_ME_TEMPLATE, encoding="utf-8")
-    logging.info("Eat Me: page reset for next use")
+    # ── Link host-specific credentials back to host notes ──
+    if discovered_creds:
+        hosts_dir = vault_dir / "Hosts"
+        host_cred_counts: dict[str, int] = collections.defaultdict(int)
+        for c in discovered_creds:
+            if c.get("host"):
+                host_cred_counts[c["host"]] += 1
+        for host_key, count in host_cred_counts.items():
+            _link_injestor_creds_to_host_note(hosts_dir, host_key, count, scan_display)
+
+    # ── Process ## Access section entries ──
+    access_entries = injestor_parsed.get("access", [])
+    access_added = 0
+    for line in access_entries:
+        m = _ACCESS_CMD_RE.match(line)
+        if not m:
+            logging.debug(f"Injestor: skipping unrecognised access line: {line!r}")
+            continue
+        ok = _add_host_access(
+            hosts_dir,
+            host_key=m.group("host"),
+            user=m.group("user"),
+            privilege=m.group("priv"),
+            method=m.group("method"),
+            session=m.group("session") or "",
+            notes=(m.group("notes") or "").strip().strip('"'),
+            source=scan_display,
+        )
+        if ok:
+            access_added += 1
+    if access_added:
+        logging.info(f"Injestor: recorded {access_added} access entr(ies) in host notes")
+
+    # ── Reset the Injestor page ──
+    injestor_path.write_text(_INJESTOR_TEMPLATE, encoding="utf-8")
+    logging.info("Injestor: page reset for next use")
 
     return {
         "scan_stem": scan_stem,
@@ -9093,7 +11847,348 @@ def export_excel(
 
 
 # ============================================================
-_SCAN_SUBDIRS = ["nmap", "nessus", "burp", "nikto", "autorecon", "loot", "misc"]
+# PlexTrac finding notes and CSV export
+# ============================================================
+
+PLEXTRAC_FIELDNAMES = [
+    "title", "severity", "status", "description", "recommendations",
+    "references", "affected_assets", "tags", "cvss_temporal", "cwe", "cve", "category",
+]
+
+_PLEXTRAC_FINDINGS_TEMPLATE = """\
+---
+title: "Finding Title"
+severity: Medium
+status: Draft
+affected_assets: []
+tags: []
+cvss_temporal: ""
+cwe: ""
+cve: ""
+category: Potential Vulnerability
+sources: []
+---
+
+## Description
+
+_Describe the vulnerability here. Include technical details, root cause, and evidence._
+
+## Recommendations
+
+_Describe remediation steps. Be specific about configuration changes, patches, or mitigations._
+
+## References
+
+-
+"""
+
+
+def _install_findings_template(vault_dir: Path) -> None:
+    """Create Findings/_Template.md if it doesn't exist."""
+    findings_dir = vault_dir / "Findings"
+    findings_dir.mkdir(exist_ok=True)
+    template_path = findings_dir / "_Template.md"
+    if not template_path.exists():
+        template_path.write_text(_PLEXTRAC_FINDINGS_TEMPLATE, encoding="utf-8")
+        logging.info("Created Findings/_Template.md")
+
+
+def _write_finding_note(findings_dir: Path, finding: dict) -> str:
+    """Create or update a finding note. Returns the file stem.
+
+    On update, only affected_assets is merged; all other fields (including
+    operator-edited description, recommendations, severity, status) are preserved.
+    """
+    title = finding.get("title", "Untitled Finding")
+    stem = safe_filename(title)
+    note_path = findings_dir / ensure_md_suffix(stem)
+
+    new_assets: list[str] = finding.get("affected_assets", [])
+
+    if note_path.exists():
+        try:
+            text = note_path.read_text(encoding="utf-8")
+            fm, body = read_frontmatter(text)
+            existing: list = fm.get("affected_assets", [])
+            existing_set = set(existing)
+            merged = existing + [a for a in new_assets if a not in existing_set]
+            fm["affected_assets"] = merged
+            note_path.write_text(write_frontmatter(fm) + body, encoding="utf-8")
+        except Exception as exc:
+            logging.warning(f"Failed to update finding note {note_path.name}: {exc}")
+        return stem
+
+    fm = {
+        "title": title,
+        "severity": finding.get("severity", "Medium"),
+        "status": "Draft",
+        "affected_assets": new_assets,
+        "tags": finding.get("tags", []),
+        "cvss_temporal": finding.get("cvss_temporal", ""),
+        "cwe": finding.get("cwe", ""),
+        "cve": finding.get("cve", ""),
+        "category": finding.get("category", "Potential Vulnerability"),
+        "sources": finding.get("sources", []),
+    }
+
+    description = finding.get("description", "") or "_No description available._"
+    if len(description) > 2000:
+        description = description[:1997] + "..."
+    recommendations = finding.get("recommendations", "") or "_No recommendations available._"
+    if len(recommendations) > 1000:
+        recommendations = recommendations[:997] + "..."
+    references: list[str] = finding.get("references", [])
+
+    body_lines: list[str] = [
+        "## Description",
+        "",
+        description,
+        "",
+        "## Recommendations",
+        "",
+        recommendations,
+        "",
+        "## References",
+        "",
+    ]
+    if references:
+        for ref in references:
+            body_lines.append(f"- {ref}")
+    else:
+        body_lines.append("_No references provided._")
+    body_lines.append("")
+
+    note_path.write_text(
+        write_frontmatter(fm) + "\n".join(body_lines),
+        encoding="utf-8",
+    )
+    logging.debug(f"Created finding note: {note_path.name}")
+    return stem
+
+
+def _write_nessus_finding_notes(
+    vault_dir: Path,
+    nessus_data: dict,
+    scan_source: str,
+) -> int:
+    """Generate Findings/ notes from Nessus results (medium severity and above).
+
+    Deduplicates by plugin_id: same plugin on multiple hosts merges
+    affected_assets into one note. Returns the count written.
+    """
+    findings_dir = vault_dir / "Findings"
+    findings_dir.mkdir(exist_ok=True)
+
+    sev_map = {4: "Critical", 3: "High", 2: "Medium", 1: "Low", 0: "Informational"}
+    plugin_map: dict[str, dict] = {}
+
+    for host in nessus_data.get("hosts", []):
+        ip = host.get("ip", "")
+        for f in host.get("findings", []):
+            if f["severity_int"] < 2:
+                continue
+
+            pid = f["plugin_id"]
+            cvss = f.get("cvss3_base") or f.get("cvss_base") or ""
+            cves = f.get("cves", [])
+            cve = cves[0] if cves else ""
+
+            port = f.get("port", 0)
+            proto = f.get("protocol", "tcp")
+            asset = f"{ip}:{port}/{proto}" if port else ip
+
+            references = [
+                f"https://nvd.nist.gov/vuln/detail/{c}" for c in cves
+            ]
+
+            if pid not in plugin_map:
+                plugin_map[pid] = {
+                    "title": f["plugin_name"],
+                    "severity": sev_map.get(f["severity_int"], "Medium"),
+                    "affected_assets": [asset],
+                    "tags": [],
+                    "cvss_temporal": str(cvss) if cvss else "",
+                    "cwe": "",
+                    "cve": cve,
+                    "category": "Potential Vulnerability",
+                    "sources": [scan_source],
+                    "description": f.get("description", ""),
+                    "recommendations": f.get("solution", ""),
+                    "references": references,
+                }
+            else:
+                if asset not in plugin_map[pid]["affected_assets"]:
+                    plugin_map[pid]["affected_assets"].append(asset)
+
+    count = 0
+    for finding in plugin_map.values():
+        _write_finding_note(findings_dir, finding)
+        count += 1
+
+    if count:
+        logging.info(f"PlexTrac: wrote {count} finding note(s) from Nessus ({scan_source})")
+    return count
+
+
+def _write_burp_finding_notes(
+    vault_dir: Path,
+    burp_data: dict,
+    scan_source: str,
+) -> int:
+    """Generate Findings/ notes from Burp results (medium severity and above).
+
+    Deduplicates by issue name. Returns the count written.
+    """
+    findings_dir = vault_dir / "Findings"
+    findings_dir.mkdir(exist_ok=True)
+
+    sev_map = {"high": "High", "medium": "Medium", "low": "Low", "information": "Informational"}
+    skip_sevs = {"low", "information", "informational"}
+    issue_map: dict[str, dict] = {}
+
+    for host in burp_data.get("hosts", []):
+        ip = host.get("ip", "")
+        url = host.get("url", "")
+        base_asset = url or ip
+
+        for issue in host.get("issues", []):
+            sev_lower = issue.get("severity", "").lower()
+            if sev_lower in skip_sevs:
+                continue
+
+            name = issue.get("name", "Unknown Issue")
+            path = issue.get("path", "")
+            full_asset = f"{base_asset}{path}" if path else base_asset
+
+            description = (
+                issue.get("issue_detail") or issue.get("issue_background") or ""
+            )
+            recommendations = (
+                issue.get("remediation_detail") or issue.get("remediation_background") or ""
+            )
+
+            if name not in issue_map:
+                issue_map[name] = {
+                    "title": name,
+                    "severity": sev_map.get(sev_lower, "Medium"),
+                    "affected_assets": [full_asset],
+                    "tags": [],
+                    "cvss_temporal": "",
+                    "cwe": "",
+                    "cve": "",
+                    "category": "Potential Vulnerability",
+                    "sources": [scan_source],
+                    "description": description,
+                    "recommendations": recommendations,
+                    "references": [],
+                }
+            else:
+                if full_asset not in issue_map[name]["affected_assets"]:
+                    issue_map[name]["affected_assets"].append(full_asset)
+
+    count = 0
+    for finding in issue_map.values():
+        _write_finding_note(findings_dir, finding)
+        count += 1
+
+    if count:
+        logging.info(f"PlexTrac: wrote {count} finding note(s) from Burp ({scan_source})")
+    return count
+
+
+def export_plextrac(vault_dir: Path) -> Path | None:
+    """Read all Findings/*.md and write Findings/PlexTrac Export.csv.
+
+    Returns the output path, or None if no findings exist.
+    """
+    import csv as _csv
+
+    findings_dir = vault_dir / "Findings"
+    if not findings_dir.exists():
+        logging.warning("No Findings/ directory. Run mAIpper to generate findings first.")
+        return None
+
+    notes = sorted(
+        f for f in findings_dir.glob("*.md")
+        if f.stem not in ("_Template",)
+    )
+    if not notes:
+        logging.warning("No finding notes in Findings/.")
+        return None
+
+    rows: list[dict] = []
+    for note_path in notes:
+        try:
+            text = note_path.read_text(encoding="utf-8")
+            fm, body = read_frontmatter(text)
+        except Exception as exc:
+            logging.warning(f"Failed to read {note_path.name}: {exc}")
+            continue
+
+        title = fm.get("title", note_path.stem)
+        severity = fm.get("severity", "Medium")
+        status = fm.get("status", "Draft")
+        cvss_temporal = fm.get("cvss_temporal", "")
+        cwe = fm.get("cwe", "")
+        cve = fm.get("cve", "")
+        category = fm.get("category", "Potential Vulnerability")
+
+        tags = fm.get("tags", [])
+        tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags or "")
+
+        assets = fm.get("affected_assets", [])
+        assets_str = ", ".join(assets) if isinstance(assets, list) else str(assets or "")
+
+        description = extract_body_section(body, "## Description").strip()
+        if not description or description.startswith("_"):
+            description = ""
+
+        recommendations = extract_body_section(body, "## Recommendations").strip()
+        if not recommendations or recommendations.startswith("_"):
+            recommendations = ""
+
+        refs_section = extract_body_section(body, "## References").strip()
+        ref_items: list[str] = []
+        for line in refs_section.splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                ref = line[2:].strip()
+                if ref and not ref.startswith("_"):
+                    ref_items.append(ref)
+            elif line and not line.startswith("_") and not line.startswith("#"):
+                ref_items.append(line)
+        references_str = ",  ".join(ref_items)
+
+        rows.append({
+            "title": title,
+            "severity": severity,
+            "status": status,
+            "description": description,
+            "recommendations": recommendations,
+            "references": references_str,
+            "affected_assets": assets_str,
+            "tags": tags_str,
+            "cvss_temporal": str(cvss_temporal) if cvss_temporal else "",
+            "cwe": str(cwe) if cwe else "",
+            "cve": str(cve) if cve else "",
+            "category": str(category) if category else "Potential Vulnerability",
+        })
+
+    if not rows:
+        return None
+
+    output_path = findings_dir / "PlexTrac Export.csv"
+    with output_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=PLEXTRAC_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logging.info(f"PlexTrac export: {output_path} ({len(rows)} finding(s))")
+    return output_path
+
+
+# ============================================================
+_SCAN_SUBDIRS = ["nmap", "nessus", "burp", "nikto", "autorecon", "loot", "misc", "nxc"]
 
 STATE_FILENAME = ".maipper_state.json"
 
@@ -9153,10 +12248,10 @@ def _snapshot_vault_files(vault_dir: Path) -> dict[str, float]:
             except OSError:
                 pass
 
-    eat_me = vault_dir / "Eat Me.md"
-    if eat_me.exists():
+    injestor = vault_dir / "Injestor.md"
+    if injestor.exists():
         try:
-            snapshot[str(eat_me)] = eat_me.stat().st_mtime
+            snapshot[str(injestor)] = injestor.stat().st_mtime
         except OSError:
             pass
 
@@ -9247,6 +12342,12 @@ def _init_scan_dirs(base: Path) -> None:
     print(f"      {base / 'autorecon/'}     — AutoRecon results (per-target subdirs)")
     print(f"      {base / 'loot/'}          — Loot (credentials, hashes, keys, sensitive files)")
     print(f"      {base / 'misc/'}          — Miscellaneous tool output (text files)")
+    print(f"      {base / 'nxc/'}           — NetExec workspace DBs (smb.db, ldap.db, etc.)")
+    vault_init = Path(args.vault).resolve()
+    _install_assessment_config(vault_init)
+    print(f"\n  Vault: {vault_init}/")
+    print(f"    {vault_init / _ASSESSMENT_CONFIG_FILENAME}")
+    print(f"      ↑ Edit this to set your system prompt and engagement context")
     print("\n    Then run mAIpper again to process.\n")
 
 
@@ -9318,35 +12419,17 @@ def _build_assessment_context(vault_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_chat_prompt(question: str, context: str, chat_history: list[dict]) -> str:
-    """Build a prompt for interactive chat with assessment context."""
-    history_text = ""
-    if chat_history:
-        history_lines = []
-        for entry in chat_history[-6:]:
-            history_lines.append(f"Operator: {entry['q']}")
-            history_lines.append(f"Assistant: {entry['a'][:300]}...")
-            history_lines.append("")
-        history_text = "\nRECENT CONVERSATION:\n" + "\n".join(history_lines)
+def _build_chat_prompt(question: str, context: str) -> str:
+    """Build the user message for interactive chat.
 
-    return f"""You are an experienced penetration tester acting as an interactive assistant
-during a live engagement. You have access to the current assessment state below.
-
-GROUNDING RULES — follow these strictly:
-- Respond ONLY in English. Do not use any other language.
-- NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
-- Only reference hosts, ports, services, credentials, and findings that appear
-  in the assessment state below. Do not invent data.
-- Tag claims: [CONFIRMED] = in the data, [INFERRED] = reasonable conclusion,
-  [ASSUMED] = needs verification.
-- When suggesting commands, use actual IPs from the assessment data.
-- Be concise and operator-focused. This is a live engagement, not a report.
-
-{context}
-{history_text}
-OPERATOR QUESTION: {question}
-
-Respond concisely with actionable information."""
+    System instructions come from _active_chat_persona via the system role in
+    ollama_chat — they are no longer embedded here.
+    """
+    return (
+        f"ASSESSMENT STATE:\n{context}\n\n"
+        f"OPERATOR QUESTION: {question}\n\n"
+        "Respond concisely with actionable information."
+    )
 
 
 def _handle_cred_drop(text: str, vault_dir: Path) -> str:
@@ -9384,6 +12467,43 @@ def _handle_cred_drop(text: str, vault_dir: Path) -> str:
 
     host_msg = f" for {host_key}" if host_key else ""
     return f"[+] Saved credential {username}:{password}{host_msg} → {target.name}"
+
+
+def _handle_access_cmd(text: str, vault_dir: Path) -> None:
+    """Handle '+access user@host privilege method [session] [notes]' command."""
+    text = text.strip()
+    # Strip leading +access keyword
+    cmd_body = re.sub(r"^\+access\s+", "", text, flags=re.IGNORECASE).strip()
+    if not cmd_body:
+        print("  Usage: +access user@host PRIVILEGE METHOD [session] [notes]")
+        print("  Examples:")
+        print("    +access administrator@10.10.10.5 SYSTEM meterpreter")
+        print("    +access svc_sql@dc01 LocalAdmin psexec sess1 \"DB service account\"")
+        return
+
+    m = _ACCESS_CMD_RE.match(cmd_body)
+    if not m:
+        print("  Could not parse. Format: +access user@host PRIVILEGE METHOD [session] [notes]")
+        return
+
+    user = m.group("user")
+    host = m.group("host")
+    privilege = m.group("priv")
+    method = m.group("method")
+    session = m.group("session") or ""
+    notes = (m.group("notes") or "").strip().strip('"')
+
+    hosts_dir = vault_dir / "Hosts"
+    ok = _add_host_access(hosts_dir, host, user, privilege, method, session, notes)
+    if ok:
+        status_note = " — status set to 'exploited'" if privilege.lower() in {"system", "root", "administrator", "admin"} else ""
+        print(f"  [+] Access recorded: {user}@{host} ({privilege} via {method}){status_note}")
+    else:
+        # Host note not found — still show help
+        note_names = [p.stem for p in hosts_dir.glob("*.md")] if hosts_dir.exists() else []
+        print(f"  [!] Host note not found for '{host}'.")
+        if note_names:
+            print(f"      Known hosts: {', '.join(sorted(note_names)[:8])}")
 
 
 def _handle_paste(vault_dir: Path) -> str:
@@ -9509,25 +12629,25 @@ def _process_vault_changes(
     all_loot_data: dict | None,
 ) -> dict[str, str]:
     """React to vault file changes. Returns updated operator_notes_lookup."""
-    eat_me_path = str(vault_dir / "Eat Me.md")
+    injestor_path = str(vault_dir / "Injestor.md")
     creds_path = str(vault_dir / "Loot" / "Credentials.md")
     hosts_dir = vault_dir / "Hosts"
     any_action = False
 
-    # ── Eat Me ──
-    if eat_me_path in changed_files:
-        em_result = _process_eat_me_page(vault_dir, args=args)
-        if em_result:
+    # ── Injestor ──
+    if injestor_path in changed_files:
+        injestor_result2 = _process_injestor(vault_dir, args=args)
+        if injestor_result2:
             any_action = True
-            if em_result["new_hosts"]:
-                print(f"  [Vault] Eat Me: created {len(em_result['new_hosts'])} new host(s)")
-                for ip in em_result["new_hosts"]:
+            if injestor_result2["new_hosts"]:
+                print(f"  [Vault] Injestor: created {len(injestor_result2['new_hosts'])} new host(s)")
+                for ip in injestor_result2["new_hosts"]:
                     print(f"      → {ip}")
-            if em_result["discovered_hostnames"]:
-                print(f"  [Vault] Eat Me: found {len(em_result['discovered_hostnames'])} hostname(s)")
-            if em_result["discovered_creds"]:
-                print(f"  [Vault] Eat Me: found {len(em_result['discovered_creds'])} credential(s)")
-            print(f"  [Vault] Eat Me: saved to Scans/{em_result['scan_stem']}.md")
+            if injestor_result2["discovered_hostnames"]:
+                print(f"  [Vault] Injestor: found {len(injestor_result2['discovered_hostnames'])} hostname(s)")
+            if injestor_result2["discovered_creds"]:
+                print(f"  [Vault] Injestor: found {len(injestor_result2['discovered_creds'])} credential(s)")
+            print(f"  [Vault] Injestor: saved to Scans/{injestor_result2['scan_stem']}.md")
 
     # ── Host notes: check for operator notes + investigation boxes ──
     host_files_changed = [
@@ -9548,6 +12668,13 @@ def _process_vault_changes(
                 pending += len(_scan_host_note_for_deep_dives(hp))
         if pending:
             print(f"  [Vault] {pending} pending investigation(s) — run /analyze to process")
+
+    # ── Assessment Config: reload system prompt if changed ──
+    config_path = str(vault_dir / _ASSESSMENT_CONFIG_FILENAME)
+    if config_path in changed_files:
+        any_action = True
+        _load_assessment_config(vault_dir)
+        print("  [Vault] Assessment Config reloaded — system prompt updated")
 
     # ── Credentials.md: rebuild Users Canvas ──
     if creds_path in changed_files:
@@ -9574,24 +12701,38 @@ def _watch_loop(args, base: Path) -> None:
     chat_history: list[dict] = []
     all_loot_data: dict | None = None
 
+    # Load (or create) assessment config before anything else
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    cfg = _load_assessment_config(vault_dir)
+
     print(f"\n[*] mAIpper Interactive Mode  (Ctrl+C to exit)")
     print(f"    Scans dir : {base}")
     print(f"    Vault dir : {vault_dir}")
     print(f"    Polling   : every {interval}s")
     print(f"    Watching  : scans/ + vault files")
+    if cfg["effective_system"]:
+        ctx_note = " + engagement context" if cfg["engagement_context"] else ""
+        print(f"    Config    : system prompt loaded{ctx_note} — edit {_ASSESSMENT_CONFIG_FILENAME} to tune")
+    else:
+        print(f"    Config    : no system prompt — edit {_ASSESSMENT_CONFIG_FILENAME} to add one")
     print()
     print("    Commands:")
     print("      /hosts      — list discovered hosts")
     print("      /status     — assessment summary")
     print("      /analyze    — analyze checked [x] items (investigation + scan boxes)")
-    print("      /analyze-full — check all pending boxes then analyze (skips done [/] items)")
+    print("      /analyze-full — check all pending [ ] boxes then analyze")
+    print("      /reanalyze  — reset all done [/] boxes and re-run full analysis")
     print("      /deepdive   — cross-source correlation per host (Nmap+Nessus+Burp+AutoRecon+Loot)")
+    print("      /plextrac   — export Findings/ notes to Findings/PlexTrac Export.csv")
     print("      /merge      — detect and merge duplicate host notes (same IP or hostname)")
     print("      /refresh    — re-process all scan files (no analysis)")
     print("      /rag        — show RAG index status")
     print("      /build-index — build or update RAG index")
+    print("      /review     — promote checked [x] rows from [REVIEW] notes to Loot/Credentials.md")
     print("      /paste      — paste multiline data (hosts, creds, tool output)")
     print("      +cred u:p   — add credential (+cred user:pass [host_ip])")
+    print("      +access u@h — record access (+access user@host PRIV METHOD [session] [notes])")
+    print("      /access     — show access summary (all compromised hosts)")
     print("      <question>  — ask the LLM about the assessment")
     print()
 
@@ -9705,7 +12846,16 @@ def _watch_loop(args, base: Path) -> None:
                 if hosts_dir.exists():
                     for hp in hosts_dir.glob("*.md"):
                         pending_investigate += len(_scan_host_note_for_deep_dives(hp))
-                pending_analyze = len(_scan_notes_for_analysis_requests(vault_dir))
+                pending_analyze  = len(_scan_notes_for_analysis_requests(vault_dir))
+                pending_review   = _count_pending_reviews(vault_dir)
+
+                # Run review immediately (no LLM — always instant)
+                if pending_review:
+                    print(f"  [*] {pending_review} file(s) with confirmed review rows — promoting to Loot...")
+                    promoted = _process_review_requests(vault_dir)
+                    if promoted:
+                        print(f"  [+] Promoted {promoted} credential(s) to Loot/Credentials.md")
+                    last_vault_snapshot = _snapshot_vault_files(vault_dir)
 
                 if pending_investigate or pending_analyze:
                     parts = []
@@ -9730,9 +12880,10 @@ def _watch_loop(args, base: Path) -> None:
                                     vault_dir, args.ollama_url, args.model,
                                     args.temperature, args.skip_validation,
                                     operator_notes_lookup,
+                                    workers=getattr(args, "workers", 1),
                                 )
                                 if dd_count:
-                                    print(f"  [+] Processed {dd_count} deep dive(s)")
+                                    print(f"  [+] Processed {dd_count} analysis result(s)")
                                 sa_count = _process_analyze_requests(
                                     vault_dir, args, operator_notes_lookup,
                                 )
@@ -9741,30 +12892,36 @@ def _watch_loop(args, base: Path) -> None:
                             except KeyboardInterrupt:
                                 print("\n  [!] Analysis interrupted")
                             last_vault_snapshot = _snapshot_vault_files(vault_dir)
-                elif not any_change:
+                elif not any_change and not pending_review:
                     print("  No changes detected.")
                 continue
 
             # Commands
-            if user_input.lower() in ("/quit", "/exit", "/q"):
+            if user_input.lower() in ("/quit", "/exit", "/q", "quit", "exit", "q"):
                 break
-            elif user_input.lower() in ("/help", "/?"):
+            elif user_input.lower() in ("/help", "/?", "help", "?"):
                 print("  /hosts      — list discovered hosts")
                 print("  /status     — assessment summary")
                 print("  /analyze    — analyze checked [x] items (investigation + scan boxes)")
-                print("  /analyze-full — check all pending boxes then analyze (skips done [/] items)")
+                print("  /analyze-full — check all pending [ ] boxes then analyze")
+                print("  /reanalyze  — reset all done [/] boxes and re-run full analysis")
                 print("  /deepdive   — cross-source correlation per host (Nmap+Nessus+Burp+AutoRecon+Loot)")
+                print("  /plextrac   — export Findings/ notes to Findings/PlexTrac Export.csv")
+                print("  /nxc        — import NXC workspace DB (scans/nxc/ or --nxc-workspace)")
                 print("  /merge      — detect and merge duplicate host notes (same IP or hostname)")
                 print("  /refresh    — re-process all scan files (no analysis)")
                 print("  /rag        — show RAG index status")
                 print("  /build-index — build or update RAG index")
+                print("  /review     — promote checked [x] rows from [REVIEW] notes to Loot/Credentials.md")
                 print("  /paste      — paste multiline data (hosts, creds, tool output)")
                 print("  +cred u:p   — add credential (+cred user:pass [host_ip])")
+                print("  +access u@h — record access (+access user@host PRIV METHOD [session] [notes])")
+                print("  /access     — show access summary (all compromised hosts)")
                 print("  Ctrl+C      — cancel current operation / exit at prompt")
                 print("  <question>  — ask the LLM about the assessment")
-            elif user_input.lower() == "/hosts":
+            elif user_input.lower() in ("/hosts", "hosts"):
                 print(_interactive_hosts(vault_dir))
-            elif user_input.lower() == "/status":
+            elif user_input.lower() in ("/status", "status"):
                 print(_interactive_status(vault_dir))
             elif user_input.lower() == "/analyze":
                 if args.no_ollama:
@@ -9779,9 +12936,10 @@ def _watch_loop(args, base: Path) -> None:
                             vault_dir, args.ollama_url, args.model,
                             args.temperature, args.skip_validation,
                             operator_notes_lookup,
+                            workers=getattr(args, "workers", 1),
                         )
                         if dd_count:
-                            print(f"  [+] Processed {dd_count} deep dive(s)")
+                            print(f"  [+] Processed {dd_count} analysis result(s)")
                         sa_count = _process_analyze_requests(
                             vault_dir, args, operator_notes_lookup,
                         )
@@ -9810,9 +12968,10 @@ def _watch_loop(args, base: Path) -> None:
                                 vault_dir, args.ollama_url, args.model,
                                 args.temperature, args.skip_validation,
                                 operator_notes_lookup,
+                                workers=getattr(args, "workers", 1),
                             )
                             if dd_count:
-                                print(f"  [+] Processed {dd_count} deep dive(s)")
+                                print(f"  [+] Processed {dd_count} analysis result(s)")
                             sa_count = _process_analyze_requests(
                                 vault_dir, args, operator_notes_lookup,
                             )
@@ -9820,6 +12979,39 @@ def _watch_loop(args, base: Path) -> None:
                                 print(f"  [+] Processed {sa_count} scan analysis request(s)")
                         except KeyboardInterrupt:
                             print("\n  [!] Analysis interrupted")
+                    last_vault_snapshot = _snapshot_vault_files(vault_dir)
+            elif user_input.lower() == "/reanalyze":
+                if args.no_ollama:
+                    print("  LLM is disabled (--no-ollama). Cannot analyze.")
+                else:
+                    inv_r, ana_r = _reset_done_boxes(vault_dir)
+                    if inv_r or ana_r:
+                        print(f"  Reset {inv_r} investigation(s) and {ana_r} scan analysis box(es) to unchecked.")
+                    inv_n, ana_n = _check_all_pending_boxes(vault_dir)
+                    total = inv_n + ana_n
+                    if total == 0:
+                        print("  No checkboxes found — do scan notes exist?")
+                    else:
+                        print(f"  Queued {inv_n} investigation(s) and {ana_n} scan analysis request(s). Running...")
+                        operator_notes_lookup = build_operator_notes_lookup(vault_dir)
+                        dd_count = 0
+                        sa_count = 0
+                        try:
+                            dd_count = _process_deep_dives(
+                                vault_dir, args.ollama_url, args.model,
+                                args.temperature, args.skip_validation,
+                                operator_notes_lookup,
+                                workers=getattr(args, "workers", 1),
+                            )
+                            if dd_count:
+                                print(f"  [+] Processed {dd_count} analysis result(s)")
+                            sa_count = _process_analyze_requests(
+                                vault_dir, args, operator_notes_lookup,
+                            )
+                            if sa_count:
+                                print(f"  [+] Processed {sa_count} scan analysis request(s)")
+                        except KeyboardInterrupt:
+                            print("\n  [!] Reanalysis interrupted")
                     last_vault_snapshot = _snapshot_vault_files(vault_dir)
             elif user_input.lower() == "/merge":
                 reports = _detect_and_merge_host_notes(vault_dir)
@@ -9837,7 +13029,7 @@ def _watch_loop(args, base: Path) -> None:
                     print("  Running cross-source correlation for all hosts...")
                     operator_notes_lookup = build_operator_notes_lookup(vault_dir)
                     try:
-                        count = _run_cross_source_deepdive(vault_dir, args, operator_notes_lookup)
+                        count = _run_cross_source_deepdive(vault_dir, args, operator_notes_lookup, workers=getattr(args, "workers", 1))
                         if count:
                             print(f"  [+] Cross-source analysis written for {count} host(s).")
                         else:
@@ -9847,6 +13039,42 @@ def _watch_loop(args, base: Path) -> None:
                     except Exception as exc:
                         logging.error(f"Deep dive failed: {exc}")
                     last_vault_snapshot = _snapshot_vault_files(vault_dir)
+            elif user_input.lower() == "/plextrac":
+                out = export_plextrac(vault_dir)
+                if out:
+                    print(f"  [+] PlexTrac export: {out}")
+                    findings_count = len([
+                        f for f in (vault_dir / "Findings").glob("*.md")
+                        if f.stem != "_Template"
+                    ])
+                    print(f"      {findings_count} finding(s) exported.")
+                else:
+                    print("  No findings to export. Generate findings from Nessus/Burp scans first,")
+                    print("  or copy Findings/_Template.md to create manual findings.")
+            elif user_input.lower() == "/nxc":
+                nxc_ws = _resolve_nxc_workspace(args, base)
+                if nxc_ws:
+                    print(f"  Importing NXC database from: {nxc_ws}")
+                    try:
+                        nxc_db_data = parse_nxc_db(nxc_ws)
+                        if nxc_db_data["hosts"]:
+                            nxc_result = create_nxc_vault(vault_dir, nxc_db_data, "NXC")
+                            print(f"  [+] {len(nxc_db_data['hosts'])} hosts, "
+                                  f"{len(nxc_db_data['creds'])} credentials imported")
+                            admin_count = sum(1 for c in nxc_db_data["creds"] if c.get("admin_on"))
+                            if admin_count:
+                                print(f"  [!] {admin_count} credential(s) with local admin access")
+                            last_vault_snapshot = _snapshot_vault_files(vault_dir)
+                        else:
+                            print("  No hosts found in NXC database.")
+                    except Exception as exc:
+                        print(f"  NXC import failed: {exc}")
+                else:
+                    print("  No NXC workspace found.")
+                    print("  Options:")
+                    print("    1. Drop smb.db (and ldap.db etc.) into scans/nxc/")
+                    print("    2. Set nxc_workspace in maipper.conf [nxc] section")
+                    print("    3. Use --nxc-workspace ~/.nxc/workspaces/default")
             elif user_input.lower() == "/rag":
                 if _RAG_BUILDER and not _RAG_BUILDER.is_ready():
                     print(f"  RAG: {_RAG_BUILDER.status_line()}")
@@ -9919,17 +13147,35 @@ def _watch_loop(args, base: Path) -> None:
             elif user_input.lower() == "/paste":
                 result = _handle_paste(vault_dir)
                 print(result)
+            elif user_input.lower() == "/review":
+                pending = _count_pending_reviews(vault_dir)
+                if pending == 0:
+                    print("  No pending review files found.")
+                    print("  Open a [REVIEW] scan note in Obsidian, check [x] rows to approve, then run /review.")
+                else:
+                    promoted = _process_review_requests(vault_dir)
+                    if promoted:
+                        print(f"  [+] Promoted {promoted} credential(s) to Loot/Credentials.md")
+                        last_vault_snapshot = _snapshot_vault_files(vault_dir)
+                    else:
+                        print(f"  {pending} review file(s) found but no rows were checked [x]. Check rows in Obsidian first.")
             elif user_input.lower().startswith("+cred"):
                 result = _handle_cred_drop(user_input, vault_dir)
                 print(result)
+            elif user_input.lower().startswith("+access"):
+                _handle_access_cmd(user_input, vault_dir)
+            elif user_input.lower() in ("/access", "access"):
+                _print_access_summary(vault_dir)
 
             # LLM question
             elif not args.no_ollama:
                 context = _build_assessment_context(vault_dir)
-                prompt = _build_chat_prompt(user_input, context, chat_history)
+                prompt = _build_chat_prompt(user_input, context)
                 try:
                     response = ollama_chat(
                         args.ollama_url, args.model, prompt, args.temperature,
+                        system=_active_chat_persona or _active_system_prompt,
+                        history=chat_history,
                     )
                     print()
                     print(response.strip())
@@ -9961,9 +13207,6 @@ scans_dir = scans
 
 # Obsidian vault output directory
 vault = Obsidian
-
-# Default tool name label for Nmap scans
-tool_name = Nmap
 
 # Verbosity level: 0 = WARNING, 1 = INFO, 2 = DEBUG
 verbose = 1
@@ -10004,7 +13247,13 @@ no_burp = false
 no_autorecon = false
 no_loot = false
 no_misc = false
+no_nxc = false
 skip_validation = false
+
+[nxc]
+# NetExec (nxc) workspace directory — set to pull live from NXC DB automatically
+# Leave blank to use scans/nxc/ drop folder only
+# nxc_workspace = ~/.nxc/workspaces/default
 
 [rag]
 # RAG (Retrieval Augmented Generation) — reference your cybersecurity library
@@ -10041,7 +13290,6 @@ def _load_config() -> dict:
     key_map = {
         ("general", "scans_dir"):          ("scans_dir",          str),
         ("general", "vault"):              ("vault",              str),
-        ("general", "tool_name"):          ("tool_name",          str),
         ("general", "verbose"):            ("verbose",            int),
         ("ollama",  "ollama_url"):         ("ollama_url",         str),
         ("ollama",  "model"):             ("model",              str),
@@ -10058,8 +13306,10 @@ def _load_config() -> dict:
         ("parsers", "no_autorecon"):       ("no_autorecon",       bool),
         ("parsers", "no_loot"):            ("no_loot",            bool),
         ("parsers", "no_misc"):            ("no_misc",            bool),
+        ("parsers", "no_nxc"):             ("no_nxc",             bool),
         ("parsers", "no_excel"):           ("no_excel",           bool),
         ("parsers", "skip_validation"):    ("skip_validation",    bool),
+        ("nxc",     "nxc_workspace"):      ("nxc_workspace",      str),
         ("rag", "docs_dir"):               ("rag_docs_dir",       str),
         ("rag", "hacktricks_dir"):         ("rag_hacktricks_dir", str),
         ("rag", "embedding_model"):        ("rag_embedding_model", str),
@@ -10092,7 +13342,7 @@ def main() -> None:
     config_defaults = _load_config()
 
     ap = argparse.ArgumentParser(
-        description="mAIpper v0.12 — Pentest scan analysis and Obsidian vault generator"
+        description="mAIpper v0.13 — Pentest scan analysis and Obsidian vault generator"
     )
     ap.add_argument("--config",     default=CONF_FILENAME,
                     help=f"Config file path (default: ./{CONF_FILENAME})")
@@ -10111,8 +13361,6 @@ def main() -> None:
     ap.add_argument("--vault",
                     default=config_defaults.get("vault", "Obsidian"),
                     help="Obsidian vault output directory")
-    ap.add_argument("--tool-name",
-                    default=config_defaults.get("tool_name", "Nmap"))
     ap.add_argument("--model",
                     default=config_defaults.get("model", "qwen2.5:14b-instruct-q5_K_M"))
     ap.add_argument("--ollama-url",
@@ -10147,7 +13395,20 @@ def main() -> None:
     ap.add_argument("--no-misc",      action="store_true",
                     default=config_defaults.get("no_misc", False),
                     help="Skip misc processing")
+    ap.add_argument("--nxcdb",         default=None, metavar="PATH",
+                    help="NetExec workspace directory or smb.db path (auto-discovers ldap.db etc. alongside)")
+    ap.add_argument("--no-nxc",        action="store_true",
+                    default=config_defaults.get("no_nxc", False),
+                    help="Skip NXC database processing")
+    ap.add_argument("--nxc-workspace", default=config_defaults.get("nxc_workspace", None),
+                    metavar="DIR",
+                    help="Path to live NXC workspace dir (e.g. ~/.nxc/workspaces/default)")
     ap.add_argument("--excel",        action="store_true", help="Generate Export.xlsx (requires openpyxl)")
+    ap.add_argument("--plextrac",     action="store_true",
+                    help="Export Findings/ notes to Findings/PlexTrac Export.csv")
+    ap.add_argument("--no-findings",  action="store_true",
+                    default=config_defaults.get("no_findings", False),
+                    help="Skip auto-generating finding notes from Nessus/Burp scanner data")
     ap.add_argument("--canvas-name",
                     default=config_defaults.get("canvas_name", "Assessment Canvas.canvas"))
     ap.add_argument("--canvas-cols",           type=int,
@@ -10159,6 +13420,10 @@ def main() -> None:
     ap.add_argument("--temperature",     type=float,
                     default=config_defaults.get("temperature", 0.15),
                     help="Ollama sampling temperature (0.0–1.0, default: 0.15)")
+    ap.add_argument("--workers", type=int,
+                    default=config_defaults.get("workers", 1),
+                    metavar="N",
+                    help="Parallel LLM worker threads for deep dives and cross-source analysis (default: 1)")
     ap.add_argument("--skip-validation", action="store_true",
                     default=config_defaults.get("skip_validation", False),
                     help="Skip post-processing AI output validation (faster, no hallucination checks)")
@@ -10206,7 +13471,7 @@ def main() -> None:
         print(f"      2. Drop PDF books into {docs_path}/")
         print(f"      3. Optionally clone HackTricks: git clone https://github.com/HackTricks-wiki/hacktricks")
         print(f"      4. Set paths in [rag] section of maipper.conf")
-        print(f"      5. python mAIpper-v0.12.py --build-index")
+        print(f"      5. python mAIpper.py --build-index")
         conf_path = Path(CONF_FILENAME)
         if not conf_path.exists():
             conf_path.write_text(_DEFAULT_CONF, encoding="utf-8")
@@ -10288,7 +13553,7 @@ def main() -> None:
         _run_processing(args, base)
 
 
-_VAULT_SUBDIRS = ["Hosts", "Scans", "Loot"]
+_VAULT_SUBDIRS = ["Hosts", "Scans", "Loot", "Findings"]
 
 _MAIPPER_CSS = """\
 /* mAIpper Investigation Checkboxes */
@@ -10328,6 +13593,18 @@ _MAIPPER_CSS = """\
 .task-list-item[data-task="/"] input[type="checkbox"] {
     accent-color: #4caf50;
 }
+
+/* ── [REVIEW] scan archive notes — orange in file explorer ── */
+.nav-file-title[data-path*="[REVIEW]"] {
+    color: #f0a500 !important;
+    font-weight: 600;
+}
+
+/* ── Pending review row [x] inside ## Pending Review — orange tint ── */
+.task-list-item[data-task="x"] .cm-strikethrough,
+.task-list-item[data-task="x"] s {
+    text-decoration: none !important;
+}
 """
 
 
@@ -10355,6 +13632,38 @@ def _install_vault_css(vault_dir: Path) -> None:
         logging.info("Auto-enabled mAIpper CSS snippet in Obsidian")
 
 
+def _migrate_host_note_sections(vault_dir: Path) -> int:
+    """One-time migration: rename old section headers in existing host notes.
+
+    ## Deep Dives  →  ## Analysis     (per-port/finding callouts)
+    ## Cross-Source Analysis  →  ## Deep Dive  (per-host synthesis)
+    > [!info]- Deep Dive:  →  > [!info]- Analysis:  (callout titles)
+
+    Idempotent — safe to call on every run. Returns count of files updated.
+    """
+    hosts_dir = vault_dir / "Hosts"
+    if not hosts_dir.exists():
+        return 0
+
+    updated = 0
+    for host_path in hosts_dir.glob("*.md"):
+        try:
+            text = host_path.read_text(encoding="utf-8")
+            new = text
+            new = new.replace("\n## Deep Dives\n", "\n## Analysis\n")
+            new = new.replace("\n## Cross-Source Analysis\n", "\n## Deep Dive\n")
+            new = new.replace("> [!info]- Deep Dive: ", "> [!info]- Analysis: ")
+            if new != text:
+                host_path.write_text(new, encoding="utf-8")
+                updated += 1
+        except Exception as exc:
+            logging.warning(f"Migration failed for {host_path.name}: {exc}")
+
+    if updated:
+        logging.info(f"Migrated section names in {updated} host note(s)")
+    return updated
+
+
 def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     """Run the full scan-processing pipeline once.
 
@@ -10367,7 +13676,11 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     for sub in _VAULT_SUBDIRS:
         (vault_dir / sub).mkdir(exist_ok=True)
     _install_vault_css(vault_dir)
-    _install_eat_me_page(vault_dir)
+    _install_injestor(vault_dir)
+    _install_findings_template(vault_dir)
+    _install_assessment_config(vault_dir)
+    _load_assessment_config(vault_dir)
+    _migrate_host_note_sections(vault_dir)
 
     # Merge duplicate host notes before processing (e.g., 10.10.110.4.md + dante-web-nix01.md)
     merge_reports = _detect_and_merge_host_notes(vault_dir)
@@ -10455,15 +13768,15 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             logging.info("RAG: No source files found in docs or hacktricks directories.")
 
     # ------------------------------------------------------------------ #
-    # Eat Me — process operator drop zone first                            #
+    # Injestor — process operator drop zone first                          #
     # ------------------------------------------------------------------ #
-    eat_me_result = _process_eat_me_page(vault_dir, args=args)
-    if eat_me_result:
-        scan_host_map[eat_me_result["scan_stem"]] = eat_me_result["host_stems"]
-        if eat_me_result["new_hosts"]:
+    injestor_result = _process_injestor(vault_dir, args=args)
+    if injestor_result:
+        scan_host_map[injestor_result["scan_stem"]] = injestor_result["host_stems"]
+        if injestor_result["new_hosts"]:
             logging.info(
-                f"Eat Me: {len(eat_me_result['new_hosts'])} new host(s) created: "
-                f"{', '.join(eat_me_result['new_hosts'])}"
+                f"Injestor: {len(injestor_result['new_hosts'])} new host(s) created: "
+                f"{', '.join(injestor_result['new_hosts'])}"
             )
 
     # ------------------------------------------------------------------ #
@@ -10528,7 +13841,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             vault_dir,
             xml_path.stem,
             scan_data,
-            args.tool_name,
+            "Nmap",
             analysis,
             None if (args.no_ollama or skip_llm) else args.model,
             validation_warnings=nmap_warnings or None,
@@ -10616,6 +13929,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 analysis,
                 None if (args.no_ollama or skip_llm) else args.model,
                 validation_warnings=nessus_warnings or None,
+                no_findings=getattr(args, "no_findings", False),
             )
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
@@ -10684,6 +13998,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 analysis,
                 None if (args.no_ollama or skip_llm) else args.model,
                 validation_warnings=burp_warnings or None,
+                no_findings=getattr(args, "no_findings", False),
             )
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
@@ -11026,7 +14341,34 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         logging.info("Skipping misc (--no-misc)")
 
     # ------------------------------------------------------------------ #
-    # Deep Dives — process checked investigation checkboxes               #
+    # NXC (NetExec) database                                               #
+    # ------------------------------------------------------------------ #
+    if not getattr(args, "no_nxc", False):
+        nxc_ws = _resolve_nxc_workspace(args, base)
+        if nxc_ws:
+            logging.info(f"Importing NXC database from: {nxc_ws}")
+            try:
+                nxc_db_data = parse_nxc_db(nxc_ws)
+                if nxc_db_data.get("hosts"):
+                    nxc_result = create_nxc_vault(vault_dir, nxc_db_data, "NXC")
+                    scan_host_map[nxc_result["scan_stem"]] = nxc_result["host_stems"]
+                    logging.info(
+                        f"NXC: {len(nxc_db_data['hosts'])} hosts, "
+                        f"{len(nxc_db_data['creds'])} credentials"
+                    )
+                else:
+                    logging.info("NXC: database found but contains no hosts")
+            except Exception as exc:
+                logging.warning(f"NXC database import failed: {exc}")
+        else:
+            logging.debug(
+                "NXC: no workspace found — drop smb.db into scans/nxc/ or set nxc_workspace in config"
+            )
+    else:
+        logging.info("Skipping NXC (--no-nxc)")
+
+    # ------------------------------------------------------------------ #
+    # Analysis — process checked investigation checkboxes                 #
     # ------------------------------------------------------------------ #
     if not args.no_ollama and not skip_llm:
         dd_count = _process_deep_dives(
@@ -11036,9 +14378,10 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             args.temperature,
             args.skip_validation,
             operator_notes_lookup,
+            workers=getattr(args, "workers", 1),
         )
         if dd_count:
-            logging.info(f"Processed {dd_count} deep dive(s)")
+            logging.info(f"Processed {dd_count} analysis result(s)")
 
     # ------------------------------------------------------------------ #
     # Canvas                                                               #
@@ -11111,6 +14454,16 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             logging.info(f"Excel export: {out}")
         else:
             logging.error("Excel export failed — is openpyxl installed?")
+
+    # ------------------------------------------------------------------ #
+    # PlexTrac CSV export                                                  #
+    # ------------------------------------------------------------------ #
+    if getattr(args, "plextrac", False):
+        out = export_plextrac(vault_dir)
+        if out:
+            print(f"  [+] PlexTrac export: {out}")
+        else:
+            print("  [!] PlexTrac export: no findings in Findings/ — run with Nessus/Burp data first.")
 
     _save_analysis_state(vault_dir, analysis_state)
     logging.info("Done.")
