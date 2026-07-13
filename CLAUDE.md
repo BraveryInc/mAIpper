@@ -4,7 +4,7 @@ This file provides guidance when working with code in this repository.
 
 ## What This Is
 
-**mAIpper** is a single-file Python CLI tool (`mAIpper-v0.12.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
+**mAIpper** is a single-file Python CLI tool (`mAIpper-v0.13.py`) for pentesters. It ingests scan output from multiple tools, queries a local LLM via **Ollama**, and writes structured **Obsidian notes** (Markdown + Canvas JSON) for use in an Obsidian vault.
 
 Supported input formats:
 - **Nmap XML** (`scans/nmap/*.xml`)
@@ -19,14 +19,14 @@ Supported input formats:
 
 ```bash
 # Basic usage — processes all scan files with full LLM analysis
-python mAIpper-v0.12.py
+python mAIpper-v0.13.py
 
 # Initialize scan directory structure + config file
-python mAIpper-v0.12.py --init
+python mAIpper-v0.13.py --init
 
 # Interactive mode — fast start (no LLM), analyze on demand
-python mAIpper-v0.12.py -i
-python mAIpper-v0.12.py -i --watch-interval 60
+python mAIpper-v0.13.py -i
+python mAIpper-v0.13.py -i --watch-interval 60
 # Then in interactive mode:
 #   /analyze       — process checked [x] investigation/analysis boxes
 #   /analyze-full  — check all boxes then analyze everything
@@ -34,30 +34,30 @@ python mAIpper-v0.12.py -i --watch-interval 60
 #   /merge         — merge duplicate host notes (IP note + hostname note)
 
 # Single Nmap file
-python mAIpper-v0.12.py --xml scans/nmap/internal.xml
+python mAIpper-v0.13.py --xml scans/nmap/internal.xml
 
 # Skip AI, skip canvas, custom vault output dir
-python mAIpper-v0.12.py --no-ollama --no-canvas --vault MyNotes
+python mAIpper-v0.13.py --no-ollama --no-canvas --vault MyNotes
 
 # Skip specific parsers
-python mAIpper-v0.12.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
+python mAIpper-v0.13.py --no-nessus --no-burp --no-autorecon --no-loot --no-misc
 
 # Remote Ollama instance, different model
-python mAIpper-v0.12.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
+python mAIpper-v0.13.py --ollama-url http://10.10.10.5:11434 --model llama3:8b
 
 # Export to Excel (requires openpyxl)
-python mAIpper-v0.12.py --excel
+python mAIpper-v0.13.py --excel
 
 # Force re-analysis of all files (ignore incremental state)
-python mAIpper-v0.12.py --reanalyze
+python mAIpper-v0.13.py --reanalyze
 
 # Hallucination mitigation tuning
-python mAIpper-v0.12.py --temperature 0.1    # lower = less creative (default: 0.15)
-python mAIpper-v0.12.py --skip-validation    # bypass post-processing validator
+python mAIpper-v0.13.py --temperature 0.1    # lower = less creative (default: 0.15)
+python mAIpper-v0.13.py --skip-validation    # bypass post-processing validator
 
 # Verbose / debug logging
-python mAIpper-v0.12.py -v      # INFO
-python mAIpper-v0.12.py -vv     # DEBUG
+python mAIpper-v0.13.py -v      # INFO
+python mAIpper-v0.13.py -vv     # DEBUG
 ```
 
 Dependencies beyond stdlib:
@@ -80,7 +80,7 @@ Set `interactive = true` in `[interactive]` to start in interactive mode by defa
 
 ## Architecture
 
-Everything lives in `mAIpper-v0.12.py`. The flow is linear:
+Everything lives in `mAIpper-v0.13.py`. The flow is linear:
 
 1. **`main`** — loads config, parses args, handles `--init` and `-i` interactive mode, dispatches to `_run_processing`
 2. **`_run_processing`** — loads operator notes, resolves scan files across all parsers, skips unchanged files (incremental state), collects `scan_host_map` and `all_analyses`, processes deep dives, calls vault writers and canvas builder, optionally exports Excel
@@ -102,12 +102,17 @@ Everything lives in `mAIpper-v0.12.py`. The flow is linear:
 18. **`build_canvas`** — full rebuild: Campaign Overview → Priority Targets → scan cards → subnet groups → Next Steps
 19. **`build_users_canvas`** — builds Users Canvas: credential → host → service relationship graph with confirmed access edges
 20. **`_detect_misc_tool`** — auto-detects tool type from filename/content signatures, returns (tool_name, analysis_level)
-21. **`_process_eat_me_page`** — parses Eat Me drop zone, creates host notes, extracts credentials and standalone usernames, writes to `Loot/Credentials.md`, archives to Scans/, resets page
-22. **`_append_eat_me_to_credentials_md`** — appends Eat Me creds/usernames directly to `Loot/Credentials.md`; deduplicates by username; creates file and Campaign-Level section if needed
+21. **`_process_injestor`** — parses Injestor drop zone, creates host notes, extracts credentials and standalone usernames, writes to `Loot/Credentials.md`, archives to Scans/, resets page
+22. **`_append_injestor_to_credentials_md`** — appends Injestor creds/usernames directly to `Loot/Credentials.md`; deduplicates by username; creates file and Campaign-Level section if needed
 23. **`_write_campaign_targets_note`** — generates copy-paste target lists from all vault data
 24. **`_build_rag_index`** — chunks PDFs + markdown, embeds via Ollama, stores in SQLite with float16 embeddings
 25. **`_rag_retrieve`** / **`_get_rag_context`** — streaming cosine similarity from SQLite with heapq top-k, formats `[REF: source]` blocks for prompt injection
 26. **`export_excel`** — generates `Export.xlsx` with Summary, Nmap, Nessus, Burp, AutoRecon, and Loot sheets
+27. **`_write_finding_note`** / **`_write_nessus_finding_notes`** / **`_write_burp_finding_notes`** — create/update `Findings/*.md` PlexTrac notes; deduplicate by plugin_id or issue name; merge affected_assets across hosts
+28. **`export_plextrac`** — reads all `Findings/*.md`, writes `Findings/PlexTrac Export.csv` matching PlexTrac v3.2 import format
+29. **`detect_kiwi_secretsdump`** — detects kiwi/mimikatz/secretsdump output format from text; returns `"sam"`, `"kiwi_sekurlsa"`, `"kiwi_lsa_dump"`, or `None`
+30. **`parse_kiwi_secretsdump`** — Python fast-path parser for three kiwi formats: SAM dump lines (`user:RID:LM:NTLM:::`), sekurlsa blocks (`* Username / * NTLM`), and meterpreter lsa_dump_sam (`RID: / User: / Hash NTLM:` blocks); skips empty/null NTLM hashes
+31. **`_llm_extract_tool_output`** — LLM-based credential/host extraction for freeform Notes content; temperature 0.05, JSON-only output; results written to `## Pending Review` in the archive note for operator confirmation
 
 ## Incremental Analysis
 
@@ -129,14 +134,14 @@ mAIpper tracks which files have been analyzed via `.maipper_state.json` in the v
 - `+cred user:pass [host_ip]` — add credential to loot
 - `/help` — command list
 - `<question>` — ask the LLM about the assessment (full vault context injected)
-- Empty Enter — check for scan + vault changes, process Eat Me, report pending items; if pending items found, prompts `Analyze now? [Y/n]:` (Enter = yes)
+- Empty Enter — check for scan + vault changes, process Injestor, report pending items; if pending items found, prompts `Analyze now? [Y/n]:` (Enter = yes)
 - Ctrl+C — cancel current operation / exit at prompt
 
 **Analysis workflow:** Check `[x]` on any investigate checkbox (host notes) or analyze checkbox (scan notes) in Obsidian, then run `/analyze`. The LLM processes only checked items. Investigation results appear as callouts in `## Deep Dives`; scan analysis fills the `## Analysis` section. Checkboxes turn `[/]` (green) when complete.
 
-**Vault change detection:** The watch loop monitors both `scans/` and vault files (`Hosts/*.md`, `Eat Me.md`, `Loot/Credentials.md`). On vault changes:
+**Vault change detection:** The watch loop monitors both `scans/` and vault files (`Hosts/*.md`, `Injestor.md`, `Loot/Credentials.md`). On vault changes:
 - **Host notes changed** → operator notes reloaded; pending checkboxes reported
-- **Eat Me.md changed** → Python processing runs (host creation, targets update)
+- **Injestor.md changed** → Python processing runs (host creation, targets update)
 - **Credentials.md changed** → Users Canvas rebuilt
 - No LLM calls happen automatically — always explicit via `/analyze`, `/analyze-full`, or `/deepdive`
 
@@ -212,11 +217,11 @@ Interactive mode starts with **no LLM analysis**. All structured data is generat
 3. Run `/analyze` → LLM re-parses source file, fills `## Analysis` section (scan-level operator notes injected automatically)
 4. `- [/] Analyze: Nmap` — complete
 
-Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per-host Loot (`- [ ] Analyze: Loot — {host}`). Eat Me archive notes also get a `- [ ] Analyze: Misc` checkbox and a `## Analysis` section.
+Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per-host Loot (`- [ ] Analyze: Loot — {host}`). Injestor archive notes also get a `- [ ] Analyze: Misc` checkbox and a `## Analysis` section.
 
 **`/analyze-full`** — marks every unchecked `[ ]` box across all host notes and scan notes as `[x]`, then runs the full analysis pass. Equivalent to checking everything manually and running `/analyze`.
 
-**Batch mode** (`python mAIpper-v0.12.py` without `-i`) runs full analysis upfront as before. Checkboxes appear pre-set to `[/]`.
+**Batch mode** (`python mAIpper-v0.13.py` without `-i`) runs full analysis upfront as before. Checkboxes appear pre-set to `[/]`.
 
 CSS snippet auto-installed in `.obsidian/` for yellow `[x]` and green `[/]` highlighting.
 
@@ -250,7 +255,7 @@ Obsidian/
 ├─ .obsidian/snippets/maipper.css   # auto-installed CSS for investigation checkboxes
 ├─ Hosts/<hostname-or-ip>.md        # frontmatter + ports + findings + deep dives + operator notes
 ├─ Hosts/_Campaign Targets.md       # copy-paste target lists (IPs, subnets, hostnames, domains)
-├─ Eat Me.md                       # operator drop zone — paste anything, processed on next run
+├─ Injestor.md                     # operator drop zone — paste anything, processed on next run
 ├─ Scans/<scan-name> - Nmap.md      # per-scan note with AI analysis
 ├─ Scans/<scan-name> - Nessus.md
 ├─ Scans/<scan-name> - Burp.md
@@ -262,6 +267,10 @@ Obsidian/
 │   └─ Hashes.md                   # all hashes organized by host
 ├─ Assessment Canvas.canvas
 ├─ Users Canvas.canvas              # credential → host → service graph
+├─ Findings/
+│   ├─ _Template.md                 # copy in Obsidian to create manual findings
+│   ├─ <finding-name>.md            # one note per unique finding (auto from Nessus/Burp, or manual)
+│   └─ PlexTrac Export.csv          # generated by --plextrac or /plextrac
 └─ Export.xlsx                      # optional; --excel flag
 ```
 
@@ -311,21 +320,32 @@ Sections produced: **Correlated Findings** (connections across tools), **Attack 
 
 `_run_cross_source_deepdive(vault_dir, args, operator_notes_lookup)` — walks all non-campaign host notes and runs the correlation pass.
 
-## Eat Me Page
+## Injestor Page
 
-`Eat Me.md` is a drop zone at the vault root. Assessors paste anything — arp tables, host lists, tool output, notes — and on the next mAIpper run (batch or interactive Enter), the content is:
+`Injestor.md` is a drop zone at the vault root. Assessors paste anything — arp tables, host lists, tool output, notes — and on the next mAIpper run (batch or interactive Enter), the content is:
 
 1. **Parsed** for IPs, hostnames, FQDNs, URLs, credentials, and **standalone usernames**
 2. **New host notes** created for each IP not already in the vault, with:
    - MAC address (if from arp output)
    - Ready-to-run nmap scan commands in `## Next Steps`
-   - `eat-me` tag and `Eat Me` source
+   - `injestor` tag and `Injestor` source
 3. **Credentials and usernames written directly to `Loot/Credentials.md`** — both `user:pass` pairs and bare usernames (marked `potential`) are appended to the Campaign-Level section immediately; no separate loot pipeline run needed
-4. **Archived** to `Scans/Eat Me <timestamp>.md` with links to new/existing hosts, extracted hostnames, a `## Credentials Found` table, a `## Potential Usernames` list, tool detection metadata, `- [ ] Analyze: Misc` checkbox, and the original input in a collapsible block
+4. **Archived** to `Scans/Injestor <timestamp>.md` with links to new/existing hosts, extracted hostnames, a `## Credentials Found` table, a `## Potential Usernames` list, tool detection metadata, `- [ ] Analyze: Misc` checkbox, and the original input in a collapsible block
 5. **Campaign Targets** updated with newly discovered IPs/hostnames
-6. **Eat Me page reset** to blank template for the next drop
+6. **Injestor page reset** to blank template for the next drop
 
-`_append_eat_me_to_credentials_md(vault_dir, creds, usernames, source_label)` — appends new entries to `Loot/Credentials.md`, creating the file or a `## Campaign-Level` section if needed. Skips duplicates by username (case-insensitive).
+Three sections with distinct processing pipelines:
+
+**`## Notes`** — smart detection runs in priority order:
+1. **NXC fast-path** — `NXC_STATUS_LINE_RE` match → `parse_nxc_stdout`; goes directly to `Loot/Credentials.md`, no review
+2. **Kiwi fast-path** — `detect_kiwi_secretsdump` match → `parse_kiwi_secretsdump`; handles SAM lines, sekurlsa blocks, and meterpreter lsa_dump_sam format; goes directly to `Loot/Credentials.md`, no review
+3. **LLM → Pending Review** — freeform/unknown content; `_llm_extract_tool_output` at temperature 0.05; results held in `## Pending Review` in the archive note until operator confirms
+
+**`## Tool Output`** — same smart detection priority order as Notes; NXC and kiwi bypass LLM; anything else adds to the LLM batch
+
+**`## Access`** — access tracking entries written to host note `## Access` tables
+
+`_append_injestor_to_credentials_md(vault_dir, creds, usernames, source_label)` — appends new entries to `Loot/Credentials.md`, creating the file or a `## Campaign-Level` section if needed. Skips duplicates by username (case-insensitive).
 
 Supports arp -a output (Linux and Windows formats), plain IP lists, tool output with embedded IPs/URLs, free-text notes, and credential dumps.
 
@@ -342,3 +362,85 @@ Index PDF security books and a local HackTricks clone. Analysis gets cited refer
 **At analysis time:** Embeds query from scan context, streams cosine-similarity search from SQLite with heapq top-k (never loads all embeddings into memory), injects as `[REFERENCE MATERIAL]` block. Nmap gets top 5, deep dives get top 8.
 
 **Optional dependency:** `pypdf` for PDFs (same pattern as `openpyxl`). Markdown files parsed natively. RAG is silently disabled if no index exists and no docs configured.
+
+## PlexTrac Integration
+
+Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each finding note has frontmatter with all PlexTrac fields and a markdown body with `## Description`, `## Recommendations`, and `## References` sections.
+
+**Finding note creation:**
+- **Auto (Nessus):** medium+ severity findings → one note per unique plugin; `affected_assets` accumulates all IPs across hosts; enabled by default, skip with `--no-findings`
+- **Auto (Burp):** medium+ severity issues → one note per unique issue name; `affected_assets` accumulates all URLs/paths; same `--no-findings` flag
+- **Manual:** copy `Findings/_Template.md` in Obsidian, fill in the fields
+
+**Finding note format (frontmatter):** `title`, `severity`, `status` (Draft/Open/Closed/In Review), `affected_assets` (list), `tags` (list), `cvss_temporal`, `cwe`, `cve`, `category`, `sources`
+
+**Deduplication:** keyed by plugin_id (Nessus) or issue name (Burp). On re-run, existing notes are only updated on `affected_assets` — operator edits to description, recommendations, severity, and status are preserved.
+
+**Export:**
+- `--plextrac` flag (batch) or `/plextrac` command (interactive) → writes `Findings/PlexTrac Export.csv`
+- CSV columns match the PlexTrac v3.2 import format exactly: `title, severity, status, description, recommendations, references, affected_assets, tags, cvss_temporal, cwe, cve, category`
+- `description` and `recommendations` pulled from `## Description` / `## Recommendations` body sections; `references` pulled from `## References` as comma-separated list
+
+**Key functions:**
+- `_write_finding_note(findings_dir, finding)` — create or update one finding note
+- `_write_nessus_finding_notes(vault_dir, nessus_data, scan_source)` — batch from Nessus
+- `_write_burp_finding_notes(vault_dir, burp_data, scan_source)` — batch from Burp
+- `export_plextrac(vault_dir)` — reads all `Findings/*.md`, writes CSV
+- `_install_findings_template(vault_dir)` — creates `Findings/_Template.md` on vault init
+
+## Assessment & Roadmap (v0.13)
+
+### What works well
+
+- **Multi-source ingestion** — Nmap, Nessus, Burp, AutoRecon (10 tool extractors), Loot, Misc (25+ signature detections). Most assessment sources covered.
+- **LLM grounding** — CONFIRMED/INFERRED/ASSUMED tagging, two-pass fact-extraction (Nessus, AutoRecon), per-prompt anti-hallucination rules, source truth validation, operator notes feedback loop. Defensive LLM usage throughout.
+- **Obsidian as the UI** — host notes, canvases, watch loop, CSS checkbox snippets. Pentesters can live in one tool.
+- **Operator notes feedback loop** — `## Operator Notes` in host notes feeds back into every subsequent LLM prompt, making analysis smarter as you add context.
+- **`/deepdive` cross-source synthesis** — correlates Nmap + Nessus + Burp + AutoRecon + Loot per host, finds chains that only emerge when viewing all data together. Coverage Gaps section flags missing sources. Standout feature.
+- **Incremental state** — `.maipper_state.json` skips unchanged files; `--reanalyze` forces full redo; `/reanalyze` interactive equivalent.
+- **PlexTrac integration** — auto-draft findings from Nessus/Burp, dedup by plugin/issue, accumulate affected_assets, export CSV matching PlexTrac v3.2.
+
+### Known gaps (pentest workflow perspective)
+
+**Critical — missing workflow coverage:**
+1. **Post-exploitation tracking** — `status: exploited` exists but no structured place for access gained (user, privilege, method, sessions, lateral movement). The kill chain is not tracked.
+2. **BloodHound / AD path data** — AD assessments without BloodHound data miss critical attack paths. JSON exports would feed the Users Canvas and host prioritization directly.
+3. **Finding descriptions need LLM drafting** — PlexTrac notes are populated with raw Nessus plugin text. Need a `/draft-findings` step that rewrites descriptions as professional report findings using host context.
+4. **Evidence collection is freeform** — no structured `## Evidence` section in finding notes; no link from evidence to findings.
+
+**Important — quality and scale:**
+5. **Sequential LLM calls don't scale** — 50 hosts × multiple sources = 300+ sequential calls. No parallelization (`concurrent.futures` would fix this).
+6. **Finding consolidation is inverted** — dedup by plugin_id is the right default but no way to split findings back out or manually group unrelated ones.
+7. **validate_ai_output only checks CVEs** — doesn't validate IP addresses or ports mentioned in analysis against source data. Easy to extend.
+8. **Prompts are hardcoded** — no template system for engagement-specific context (client industry, compliance, assessment type), custom output sections, or per-prompt temperature tuning.
+
+**Missing parsers (high-value):**
+9. **CrackMapExec** — bulk spray / domain enumeration results; daily-driver tool on internal assessments.
+10. **Responder logs** — LLMNR/NBT-NS hash captures.
+11. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
+12. **Metasploit db export** — sessions, loot, modules run.
+
+**Architecture / robustness:**
+13. **No atomic writes** — interrupted LLM calls during vault writes can corrupt notes. Temp-file-then-rename pattern needed.
+14. **String-based section parsing is fragile** — `extract_body_section` breaks if section headers appear inside code blocks or operator notes.
+15. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
+16. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
+17. **Interactive analysis requires Obsidian round-trip** — must check boxes in Obsidian, switch to terminal, run `/analyze`. Want `/analyze <host> <topic>` direct from prompt.
+18. **Persistent chat history** — session chat lost on exit; not saved to vault.
+19. **Multi-IP host merging** — assets with multiple network interfaces have multiple IPs. Need: (a) `ips` list in frontmatter alongside primary `ip`, (b) `/merge` to detect and collapse notes sharing a hostname even when all three notes have different IPs, (c) canvas and Users Canvas to resolve any IP in the `ips` list to the canonical note. Current `/merge` only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md all for the same physical host).
+
+### Prioritized next steps
+
+| Priority | Item | Why |
+|---|---|---|
+| 1 | Exploitation / access tracking | Kill chain is the core of a pentest report; completely missing |
+| 2 | BloodHound parser + AD Canvas | Required for internal assessments; pairs with Users Canvas |
+| 3 | LLM-assisted finding drafting (`/draft-findings`) | Biggest reporting quality gap; raw plugin text ≠ professional finding |
+| 4 | Parallel LLM calls | Biggest performance gap; hours → minutes for large assessments |
+| 5 | Evidence blocks in findings | Bridges note-taking and reporting |
+| 6 | CrackMapExec + Responder parsers | Daily-driver tools, high return |
+| 7 | Scope management | Required for client-facing deliverables |
+| 8 | Extend hallucination validator to ports/IPs | Low effort, meaningful accuracy improvement |
+| 9 | Atomic vault writes | Robustness; prevents corruption under interruption |
+| 10 | `/analyze <host> <topic>` direct command | Removes Obsidian round-trip for active exploitation sessions |
+| 11 | Multi-IP host merging | Dual-homed assets produce split notes; `/merge` needs to unify by shared hostname across all IP notes |

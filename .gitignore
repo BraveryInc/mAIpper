@@ -23,6 +23,16 @@ __pycache__/
 venv/
 env/
 
+# Work in progress / scratch files
+wip/
+
+# Images and banners (design assets kept out of repo)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
 # OS
 .DS_Store
 Thumbs.db

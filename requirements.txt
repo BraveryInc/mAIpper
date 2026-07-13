@@ -1,0 +1,16 @@
+# mAIpper requirements
+# Python 3.10+ required
+#
+# Install all:          pip install -r requirements.txt
+# Required only:        pip install requests
+# Skip optional:        pip install -r requirements.txt --ignore-requires-python
+
+# ── Required ──────────────────────────────────────────────────────────────────
+requests>=2.28.0          # Ollama API calls
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# Excel export (--excel flag)
+openpyxl>=3.1.0
+
+# RAG: PDF reference books (--build-index with PDFs in docs/)
+pypdf>=3.0.0
