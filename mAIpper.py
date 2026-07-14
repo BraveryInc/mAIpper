@@ -13339,7 +13339,7 @@ def _watch_loop(args, base: Path) -> None:
     print("      +cred u:p   — add credential (+cred user:pass [host_ip])")
     print("      +access u@h — record access (+access user@host PRIV METHOD [session] [notes])")
     print("      /access     — show access summary (all compromised hosts)")
-    print("      <question>  — ask the LLM about the assessment")
+    print("      /chat <q>   — ask the LLM about the assessment")
     print()
 
     if not base.exists():
@@ -13421,7 +13421,7 @@ def _watch_loop(args, base: Path) -> None:
 
             # Interactive prompt
             try:
-                print("\033[90m  Enter to check · type a question · /help for commands\033[0m")
+                print("\033[90m  Enter to check · /chat <question> · /help for commands\033[0m")
                 user_input = input("mAIpper> ").strip()
             except EOFError:
                 break
@@ -13523,8 +13523,8 @@ def _watch_loop(args, base: Path) -> None:
                 print("  +cred u:p   — add credential (+cred user:pass [host_ip])")
                 print("  +access u@h — record access (+access user@host PRIV METHOD [session] [notes])")
                 print("  /access     — show access summary (all compromised hosts)")
+                print("  /chat <q>   — ask the LLM about the assessment")
                 print("  Ctrl+C      — cancel current operation / exit at prompt")
-                print("  <question>  — ask the LLM about the assessment")
             elif user_input.lower() in ("/hosts", "hosts"):
                 print(_interactive_hosts(vault_dir))
             elif user_input.lower() in ("/status", "status"):
@@ -13773,27 +13773,36 @@ def _watch_loop(args, base: Path) -> None:
             elif user_input.lower() in ("/access", "access"):
                 _print_access_summary(vault_dir)
 
-            # LLM question
-            elif not args.no_ollama:
-                context = _build_assessment_context(vault_dir)
-                prompt = _build_chat_prompt(user_input, context)
-                try:
-                    response = ollama_chat(
-                        args.ollama_url, args.model, prompt, args.temperature,
-                        system=_active_chat_persona or _active_system_prompt,
-                        history=chat_history,
-                    )
-                    print()
-                    print(response.strip())
-                    chat_history.append({"q": user_input, "a": response.strip()})
-                    if len(chat_history) > 20:
-                        chat_history = chat_history[-20:]
-                except KeyboardInterrupt:
-                    print("\n  [!] LLM query cancelled")
-                except Exception as exc:
-                    print(f"  LLM query failed: {exc}")
+            elif user_input.lower().startswith("/chat"):
+                question = user_input[5:].strip()
+                if not question:
+                    print("  Usage: /chat <question>")
+                    print("  Example: /chat what ports are open on DANTE-WS03?")
+                elif args.no_ollama:
+                    print("  LLM is disabled (--no-ollama).")
+                else:
+                    context = _build_assessment_context(vault_dir)
+                    prompt = _build_chat_prompt(question, context)
+                    try:
+                        response = ollama_chat(
+                            args.ollama_url, args.model, prompt, args.temperature,
+                            system=_active_chat_persona or _active_system_prompt,
+                            history=chat_history,
+                        )
+                        print()
+                        print(response.strip())
+                        chat_history.append({"q": question, "a": response.strip()})
+                        if len(chat_history) > 20:
+                            chat_history = chat_history[-20:]
+                    except KeyboardInterrupt:
+                        print("\n  [!] LLM query cancelled")
+                    except Exception as exc:
+                        print(f"  LLM query failed: {exc}")
+
             else:
-                print("  LLM is disabled (--no-ollama). Use commands or enable Ollama.")
+                print(f"  Unknown command: '{user_input}'")
+                print("  /analyze  /deepdive  /merge  /hosts  /status  /chat <question>")
+                print("  /help for full command list")
 
     except KeyboardInterrupt:
         print("\n[*] Interactive mode stopped.")
