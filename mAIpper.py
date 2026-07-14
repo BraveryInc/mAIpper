@@ -7651,6 +7651,148 @@ def _interpret_credential_operator_notes(
     return len(updates)
 
 
+_CRED_TABLE_ROW_RE = re.compile(r"^\|(.+)\|$")
+_CRED_HEADER_NAMES = {"username", "password", "hash", "hash type", "source", "notes"}
+
+
+def _reattribute_campaign_credentials_by_notes(
+    creds_path: Path,
+    known_hosts: dict[str, str],
+    vault_dir: Path,
+) -> int:
+    """Move Campaign-Level credential rows to the correct host section when
+    the Notes column contains a known host identifier.
+
+    Handles both short notes ('Dante-WS01') and prose notes
+    ('from the SMB share on dante-ws01 with guest read').
+
+    Returns number of rows moved.
+    """
+    if not creds_path.exists():
+        return 0
+    try:
+        file_lines = creds_path.read_text(encoding="utf-8").split("\n")
+    except Exception:
+        return 0
+
+    # Locate Campaign-Level section
+    camp_start: int | None = None
+    camp_end: int = len(file_lines)
+    for i, line in enumerate(file_lines):
+        if line.strip() == "## Campaign-Level":
+            camp_start = i
+        elif camp_start is not None and line.strip().startswith("## ") and i > camp_start:
+            camp_end = i
+            break
+
+    if camp_start is None:
+        return 0
+
+    # Scan Campaign-Level table rows for Notes column containing a known host
+    rows_to_move: list[tuple[int, str, str]] = []  # (line_idx, raw_line, target_host_key)
+    for i in range(camp_start, camp_end):
+        line = file_lines[i]
+        if not _CRED_TABLE_ROW_RE.match(line.strip()):
+            continue
+        cols = [c.strip() for c in line.split("|")[1:-1]]
+        if len(cols) < 6:
+            continue
+        # Skip header and separator rows
+        if cols[0].lower().lstrip("`") in _CRED_HEADER_NAMES or set(cols[0]) <= {"-", " "}:
+            continue
+        notes_col = cols[5].strip("`").strip()
+        if not notes_col or notes_col == "—":
+            continue
+        notes_lower = notes_col.lower()
+        for ident, h_key in known_hosts.items():
+            if len(ident) >= 4 and ident in notes_lower:
+                rows_to_move.append((i, line, h_key))
+                break
+
+    if not rows_to_move:
+        return 0
+
+    # Group by target host
+    host_rows: dict[str, list[str]] = {}
+    remove_idxs: set[int] = set()
+    for idx, raw, h_key in rows_to_move:
+        host_rows.setdefault(h_key, []).append(raw)
+        remove_idxs.add(idx)
+
+    # Remove rows from Campaign-Level
+    new_lines = [ln for i, ln in enumerate(file_lines) if i not in remove_idxs]
+
+    # Build host_key → stem map from vault notes
+    hosts_dir = vault_dir / "Hosts"
+    stem_map: dict[str, str] = {}
+    if hosts_dir.exists():
+        for hp in hosts_dir.glob("*.md"):
+            if hp.stem.startswith("_"):
+                continue
+            try:
+                fm, _ = read_frontmatter(hp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            ip = fm.get("ip", "")
+            hostnames = fm.get("hostnames", [])
+            hk = ip or (hostnames[0] if hostnames else hp.stem)
+            stem_map[hk] = hp.stem
+
+    for h_key, cred_rows in host_rows.items():
+        host_stem = stem_map.get(h_key, safe_filename(h_key))
+        expected_header = f"## [[Hosts/{host_stem}|{h_key}]]"
+
+        # Find existing section (match by host_key anywhere in the header line)
+        section_idx: int | None = None
+        for i, line in enumerate(new_lines):
+            stripped = line.strip()
+            if stripped.startswith("## ") and h_key in stripped:
+                section_idx = i
+                break
+
+        if section_idx is not None:
+            # Find the last table row in this section (before sentinel or next ##)
+            last_table_row = section_idx
+            for i in range(section_idx + 1, len(new_lines)):
+                stripped = new_lines[i].strip()
+                if stripped.startswith("## ") or stripped == _CRED_NOTES_SENTINEL:
+                    break
+                if _CRED_TABLE_ROW_RE.match(stripped):
+                    last_table_row = i
+            insert_at = last_table_row + 1
+            for row in reversed(cred_rows):
+                new_lines.insert(insert_at, row)
+        else:
+            # Create a new section just before Campaign-Level
+            camp_idx = next(
+                (i for i, l in enumerate(new_lines) if l.strip() == "## Campaign-Level"),
+                len(new_lines),
+            )
+            new_section: list[str] = [
+                expected_header,
+                "",
+                "| Username | Password | Hash | Hash Type | Source | Notes |",
+                "|----------|----------|------|-----------|--------|-------|",
+            ] + cred_rows + [
+                "",
+                _CRED_NOTES_SENTINEL,
+                _CRED_NOTES_HINT,
+                "",
+            ]
+            for line in reversed(new_section):
+                new_lines.insert(camp_idx, line)
+
+    _atomic_write_text(creds_path, "\n".join(new_lines))
+
+    moved = sum(len(rows) for rows in host_rows.values())
+    for h_key, rows in host_rows.items():
+        for row in rows:
+            cols = [c.strip() for c in row.split("|")[1:-1]]
+            username = cols[0].strip("`") if cols else "?"
+            print(f"  [Creds] Moved '{username}' from Campaign-Level → {h_key} (matched Notes column)")
+    return moved
+
+
 def _read_credential_row_notes(creds_path: Path) -> dict[str, dict[str, str]]:
     """Read per-credential inline notes from the table's Notes column.
 
@@ -13112,7 +13254,12 @@ def _process_vault_changes(
         known = _build_known_hosts_lookup(vault_dir)
         patched = _interpret_credential_operator_notes(vault_dir, args, known)
         if patched:
-            print(f"  [Creds] Annotated {patched} section(s) — Users Canvas rebuilding")
+            print(f"  [Creds] Annotated {patched} section(s)")
+        moved = _reattribute_campaign_credentials_by_notes(
+            vault_dir / "Loot" / "Credentials.md", known, vault_dir
+        )
+        if moved:
+            print(f"  [Creds] Re-attributed {moved} credential(s) based on Notes column")
         if not args.no_canvas and not args.no_users_canvas:
             build_users_canvas(vault_dir, all_loot_data)
             print("  [Vault] Users Canvas rebuilt")
