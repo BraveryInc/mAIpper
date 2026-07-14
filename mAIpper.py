@@ -2231,9 +2231,14 @@ def _build_known_hosts_lookup(vault_dir: Path) -> dict[str, str]:
         hostnames = fm.get("hostnames", [])
         host_key = ip or (hostnames[0] if hostnames else hp.stem)
 
-        # Register the IP
+        # Register the primary IP
         if ip:
             lookup[ip.lower()] = host_key
+        # Register secondary IPs (multi-interface hosts)
+        for extra_ip in fm.get("ips", []):
+            extra_ip = (extra_ip or "").strip()
+            if extra_ip:
+                lookup[extra_ip.lower()] = host_key
         # Register all hostnames
         for hn in hostnames:
             if hn:
@@ -6053,8 +6058,14 @@ def _merge_two_host_notes(keep_path: Path, delete_path: Path, vault_dir: Path) -
     keep_fm,   keep_body   = read_frontmatter(keep_text)
     delete_fm, delete_body = read_frontmatter(delete_text)
 
-    # Merge frontmatter
-    merged_ip = (keep_fm.get("ip") or delete_fm.get("ip") or "").strip()
+    # Merge frontmatter — collect all IPs; primary ip stays first, rest go into ips list
+    all_ips: list[str] = list(dict.fromkeys(filter(None, [
+        (keep_fm.get("ip") or "").strip(),
+        (delete_fm.get("ip") or "").strip(),
+        *[x.strip() for x in keep_fm.get("ips", []) if x],
+        *[x.strip() for x in delete_fm.get("ips", []) if x],
+    ])))
+    merged_ip = all_ips[0] if all_ips else ""
 
     all_hostnames: list[str] = list(dict.fromkeys(
         (keep_fm.get("hostnames") or []) + (delete_fm.get("hostnames") or [])
@@ -6068,6 +6079,10 @@ def _merge_two_host_notes(keep_path: Path, delete_path: Path, vault_dir: Path) -
 
     merged_fm: dict = dict(keep_fm)
     merged_fm["ip"]        = merged_ip
+    if len(all_ips) > 1:
+        merged_fm["ips"] = all_ips[1:]
+    elif "ips" in merged_fm:
+        del merged_fm["ips"]
     merged_fm["hostnames"] = all_hostnames
     merged_fm["tags"]      = merged_tags
     merged_fm["sources"]   = merged_sources
@@ -6200,6 +6215,11 @@ def _detect_and_merge_host_notes(vault_dir: Path) -> list[str]:
         ip = (fm.get("ip") or "").strip()
         if ip:
             groups.setdefault(f"ip:{ip}", set()).add(path)
+        # Secondary IPs (multi-interface hosts)
+        for extra_ip in (fm.get("ips") or []):
+            extra_ip = (extra_ip or "").strip()
+            if extra_ip:
+                groups.setdefault(f"ip:{extra_ip}", set()).add(path)
         # If the stem itself looks like an IP, add it under that key too
         if _IPV4_STEM_RE.match(path.stem):
             groups.setdefault(f"ip:{path.stem}", set()).add(path)
@@ -7964,6 +7984,7 @@ def _write_loot_credentials_page(
     loot_dir_out: Path,
     loot_data: dict,
     host_stem_map: dict[str, str],
+    host_display_map: dict[str, str] | None = None,
 ) -> None:
     """Write Loot/Credentials.md with all credentials organized by host."""
     page_path = loot_dir_out / "Credentials.md"
@@ -7990,8 +8011,9 @@ def _write_loot_credentials_page(
             continue
         has_content = True
         host_stem = host_stem_map.get(host_key, safe_filename(host_key))
+        host_display = (host_display_map or {}).get(host_key, host_key)
         host_row_notes = existing_row_notes.get(host_key, {})
-        lines.append(f"## [[Hosts/{host_stem}|{host_key}]]")
+        lines.append(f"## [[Hosts/{host_stem}|{host_display}]]")
         lines.append("")
         lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
         lines.append("|----------|----------|------|-----------|--------|-------|")
@@ -8047,6 +8069,7 @@ def _write_loot_hashes_page(
     loot_dir_out: Path,
     loot_data: dict,
     host_stem_map: dict[str, str],
+    host_display_map: dict[str, str] | None = None,
 ) -> None:
     """Write Loot/Hashes.md with all hashes organized by host."""
     lines: list[str] = [
@@ -8071,7 +8094,8 @@ def _write_loot_hashes_page(
             continue
         has_content = True
         host_stem = host_stem_map.get(host_key, safe_filename(host_key))
-        lines.append(f"## [[Hosts/{host_stem}|{host_key}]]")
+        host_display = (host_display_map or {}).get(host_key, host_key)
+        lines.append(f"## [[Hosts/{host_stem}|{host_display}]]")
         lines.append("")
         lines.append("| Hash | Type | Username | Source |")
         lines.append("|------|------|----------|--------|")
@@ -8255,6 +8279,7 @@ def create_loot_vault(
     # Update host notes with lightweight loot sections
     host_entries: list[tuple[str, str]] = []
     host_stem_map: dict[str, str] = {}
+    host_display_map: dict[str, str] = {}
 
     for host_key, loot_files in loot_data.get("host_loot", {}).items():
         ip = host_key if IPV4_RE.match(host_key) else ""
@@ -8264,10 +8289,11 @@ def create_loot_vault(
         )
         host_entries.append((display, host_stem))
         host_stem_map[host_key] = host_stem
+        host_display_map[host_key] = display  # prefers hostname over IP
 
     # Write centralized Loot pages
-    _write_loot_credentials_page(loot_dir_out, loot_data, host_stem_map)
-    _write_loot_hashes_page(loot_dir_out, loot_data, host_stem_map)
+    _write_loot_credentials_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
+    _write_loot_hashes_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
 
     # Write Loot/Overview.md (replaces old Scans/Loot.md)
     summary = loot_data.get("summary", {})
