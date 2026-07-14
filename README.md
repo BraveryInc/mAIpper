@@ -165,11 +165,11 @@ Starts immediately with no LLM calls — all parsing, host notes, and canvases a
 | `/plextrac` | Export `Findings/` notes to PlexTrac-compatible CSV |
 | `/hosts` | List all discovered hosts |
 | `/status` | Assessment summary |
+| `/chat <question>` | Ask the LLM about the assessment with full vault context injected |
 | `/paste` | Multiline paste (auto-detects IPs, credentials, tool output) |
 | `/build-index` | Build or update RAG index from `docs/` |
 | `+access user@host PRIV METHOD [session] [notes]` | Record a shell or access gained; updates the host note `## Access` section |
 | `/access` | Print campaign-wide access summary (all compromised hosts) |
-| `<question>` | Ask the LLM about the assessment with full vault context injected |
 | Enter | Check for new scans and vault changes; prompt to analyze if anything is pending |
 | Ctrl+C | Cancel current operation / exit at prompt |
 
@@ -314,18 +314,32 @@ Obsidian/
 
 ```
 scans/loot/
-├── 10.10.10.5/sam_dump.txt     → associated with 10.10.10.5
-└── 10.10.10.10_creds.txt       → associated with 10.10.10.10
+├── 10.10.10.5/sam_dump.txt      → associated with 10.10.10.5 (subdirectory)
+├── dc01_creds.txt               → associated with dc01 (short hostname prefix)
+├── dc01.domain.local_dump.txt   → associated with dc01.domain.local (FQDN prefix)
+└── 10.10.10.10_creds.txt        → associated with 10.10.10.10 (IP prefix)
 ```
+
+Unassociated files go to Campaign-Level. Credential rows in Campaign-Level are automatically re-attributed if the **Notes column** contains a known host identifier — short notes (`dc01`) or prose (`from the SMB share on dc01 with guest read`) both work. mAIpper detects the change on the next Enter press and moves the row to the correct host section.
 
 Mark confirmed access in `Loot/Credentials.md` under any host's `### Operator Notes` section:
 
 ```markdown
 - [x] Confirmed on 10.10.10.5
-- Works on 10.10.10.5 via RDP only
+- Works on dc01 via RDP only
 ```
 
-Confirmed entries create green edges in the Users Canvas.
+mAIpper scans operator notes on every Credentials.md change. If a known host identifier appears in freeform text, `- [x] Confirmed on <host>` is auto-appended. Ambiguous notes go to the LLM for interpretation (console suggestion only — operator confirms). Confirmed entries create green edges in the Users Canvas.
+
+**Multi-interface hosts** — hosts with multiple IPs store secondary addresses in `ips` frontmatter. Both IPs then resolve to the same host note for loot attribution, canvas layout, and `/merge` detection:
+
+```yaml
+ip: 10.10.100.100
+ips: ["172.16.1.100"]
+hostnames: ["dante-web-nix01"]
+```
+
+`/merge` collapses separate IP notes into one canonical note and populates `ips` automatically.
 
 ---
 

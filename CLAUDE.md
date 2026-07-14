@@ -106,13 +106,16 @@ Everything lives in `mAIpper.py`. The flow is linear:
 22. **`_append_injestor_to_credentials_md`** — appends Injestor creds/usernames directly to `Loot/Credentials.md`; deduplicates by username; creates file and Campaign-Level section if needed
 23. **`_write_campaign_targets_note`** — generates copy-paste target lists from all vault data
 24. **`_build_rag_index`** — chunks PDFs + markdown, embeds via Ollama, stores in SQLite with float16 embeddings
-25. **`_rag_retrieve`** / **`_get_rag_context`** — streaming cosine similarity from SQLite with heapq top-k, formats `[REF: source]` blocks for prompt injection
+25. **`_rag_retrieve`** / **`_load_rag_matrix`** / **`_get_rag_context`** — vectorized cosine similarity over a cached in-memory numpy matrix (falls back to streaming SQLite + heapq top-k when numpy is absent), formats `[REF: source]` blocks for prompt injection
 26. **`export_excel`** — generates `Export.xlsx` with Summary, Nmap, Nessus, Burp, AutoRecon, and Loot sheets
 27. **`_write_finding_note`** / **`_write_nessus_finding_notes`** / **`_write_burp_finding_notes`** — create/update `Findings/*.md` PlexTrac notes; deduplicate by plugin_id or issue name; merge affected_assets across hosts
 28. **`export_plextrac`** — reads all `Findings/*.md`, writes `Findings/PlexTrac Export.csv` matching PlexTrac v3.2 import format
 29. **`detect_kiwi_secretsdump`** — detects kiwi/mimikatz/secretsdump output format from text; returns `"sam"`, `"kiwi_sekurlsa"`, `"kiwi_lsa_dump"`, or `None`
 30. **`parse_kiwi_secretsdump`** — Python fast-path parser for three kiwi formats: SAM dump lines (`user:RID:LM:NTLM:::`), sekurlsa blocks (`* Username / * NTLM`), and meterpreter lsa_dump_sam (`RID: / User: / Hash NTLM:` blocks); skips empty/null NTLM hashes
 31. **`_llm_extract_tool_output`** — LLM-based credential/host extraction for freeform Notes content; temperature 0.05, JSON-only output; results written to `## Pending Review` in the archive note for operator confirmation
+32. **`_interpret_credential_operator_notes`** — on Credentials.md change, scans `### Operator Notes` blocks for freeform text; Pass 1 (Python) matches known host identifiers and auto-appends `[x] Confirmed on`; Pass 2 (LLM) handles ambiguous access-implying language and prints a suggestion
+33. **`_reattribute_campaign_credentials_by_notes`** — scans Campaign-Level credential table rows; when the Notes column contains a known host identifier (short or prose), moves the row to the correct host section and creates the section if needed
+34. **`_parse_creds_host_key`** / **`_patch_credential_operator_notes`** — helpers: parse `## [[Hosts/stem|key]]` headers; targeted in-place append to operator notes blocks without full file rewrite
 
 ## Incremental Analysis
 
@@ -128,14 +131,15 @@ mAIpper tracks which files have been analyzed via `.maipper_state.json` in the v
 - `/analyze` — analyze checked `[x]` items (investigation checkboxes + scan analysis boxes)
 - `/analyze-full` — check ALL unchecked boxes then run full analysis (equivalent to checking everything and running `/analyze`)
 - `/deepdive` — cross-source correlation per host: synthesizes Nmap + Nessus + Burp + AutoRecon + Loot into one analysis per host, writes `## Cross-Source Analysis`
-- `/merge` — detect and merge duplicate host notes (e.g., `10.10.10.5.md` + `dc01.domain.local.md`)
+- `/merge` — detect and merge duplicate host notes (e.g., `10.10.10.5.md` + `dc01.domain.local.md`); also collapses multi-IP notes via `ips` frontmatter
+- `/chat <question>` — ask the LLM about the assessment (full vault context injected); explicit prefix required — freeform text no longer fires LLM calls
 - `/refresh` — re-process all scan files (no analysis)
 - `/paste` — multiline paste (auto-detects IPs, credentials, or saves to misc)
 - `+cred user:pass [host_ip]` — add credential to loot
 - `/help` — command list
-- `<question>` — ask the LLM about the assessment (full vault context injected)
 - Empty Enter — check for scan + vault changes, process Injestor, report pending items; if pending items found, prompts `Analyze now? [Y/n]:` (Enter = yes)
 - Ctrl+C — cancel current operation / exit at prompt
+- Unknown input — prints short command reminder; no accidental LLM calls
 
 **Analysis workflow:** Check `[x]` on any investigate checkbox (host notes) or analyze checkbox (scan notes) in Obsidian, then run `/analyze`. The LLM processes only checked items. Investigation results appear as callouts in `## Deep Dives`; scan analysis fills the `## Analysis` section. Checkboxes turn `[/]` (green) when complete.
 
@@ -150,8 +154,8 @@ mAIpper tracks which files have been analyzed via `.maipper_state.json` in the v
 Assessors drop loot files into `scans/loot/` — credentials, hashes, keys, sensitive files.
 
 **Host association:**
-- **Subdirectory:** `loot/10.10.10.5/ftp_listing.txt`
-- **Filename prefix:** `loot/10.10.10.5_ftp_creds.txt`
+- **Subdirectory:** `loot/10.10.10.5/` or `loot/dante-ws03/` (IP or short hostname)
+- **Filename prefix:** `loot/10.10.10.5_creds.txt`, `loot/dante-ws03_dump.txt`, `loot/dc01.domain.local_sam.txt`
 - **Unassociated:** `loot/cracked_hashes.txt` — campaign-level
 
 **Output:** Centralized `Loot/Credentials.md` and `Loot/Hashes.md` with per-host tables. Host notes get lightweight `## Loot` sections with summary stats and links. File listings stay inline.
@@ -236,6 +240,7 @@ The `## Operator Notes` section in **host notes** is a live feedback channel. On
 ```yaml
 ---
 ip: 10.10.10.5
+ips: ["172.16.1.100"]      # secondary IPs for multi-interface hosts; populated by /merge
 hostnames: ["dc01.domain.local"]
 status: not-started        # not-started / in-progress / done / exploited / blocked
 tags: ["smb", "kerberos", "ldap", "domain-controller", "autorecon", "loot"]
@@ -247,6 +252,8 @@ loot_credential_count: 5
 loot_hash_count: 2
 ---
 ```
+
+`ips` is optional — only present on multi-interface hosts. All IPs in `ips` resolve to this note in `_build_known_hosts_lookup`, so loot files prefixed with any of the host's IPs attribute correctly. `/merge` populates `ips` automatically when collapsing separate IP notes.
 
 ## Output Layout
 
@@ -359,9 +366,9 @@ Index PDF security books and a local HackTricks clone. Analysis gets cited refer
 
 **Config** (`[rag]` section in `maipper.conf`): `docs_dir`, `hacktricks_dir`, `embedding_model` (default: `nomic-embed-text`), `max_chunks`, `auto_build` (default: `true` — prompts on startup if unindexed or changed docs found).
 
-**At analysis time:** Embeds query from scan context, streams cosine-similarity search from SQLite with heapq top-k (never loads all embeddings into memory), injects as `[REFERENCE MATERIAL]` block. Nmap gets top 5, deep dives get top 8.
+**At analysis time:** Embeds query from scan context, then scores it against the chunk embeddings. With `numpy` installed, all embeddings are loaded once into an in-memory matrix (cached per run, keyed by DB path + mtime) and scored with a single vectorized cosine op — fast even at 50k+ chunks. Without numpy, it falls back to a streaming SQLite scan with heapq top-k (never loads all embeddings into memory, but pure-Python and slow on large indexes). Injects results as a `[REFERENCE MATERIAL]` block. Nmap gets top 5, deep dives get top 8.
 
-**Optional dependency:** `pypdf` for PDFs (same pattern as `openpyxl`). Markdown files parsed natively. RAG is silently disabled if no index exists and no docs configured.
+**Optional dependencies:** `pypdf` for PDFs (same pattern as `openpyxl`); `numpy` strongly recommended for fast RAG retrieval (falls back to slow pure-Python scan without it). Markdown files parsed natively. RAG is silently disabled if no index exists and no docs configured.
 
 ## PlexTrac Integration
 
@@ -388,7 +395,16 @@ Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each f
 - `export_plextrac(vault_dir)` — reads all `Findings/*.md`, writes CSV
 - `_install_findings_template(vault_dir)` — creates `Findings/_Template.md` on vault init
 
-## Assessment & Roadmap (v0.13)
+## Assessment & Roadmap (v0.14)
+
+### Recently resolved (v0.14)
+
+- **Host-note section data loss (fixed)** — all six writers now preserve `## Access` and `## NXC Enumeration`; the Nmap writer also preserves `## Cross-Source Analysis`. Previously a re-scan of a host silently dropped post-ex/AD/synthesis sections.
+- **Atomic vault writes (fixed, gap #13)** — every note/canvas/page write uses `_atomic_write_text` (temp file + `os.replace`); interruption no longer corrupts notes.
+- **RAG retrieval performance (fixed, part of gap #5 cost)** — with `numpy` installed, embeddings load once into an in-memory matrix and are scored with vectorized cosine, cached per run, replacing the pure-Python full-table scan on every query. Pure-Python streaming remains as fallback.
+- **Parallel analysis (partial, gap #5)** — `--workers` now parallelizes AutoRecon, loot, and misc LLM analysis in addition to deep dives / cross-source. Nmap/Nessus/Burp per-file loops remain serial (low file counts).
+- **Validator scope (fixed, gap #7)** — `validate_ai_output` already cross-references IPs, ports, and hostnames, not just CVEs.
+- **Fragile section parsing (partial, gap #14)** — `extract_body_section` is now fenced-code-block aware; a `## ` line inside a ``` fence no longer truncates a section.
 
 ### What works well
 
@@ -409,9 +425,9 @@ Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each f
 4. **Evidence collection is freeform** — no structured `## Evidence` section in finding notes; no link from evidence to findings.
 
 **Important — quality and scale:**
-5. **Sequential LLM calls don't scale** — 50 hosts × multiple sources = 300+ sequential calls. No parallelization (`concurrent.futures` would fix this).
+5. **Sequential LLM calls in the scan-file loops** — Nmap/Nessus/Burp per-file analysis is still serial (AutoRecon/loot/misc/deep-dive/cross-source are parallelized via `--workers`). Low priority since scan-file counts are usually small; a two-phase (parallel analyze → serial write) refactor would finish it.
 6. **Finding consolidation is inverted** — dedup by plugin_id is the right default but no way to split findings back out or manually group unrelated ones.
-7. **validate_ai_output only checks CVEs** — doesn't validate IP addresses or ports mentioned in analysis against source data. Easy to extend.
+7. ~~validate_ai_output only checks CVEs~~ — **RESOLVED**: now cross-references IPs, ports, and hostnames too.
 8. **Prompts are hardcoded** — no template system for engagement-specific context (client industry, compliance, assessment type), custom output sections, or per-prompt temperature tuning.
 
 **Missing parsers (high-value):**
@@ -421,8 +437,8 @@ Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each f
 12. **Metasploit db export** — sessions, loot, modules run.
 
 **Architecture / robustness:**
-13. **No atomic writes** — interrupted LLM calls during vault writes can corrupt notes. Temp-file-then-rename pattern needed.
-14. **String-based section parsing is fragile** — `extract_body_section` breaks if section headers appear inside code blocks or operator notes.
+13. ~~No atomic writes~~ — **RESOLVED**: all writes go through `_atomic_write_text` (temp file + `os.replace`).
+14. **String-based section parsing is still string-based** — `extract_body_section` is now fenced-code-block aware, but section handling remains six copies of manual extract/emit logic per writer. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them and prevent future "forgot to preserve section X" regressions.
 15. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
 16. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
 17. **Interactive analysis requires Obsidian round-trip** — must check boxes in Obsidian, switch to terminal, run `/analyze`. Want `/analyze <host> <topic>` direct from prompt.
@@ -436,11 +452,12 @@ Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each f
 | 1 | Exploitation / access tracking | Kill chain is the core of a pentest report; completely missing |
 | 2 | BloodHound parser + AD Canvas | Required for internal assessments; pairs with Users Canvas |
 | 3 | LLM-assisted finding drafting (`/draft-findings`) | Biggest reporting quality gap; raw plugin text ≠ professional finding |
-| 4 | Parallel LLM calls | Biggest performance gap; hours → minutes for large assessments |
-| 5 | Evidence blocks in findings | Bridges note-taking and reporting |
-| 6 | CrackMapExec + Responder parsers | Daily-driver tools, high return |
-| 7 | Scope management | Required for client-facing deliverables |
-| 8 | Extend hallucination validator to ports/IPs | Low effort, meaningful accuracy improvement |
-| 9 | Atomic vault writes | Robustness; prevents corruption under interruption |
-| 10 | `/analyze <host> <topic>` direct command | Removes Obsidian round-trip for active exploitation sessions |
-| 11 | Multi-IP host merging | Dual-homed assets produce split notes; `/merge` needs to unify by shared hostname across all IP notes |
+| 4 | Evidence blocks in findings | Bridges note-taking and reporting |
+| 5 | CrackMapExec + Responder parsers | Daily-driver tools, high return |
+| 6 | Scope management | Required for client-facing deliverables |
+| 7 | Single section-dict serializer for host notes | Collapses six manual writer copies; structurally prevents section-drop regressions |
+| 8 | Finish parallelizing Nmap/Nessus/Burp scan-file loops | Two-phase analyze→write; completes the `--workers` coverage |
+| 9 | `/analyze <host> <topic>` direct command | Removes Obsidian round-trip for active exploitation sessions |
+| 10 | Multi-IP host merging | Dual-homed assets produce split notes; `/merge` needs to unify by shared hostname across all IP notes |
+
+**Resolved in v0.14:** parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/IPs, RAG retrieval performance, host-note section data loss.
