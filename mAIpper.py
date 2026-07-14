@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.13 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.14 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.13:
+  - FIX (data loss): host-note re-writes no longer drop ## Access or
+    ## NXC Enumeration sections; the Nmap writer also now preserves
+    ## Cross-Source Analysis. All six writers preserve the full canonical
+    section set on every merge.
+  - Atomic vault writes: every note/canvas/page write goes through
+    _atomic_write_text (temp file + os.replace), preventing corruption if
+    the process is interrupted (e.g. Ctrl+C during an LLM call).
+  - Faster RAG retrieval: when numpy is installed, embeddings are loaded
+    once into an in-memory matrix and scored with vectorized cosine
+    similarity (cached per run) instead of a pure-Python full-table scan
+    on every query. Falls back to the streaming scan without numpy.
+  - Parallel analysis: --workers now also parallelizes AutoRecon, loot,
+    and misc LLM analysis (previously deep dives / cross-source only).
+  - extract_body_section is fenced-code-block aware: a ## line inside a
+    ``` code fence no longer truncates a preserved section.
 
 Changes from v0.12:
   - PlexTrac integration: auto-generates Findings/ notes from Nessus
@@ -138,6 +155,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sys
 import threading
@@ -169,6 +187,12 @@ except ImportError:
         HAS_PYPDF = True
     except ImportError:
         HAS_PYPDF = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 
 # ============================================================
@@ -290,6 +314,10 @@ _RAG_INDEX: dict | None = None
 _RAG_BUILDER = None  # _RagIndexBuilder | None
 _RAG_OLLAMA_URL: str = ""
 _RAG_EMBEDDING_MODEL: str = RAG_DEFAULT_EMBEDDING_MODEL
+# Cached numpy embedding matrix for fast retrieval, keyed by (db_path, mtime).
+# {"key": (str, float), "matrix": np.ndarray (N, dim) float32,
+#  "norms": np.ndarray (N,), "meta": list[dict]}
+_RAG_MATRIX_CACHE: dict | None = None
 
 # NXC (NetExec) stdout parsing regexes
 NXC_STATUS_LINE_RE = re.compile(
@@ -548,6 +576,30 @@ def read_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body
 
 
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write text to *path* atomically (temp file in same dir + os.replace).
+
+    Prevents note/canvas corruption if the process is interrupted (e.g. Ctrl+C
+    during an LLM call) partway through a write. os.replace is atomic on both
+    POSIX and Windows when source and destination are on the same filesystem.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding=encoding, newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def extract_operator_notes(body: str) -> str:
     idx = body.find(OPERATOR_NOTES_SENTINEL)
     if idx == -1:
@@ -567,10 +619,36 @@ def extract_operator_notes(body: str) -> str:
 
 
 def extract_body_section(body: str, section_header: str) -> str:
-    """Extract content of a named ## section (without its header line)."""
-    pattern = rf"(?:^|\n){re.escape(section_header)}\n(.*?)(?=\n## |\Z)"
-    m = re.search(pattern, body, re.DOTALL)
-    return m.group(1).strip() if m else ""
+    """Extract content of a named ## section (without its header line).
+
+    Fenced code blocks (``` or ~~~) are respected: a line that merely looks
+    like a level-2 heading inside a code fence does not terminate the section.
+    A following ``## `` heading (outside a fence) ends it; deeper ``### ``
+    headings do not.
+    """
+    target = section_header.strip()
+    lines = body.splitlines()
+
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == target:
+            start = i + 1
+            break
+    if start is None:
+        return ""
+
+    collected: list[str] = []
+    in_fence = False
+    for line in lines[start:]:
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            collected.append(line)
+            continue
+        if not in_fence and line.startswith("## "):
+            break
+        collected.append(line)
+    return "\n".join(collected).strip()
 
 
 # ============================================================
@@ -2007,8 +2085,17 @@ def _process_loot_file(filepath: Path) -> dict | None:
 # Loot directory parsing
 # ============================================================
 
-def _resolve_host_from_path(filepath: Path, loot_dir: Path) -> str | None:
-    """Resolve which host a loot file belongs to, or None for campaign-level."""
+def _resolve_host_from_path(
+    filepath: Path,
+    loot_dir: Path,
+    known_hosts: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve which host a loot file belongs to, or None for campaign-level.
+
+    Resolution order:
+      1. Subdirectory name — IP, FQDN (has dot), or short hostname in known_hosts
+      2. Filename prefix (before _) — IP regex, FQDN regex, or short hostname in known_hosts
+    """
     rel = filepath.relative_to(loot_dir)
     parts = rel.parts
 
@@ -2018,6 +2105,9 @@ def _resolve_host_from_path(filepath: Path, loot_dir: Path) -> str | None:
             return subdir
         if is_probable_fqdn(subdir):
             return subdir
+        # Short hostname subdirectory (e.g. loot/dante-ws03/)
+        if known_hosts and subdir.lower() in known_hosts:
+            return known_hosts[subdir.lower()]
 
     m = LOOT_IP_PREFIX_RE.match(filepath.name)
     if m:
@@ -2025,6 +2115,12 @@ def _resolve_host_from_path(filepath: Path, loot_dir: Path) -> str | None:
     m = LOOT_FQDN_PREFIX_RE.match(filepath.name)
     if m:
         return m.group(1)
+    # Short hostname filename prefix (e.g. dante-ws03_creds.txt).
+    # Split on first _ only — hyphens are part of hostnames, not separators.
+    if known_hosts and "_" in filepath.stem:
+        prefix = filepath.stem.split("_")[0]
+        if len(prefix) >= 3 and prefix.lower() in known_hosts:
+            return known_hosts[prefix.lower()]
 
     return None
 
@@ -2189,7 +2285,7 @@ def parse_loot_dir(loot_dir: Path, known_hosts: dict[str, str] | None = None) ->
         for h in result["hashes"]:
             hash_types.add(h["hash_type"])
 
-        host_key = _resolve_host_from_path(filepath, loot_dir)
+        host_key = _resolve_host_from_path(filepath, loot_dir, known_hosts)
         if not host_key:
             host_key = _resolve_host_from_content(result.get("raw_preview", ""), known_hosts)
             if host_key:
@@ -2259,7 +2355,7 @@ def parse_misc_dir(misc_dir: Path, known_hosts: dict[str, str] | None = None) ->
             raw = raw[:LOOT_MAX_FILE_SIZE]
             logging.warning(f"Misc file truncated ({filepath.stat().st_size} bytes): {filepath.name}")
 
-        host_key = _resolve_host_from_path(filepath, misc_dir)
+        host_key = _resolve_host_from_path(filepath, misc_dir, known_hosts)
         if not host_key:
             host_key = _resolve_host_from_content(raw[:2000], known_hosts)
             if host_key:
@@ -4579,6 +4675,57 @@ class _RagIndexBuilder:
         self.progress_source = source
 
 
+def _load_rag_matrix(db_path: str, dim: int) -> dict | None:
+    """Load all chunk embeddings into an in-memory numpy matrix, cached by
+    (db_path, mtime). Returns None if numpy is unavailable or the DB is empty.
+
+    The matrix is loaded once and reused across every retrieval in a run,
+    replacing the previous per-query full-table scan in pure Python.
+    """
+    global _RAG_MATRIX_CACHE
+    if not HAS_NUMPY:
+        return None
+
+    try:
+        mtime = os.path.getmtime(db_path)
+    except OSError:
+        mtime = 0.0
+    key = (str(db_path), mtime)
+
+    if _RAG_MATRIX_CACHE is not None and _RAG_MATRIX_CACHE.get("key") == key:
+        return _RAG_MATRIX_CACHE
+
+    conn = _rag_db_connect(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT id, source, source_path, source_type, location, title, text, embedding "
+            "FROM chunks WHERE embedding IS NOT NULL"
+        )
+        vecs: list = []
+        meta: list[dict] = []
+        for row in cursor:
+            blob = row[7]
+            if not blob:
+                continue
+            vecs.append(np.frombuffer(blob, dtype="<f2"))
+            meta.append({
+                "source": row[1], "source_path": row[2], "source_type": row[3],
+                "location": row[4], "title": row[5], "text": row[6],
+            })
+    finally:
+        conn.close()
+
+    if not vecs:
+        return None
+
+    matrix = np.array(vecs, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1)
+    norms[norms == 0] = 1e-12  # avoid divide-by-zero
+    _RAG_MATRIX_CACHE = {"key": key, "matrix": matrix, "norms": norms, "meta": meta}
+    logging.info(f"RAG: loaded {matrix.shape[0]} embeddings into memory (numpy)")
+    return _RAG_MATRIX_CACHE
+
+
 def _rag_retrieve(
     query_text: str,
     rag_meta: dict,
@@ -4586,7 +4733,11 @@ def _rag_retrieve(
     embedding_model: str,
     top_k: int = 5,
 ) -> list[dict]:
-    """Retrieve the top-k most relevant chunks by streaming from SQLite."""
+    """Retrieve the top-k most relevant chunks by cosine similarity.
+
+    Uses a cached in-memory numpy matrix when numpy is installed (fast,
+    vectorized); otherwise falls back to a streaming pure-Python scan.
+    """
     try:
         query_vec = ollama_embed(ollama_url, embedding_model, query_text[:2000])
     except Exception as exc:
@@ -4600,9 +4751,29 @@ def _rag_retrieve(
     if qnorm == 0:
         return []
 
+    # --- Fast path: vectorized numpy over cached matrix ---
+    cache = _load_rag_matrix(db_path, dim)
+    if cache is not None:
+        q = np.asarray(query_vec, dtype=np.float32)
+        scores = (cache["matrix"] @ q) / (cache["norms"] * float(np.linalg.norm(q) or 1e-12))
+        n = scores.shape[0]
+        k = min(top_k, n)
+        # argpartition for top-k, then sort those k descending
+        idx = np.argpartition(scores, n - k)[n - k:]
+        idx = idx[np.argsort(scores[idx])[::-1]]
+        results: list[dict] = []
+        for i in idx:
+            score = float(scores[i])
+            if score < 0.3:
+                continue
+            chunk = dict(cache["meta"][int(i)])
+            chunk["score"] = score
+            results.append(chunk)
+        return results
+
+    # --- Fallback: streaming pure-Python scan ---
     conn = _rag_db_connect(db_path)
     heap: list[tuple[float, int, dict]] = []
-
     cursor = conn.execute(
         "SELECT id, source, source_path, source_type, location, title, text, embedding "
         "FROM chunks WHERE embedding IS NOT NULL"
@@ -5018,7 +5189,7 @@ def _check_all_pending_boxes(vault_dir: Path) -> tuple[int, int]:
             text = host_path.read_text(encoding="utf-8")
             new_text, n = _UNCHECKED_INVESTIGATE_RE.subn(r"\1[x] \2", text)
             if n:
-                host_path.write_text(new_text, encoding="utf-8")
+                _atomic_write_text(host_path, new_text)
                 investigate_checked += n
 
     scans_dir = vault_dir / "Scans"
@@ -5027,7 +5198,7 @@ def _check_all_pending_boxes(vault_dir: Path) -> tuple[int, int]:
             text = scan_path.read_text(encoding="utf-8")
             new_text, n = _UNCHECKED_ANALYZE_RE.subn(r"\1[x] \2", text)
             if n:
-                scan_path.write_text(new_text, encoding="utf-8")
+                _atomic_write_text(scan_path, new_text)
                 analyze_checked += n
 
     loot_overview = vault_dir / "Loot" / "Overview.md"
@@ -5035,7 +5206,7 @@ def _check_all_pending_boxes(vault_dir: Path) -> tuple[int, int]:
         text = loot_overview.read_text(encoding="utf-8")
         new_text, n = _UNCHECKED_ANALYZE_RE.subn(r"\1[x] \2", text)
         if n:
-            loot_overview.write_text(new_text, encoding="utf-8")
+            _atomic_write_text(loot_overview, new_text)
             analyze_checked += n
 
     return investigate_checked, analyze_checked
@@ -5055,7 +5226,7 @@ def _reset_done_boxes(vault_dir: Path) -> tuple[int, int]:
             text = host_path.read_text(encoding="utf-8")
             new_text, n = _DONE_INVESTIGATE_RE.subn(r"\1[ ] \2", text)
             if n:
-                host_path.write_text(new_text, encoding="utf-8")
+                _atomic_write_text(host_path, new_text)
                 investigate_reset += n
 
     scans_dir = vault_dir / "Scans"
@@ -5064,7 +5235,7 @@ def _reset_done_boxes(vault_dir: Path) -> tuple[int, int]:
             text = scan_path.read_text(encoding="utf-8")
             new_text, n = _DONE_ANALYZE_RE.subn(r"\1[ ] \2", text)
             if n:
-                scan_path.write_text(new_text, encoding="utf-8")
+                _atomic_write_text(scan_path, new_text)
                 analyze_reset += n
 
     loot_overview = vault_dir / "Loot" / "Overview.md"
@@ -5072,7 +5243,7 @@ def _reset_done_boxes(vault_dir: Path) -> tuple[int, int]:
         text = loot_overview.read_text(encoding="utf-8")
         new_text, n = _DONE_ANALYZE_RE.subn(r"\1[ ] \2", text)
         if n:
-            loot_overview.write_text(new_text, encoding="utf-8")
+            _atomic_write_text(loot_overview, new_text)
             analyze_reset += n
 
     return investigate_reset, analyze_reset
@@ -5180,6 +5351,34 @@ def _get_file_write_lock(path: Path) -> threading.Lock:
         if key not in _LLM_WRITE_LOCKS:
             _LLM_WRITE_LOCKS[key] = threading.Lock()
         return _LLM_WRITE_LOCKS[key]
+
+
+def _parallel_map(items: list, fn, workers: int, label: str = "task") -> list:
+    """Run fn(item) over items, preserving input order in the results.
+
+    Used to parallelize independent LLM calls (the dominant cost in a run).
+    With workers<=1 or a single item, runs serially in the current thread.
+    Exceptions from fn are caught and returned as the item's result so one
+    failure doesn't sink the batch — callers already expect per-item error
+    strings from the previous serial code.
+    """
+    if workers <= 1 or len(items) <= 1:
+        return [fn(it) for it in items]
+
+    results: list = [None] * len(items)
+
+    def _worker(idx_item):
+        idx, item = idx_item
+        try:
+            return idx, fn(item)
+        except Exception as exc:  # noqa: BLE001 — surfaced to caller as result
+            logging.warning(f"[parallel {label}] item {idx} failed: {exc}")
+            return idx, exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for idx, res in pool.map(_worker, enumerate(items)):
+            results[idx] = res
+    return results
 
 
 def _process_deep_dives(
@@ -5295,7 +5494,7 @@ def _write_deep_dive_result(host_path: Path, topic: str, analysis: str) -> None:
         else:
             text += f"\n\n{DEEP_DIVE_SECTION}\n{callout_block}"
 
-    host_path.write_text(text, encoding="utf-8")
+    _atomic_write_text(host_path, text)
     logging.info(f"[Analysis] Wrote result for: {topic}")
 
 
@@ -5396,7 +5595,7 @@ def _write_cross_source_result(host_path: Path, analysis: str) -> None:
         else:
             text += f"\n\n{new_section}"
 
-    host_path.write_text(text, encoding="utf-8")
+    _atomic_write_text(host_path, text)
     logging.info(f"[DeepDive] Wrote deep dive for: {host_path.stem}")
 
 
@@ -5579,7 +5778,7 @@ def _update_scan_note_analysis(
     pattern = re.escape(section_header) + r"\n.*?(?=\n## |\Z)"
     text = re.sub(pattern, new_section, text, count=1, flags=re.DOTALL)
 
-    scan_path.write_text(text, encoding="utf-8")
+    _atomic_write_text(scan_path, text)
     logging.info(f"[Analyze] Wrote analysis for: {label} in {scan_path.name}")
 
 
@@ -5924,7 +6123,7 @@ def _merge_two_host_notes(keep_path: Path, delete_path: Path, vault_dir: Path) -
     if combined_op:
         body_lines += ["", combined_op]
 
-    keep_path.write_text(write_frontmatter(merged_fm) + "\n" + "\n".join(body_lines), encoding="utf-8")
+    _atomic_write_text(keep_path, write_frontmatter(merged_fm) + "\n" + "\n".join(body_lines))
 
     # Update all vault files that link to the deleted note
     _replace_vault_host_refs(vault_dir, delete_path.stem, keep_path.stem)
@@ -5948,7 +6147,7 @@ def _replace_vault_host_refs(vault_dir: Path, old_stem: str, new_stem: str) -> N
             if old_stem in text:
                 new_text = old_link_pat.sub(new_link, text)
                 if new_text != text:
-                    md_path.write_text(new_text, encoding="utf-8")
+                    _atomic_write_text(md_path, new_text)
         except Exception:
             pass
 
@@ -5963,7 +6162,7 @@ def _replace_vault_host_refs(vault_dir: Path, old_stem: str, new_stem: str) -> N
                     f'"file": "Hosts/{old_stem}"', f'"file": "Hosts/{new_stem}"'
                 )
                 if new_text != text:
-                    canvas_path.write_text(new_text, encoding="utf-8")
+                    _atomic_write_text(canvas_path, new_text)
         except Exception:
             pass
 
@@ -6083,6 +6282,8 @@ def _write_host_note(
     existing_loot      = ""
     existing_deep_dives = ""
     existing_cross_source = ""
+    existing_nxc       = ""
+    existing_access    = ""
     existing_open_ports = ""
 
     if host_path.exists():
@@ -6093,7 +6294,9 @@ def _write_host_note(
         existing_nessus    = extract_body_section(old_body, "## Nessus Findings")
         existing_burp      = extract_body_section(old_body, "## Burp Suite Findings")
         existing_autorecon = extract_body_section(old_body, "## AutoRecon Enumeration")
+        existing_nxc       = extract_body_section(old_body, "## NXC Enumeration")
         existing_loot      = extract_body_section(old_body, "## Loot")
+        existing_access    = extract_body_section(old_body, "## Access")
         existing_deep_dives = extract_body_section(old_body, DEEP_DIVE_SECTION)
         existing_cross_source = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         logging.debug(f"Merging Nmap host note: {host_path.name}")
@@ -6157,11 +6360,20 @@ def _write_host_note(
     if existing_autorecon:
         lines += ["", "## AutoRecon Enumeration", existing_autorecon]
 
+    if existing_nxc:
+        lines += ["", "## NXC Enumeration", existing_nxc]
+
     if existing_loot:
         lines += ["", "## Loot", existing_loot]
 
+    if existing_access:
+        lines += ["", "## Access", existing_access]
+
     if existing_deep_dives:
         lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
+
+    if existing_cross_source:
+        lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
 
     lines += ["", "## Scan References"]
     for src in fm["sources"]:
@@ -6173,7 +6385,7 @@ def _write_host_note(
         lines += ["", existing_op_notes]
 
     body = "\n".join(lines)
-    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_stem
 
 
@@ -6233,7 +6445,7 @@ def create_obsidian_vault(
             scan_lines.append(f"- {w}")
 
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
-    scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Wrote Nmap scan note: {scan_path.name}")
 
     return {
@@ -6278,7 +6490,9 @@ def _update_host_note_nessus(
     existing_open_ports_section = ""
     existing_burp_section = ""
     existing_autorecon_section = ""
+    existing_nxc_section = ""
     existing_loot_section = ""
+    existing_access_section = ""
     existing_deep_dives = ""
     existing_cross_source = ""
     existing_preamble_lines: list[str] = []
@@ -6291,7 +6505,9 @@ def _update_host_note_nessus(
         existing_open_ports_section = extract_body_section(old_body, "## Open Ports")
         existing_burp_section       = extract_body_section(old_body, "## Burp Suite Findings")
         existing_autorecon_section  = extract_body_section(old_body, "## AutoRecon Enumeration")
+        existing_nxc_section        = extract_body_section(old_body, "## NXC Enumeration")
         existing_loot_section       = extract_body_section(old_body, "## Loot")
+        existing_access_section     = extract_body_section(old_body, "## Access")
         existing_deep_dives         = extract_body_section(old_body, DEEP_DIVE_SECTION)
         existing_cross_source       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         for line in old_body.splitlines():
@@ -6351,8 +6567,14 @@ def _update_host_note_nessus(
     if existing_autorecon_section:
         lines += ["", "## AutoRecon Enumeration", existing_autorecon_section]
 
+    if existing_nxc_section:
+        lines += ["", "## NXC Enumeration", existing_nxc_section]
+
     if existing_loot_section:
         lines += ["", "## Loot", existing_loot_section]
+
+    if existing_access_section:
+        lines += ["", "## Access", existing_access_section]
 
     if existing_deep_dives:
         lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
@@ -6370,7 +6592,7 @@ def _update_host_note_nessus(
         lines += ["", existing_op_notes]
 
     body = "\n".join(lines)
-    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
 
@@ -6443,7 +6665,7 @@ def create_nessus_vault(
             scan_lines.append(f"- {w}")
 
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
-    scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Wrote Nessus scan note: {scan_path.name}")
 
     if not no_findings:
@@ -6493,7 +6715,9 @@ def _update_host_note_burp(
     existing_open_ports_section = ""
     existing_nessus_section = ""
     existing_autorecon_section = ""
+    existing_nxc_section = ""
     existing_loot_section = ""
+    existing_access_section = ""
     existing_deep_dives = ""
     existing_cross_source = ""
     existing_preamble_lines: list[str] = []
@@ -6505,7 +6729,9 @@ def _update_host_note_burp(
         existing_open_ports_section  = extract_body_section(old_body, "## Open Ports")
         existing_nessus_section      = extract_body_section(old_body, "## Nessus Findings")
         existing_autorecon_section   = extract_body_section(old_body, "## AutoRecon Enumeration")
+        existing_nxc_section         = extract_body_section(old_body, "## NXC Enumeration")
         existing_loot_section        = extract_body_section(old_body, "## Loot")
+        existing_access_section      = extract_body_section(old_body, "## Access")
         existing_deep_dives          = extract_body_section(old_body, DEEP_DIVE_SECTION)
         existing_cross_source        = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         for line in old_body.splitlines():
@@ -6562,8 +6788,14 @@ def _update_host_note_burp(
     if existing_autorecon_section:
         lines += ["", "## AutoRecon Enumeration", existing_autorecon_section]
 
+    if existing_nxc_section:
+        lines += ["", "## NXC Enumeration", existing_nxc_section]
+
     if existing_loot_section:
         lines += ["", "## Loot", existing_loot_section]
+
+    if existing_access_section:
+        lines += ["", "## Access", existing_access_section]
 
     if existing_deep_dives:
         lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
@@ -6581,7 +6813,7 @@ def _update_host_note_burp(
         lines += ["", existing_op_notes]
 
     body = "\n".join(lines)
-    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
 
@@ -6649,7 +6881,7 @@ def create_burp_vault(
             scan_lines.append(f"- {w}")
 
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
-    scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Wrote Burp scan note: {scan_path.name}")
 
     if not no_findings:
@@ -6863,7 +7095,9 @@ def _update_host_note_autorecon(
     existing_open_ports_section = ""
     existing_nessus_section = ""
     existing_burp_section = ""
+    existing_nxc_section = ""
     existing_loot = ""
+    existing_access_section = ""
     existing_deep_dives = ""
     existing_cross_source = ""
     existing_preamble_lines: list[str] = []
@@ -6875,7 +7109,9 @@ def _update_host_note_autorecon(
         existing_open_ports_section = extract_body_section(old_body, "## Open Ports")
         existing_nessus_section     = extract_body_section(old_body, "## Nessus Findings")
         existing_burp_section       = extract_body_section(old_body, "## Burp Suite Findings")
+        existing_nxc_section        = extract_body_section(old_body, "## NXC Enumeration")
         existing_loot               = extract_body_section(old_body, "## Loot")
+        existing_access_section     = extract_body_section(old_body, "## Access")
         existing_deep_dives         = extract_body_section(old_body, DEEP_DIVE_SECTION)
         existing_cross_source       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         for line in old_body.splitlines():
@@ -6931,8 +7167,14 @@ def _update_host_note_autorecon(
 
     body_lines += ["", "## AutoRecon Enumeration", _render_autorecon_section(target_data)]
 
+    if existing_nxc_section:
+        body_lines += ["", "## NXC Enumeration", existing_nxc_section]
+
     if existing_loot:
         body_lines += ["", "## Loot", existing_loot]
+
+    if existing_access_section:
+        body_lines += ["", "## Access", existing_access_section]
 
     if existing_deep_dives:
         body_lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
@@ -6950,7 +7192,7 @@ def _update_host_note_autorecon(
         body_lines += ["", existing_op_notes]
 
     body = "\n".join(body_lines)
-    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
 
@@ -7047,7 +7289,7 @@ def create_autorecon_vault(
             ]
 
     scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
-    scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Wrote AutoRecon scan note: {scan_path.name}")
 
     return {
@@ -7237,6 +7479,176 @@ def _read_credential_annotations(creds_path: Path) -> dict[str, str]:
         annotations[current_host] = "\n".join(notes_lines).strip()
 
     return annotations
+
+
+def _parse_creds_host_key(header_stripped: str) -> str | None:
+    """Extract host key from a '## ...' Credentials.md section header line."""
+    text = header_stripped[3:].strip()
+    if text.startswith("[["):
+        pipe = text.find("|")
+        end  = text.find("]]")
+        if pipe != -1 and end != -1:
+            return text[pipe + 1:end]
+    return text or None
+
+
+def _patch_credential_operator_notes(
+    creds_path: Path,
+    updates: dict[str, list[str]],
+) -> None:
+    """Append new lines into per-host operator notes blocks in Credentials.md in-place."""
+    if not updates:
+        return
+    try:
+        file_lines = creds_path.read_text(encoding="utf-8").split("\n")
+    except Exception:
+        return
+
+    # Map each host to (sentinel_line_idx, end_line_idx) so we know where to inject.
+    current_host: str | None = None
+    sentinel_idx: int | None = None
+    host_sentinel: dict[str, int] = {}
+    host_end: dict[str, int] = {}
+
+    for i, line in enumerate(file_lines):
+        if line.strip().startswith("## "):
+            if current_host and sentinel_idx is not None and current_host not in host_end:
+                host_end[current_host] = i
+            current_host = _parse_creds_host_key(line.strip())
+            sentinel_idx = None
+        elif line.strip() == _CRED_NOTES_SENTINEL and current_host:
+            sentinel_idx = i
+            host_sentinel[current_host] = i
+
+    if current_host and current_host in host_sentinel and current_host not in host_end:
+        host_end[current_host] = len(file_lines)
+
+    # Build (insert_at, new_lines) pairs — insert after last non-blank line in block.
+    insertions: list[tuple[int, list[str]]] = []
+    for host_key, new_lines in updates.items():
+        s_idx = host_sentinel.get(host_key)
+        e_idx = host_end.get(host_key)
+        if s_idx is None or e_idx is None:
+            continue
+        insert_at = e_idx
+        for j in range(e_idx - 1, s_idx, -1):
+            if file_lines[j].strip():
+                insert_at = j + 1
+                break
+        insertions.append((insert_at, new_lines))
+
+    # Apply in reverse order so earlier insertions don't shift later indices.
+    insertions.sort(key=lambda x: x[0], reverse=True)
+    for insert_at, new_lines in insertions:
+        for nl in reversed(new_lines):
+            file_lines.insert(insert_at, nl)
+
+    _atomic_write_text(creds_path, "\n".join(file_lines))
+
+
+_EXPLICIT_CONFIRMED_RE = re.compile(
+    r"^\s*-\s*\[x\]\s*(?:Confirmed on|Works on)\s+\S+",
+    re.IGNORECASE,
+)
+_ACCESS_LANGUAGE_RE = re.compile(
+    r"\b(?:works?|confirmed?|valid|success(?:ful)?|access|admin|pwn(?:ed)?|logged.?in|shell)\b",
+    re.IGNORECASE,
+)
+
+
+def _interpret_credential_operator_notes(
+    vault_dir: Path,
+    args,
+    known_hosts: dict[str, str],
+) -> int:
+    """Scan Credentials.md operator notes for host associations not yet marked explicit.
+
+    Pass 1 (Python): regex match for known IPs/hostnames in freeform text
+        → auto-appends '- [x] Confirmed on <host>' to that section.
+    Pass 2 (LLM fallback): when text implies access but no identifier matched
+        → prints a suggestion; operator adds the marker manually.
+
+    Returns number of sections patched.
+    """
+    creds_path = vault_dir / "Loot" / "Credentials.md"
+    if not creds_path.exists():
+        return 0
+
+    annotations = _read_credential_annotations(creds_path)
+    if not annotations:
+        return 0
+
+    updates: dict[str, list[str]] = {}
+
+    for host_key, notes_text in annotations.items():
+        if not notes_text.strip():
+            continue
+
+        freeform_lines = [
+            ln for ln in notes_text.splitlines()
+            if ln.strip()
+            and not _EXPLICIT_CONFIRMED_RE.match(ln)
+            and not ln.strip().startswith("<!--")
+        ]
+        if not freeform_lines:
+            continue
+
+        freeform = "\n".join(freeform_lines)
+        freeform_lower = freeform.lower()
+
+        # Pass 1: match any known host identifier in the text (skip source host itself)
+        matched: dict[str, int] = {}
+        for ident, h_key in known_hosts.items():
+            if h_key == host_key or len(ident) < 4:
+                continue
+            if ident in freeform_lower:
+                matched[h_key] = matched.get(h_key, 0) + 1
+
+        if matched:
+            new_lines = [f"- [x] Confirmed on {hk}" for hk in sorted(matched)]
+            updates[host_key] = new_lines
+            for nl in new_lines:
+                print(f"  [Creds] {host_key}: auto-added '{nl}' from note text")
+            continue
+
+        # Pass 2: LLM fallback — only when access-implying language is present
+        if getattr(args, "no_ollama", False):
+            continue
+        if not _ACCESS_LANGUAGE_RE.search(freeform):
+            continue
+
+        host_list = "\n".join(f"- {hk}" for hk in sorted(set(known_hosts.values())))
+        prompt = (
+            f"Known hosts:\n{host_list}\n\n"
+            f"Operator note in the '{host_key}' section of Credentials.md:\n{freeform}\n\n"
+            "Does this note indicate these credentials work on a host from the list above? "
+            "Reply with JSON only — no other text:\n"
+            "{\"host\": \"<host_key or null>\", \"confirmed\": true/false}"
+        )
+        try:
+            resp = ollama_chat(
+                args.ollama_url, args.model, prompt,
+                temperature=0.05,
+                system="You are a JSON-only extraction assistant. Respond only with valid JSON.",
+            )
+            data = json.loads(resp.strip())
+            suggested = data.get("host")
+            all_host_keys = set(known_hosts.values())
+            if suggested and suggested in all_host_keys and suggested != host_key:
+                if data.get("confirmed"):
+                    print(
+                        f"  [Creds] {host_key}: LLM suggests credentials work on {suggested} — "
+                        f"add '- [x] Confirmed on {suggested}' to Credentials.md to confirm"
+                    )
+                else:
+                    print(f"  [Creds] {host_key}: LLM notes possible relation to {suggested}")
+        except Exception:
+            pass
+
+    if updates:
+        _patch_credential_operator_notes(creds_path, updates)
+
+    return len(updates)
 
 
 def _read_credential_row_notes(creds_path: Path) -> dict[str, dict[str, str]]:
@@ -7484,7 +7896,7 @@ def _write_loot_credentials_page(
     if not has_content:
         lines.append("_No credentials or users found._")
 
-    page_path.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(page_path, "\n".join(lines))
     _rebuild_campaign_aggregates(page_path)
     logging.info(f"Wrote Loot/Credentials.md ({total_creds} entries)")
 
@@ -7547,7 +7959,7 @@ def _write_loot_hashes_page(
         lines.append("_No hashes found._")
 
     page_path = loot_dir_out / "Hashes.md"
-    page_path.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(page_path, "\n".join(lines))
     logging.info(f"Wrote Loot/Hashes.md ({total_hashes} hashes)")
 
 
@@ -7582,7 +7994,9 @@ def _update_host_note_loot(
     existing_nessus = ""
     existing_burp = ""
     existing_autorecon = ""
+    existing_nxc       = ""
     existing_loot = ""
+    existing_access    = ""
     existing_deep_dives = ""
     existing_cross_source = ""
     existing_preamble_lines: list[str] = []
@@ -7595,7 +8009,9 @@ def _update_host_note_loot(
         existing_nessus    = extract_body_section(old_body, "## Nessus Findings")
         existing_burp      = extract_body_section(old_body, "## Burp Suite Findings")
         existing_autorecon = extract_body_section(old_body, "## AutoRecon Enumeration")
+        existing_nxc       = extract_body_section(old_body, "## NXC Enumeration")
         existing_loot      = extract_body_section(old_body, "## Loot")
+        existing_access    = extract_body_section(old_body, "## Access")
         existing_deep_dives = extract_body_section(old_body, DEEP_DIVE_SECTION)
         existing_cross_source = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         for line in old_body.splitlines():
@@ -7649,7 +8065,13 @@ def _update_host_note_loot(
     if existing_autorecon:
         body_lines += ["", "## AutoRecon Enumeration", existing_autorecon]
 
+    if existing_nxc:
+        body_lines += ["", "## NXC Enumeration", existing_nxc]
+
     body_lines += ["", "## Loot", _render_loot_section_lightweight(loot_files)]
+
+    if existing_access:
+        body_lines += ["", "## Access", existing_access]
 
     if existing_deep_dives:
         body_lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
@@ -7667,7 +8089,7 @@ def _update_host_note_loot(
         body_lines += ["", existing_op_notes]
 
     body = "\n".join(body_lines)
-    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
 
@@ -7776,7 +8198,7 @@ def create_loot_vault(
 
     overview_path = loot_dir_out / "Overview.md"
     overview_lines = _preserve_scan_note_operator_notes(overview_path, overview_lines)
-    overview_path.write_text("\n".join(overview_lines), encoding="utf-8")
+    _atomic_write_text(overview_path, "\n".join(overview_lines))
     logging.info(f"Wrote Loot/Overview.md")
 
     return {
@@ -7822,7 +8244,7 @@ def _add_scan_reference_to_host(
             f"{ref_line}\n\n{OPERATOR_NOTES_SENTINEL}",
         )
 
-    existing_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    _atomic_write_text(existing_path, write_frontmatter(fm) + "\n" + body)
     return existing_path.stem
 
 
@@ -7901,7 +8323,7 @@ def create_misc_vault(
         lines.append(analysis or "_No AI analysis generated._")
 
         lines = _preserve_scan_note_operator_notes(scan_path, lines)
-        scan_path.write_text("\n".join(lines), encoding="utf-8")
+        _atomic_write_text(scan_path, "\n".join(lines))
         logging.info(f"Wrote misc scan note: {scan_path.name}")
 
         results.append({
@@ -8552,9 +8974,9 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
     if existing_op_notes:
         body_parts += ["", existing_op_notes]
 
-    host_path.write_text(
+    _atomic_write_text(
+        host_path,
         write_frontmatter(fm) + "\n" + "\n".join(body_parts),
-        encoding="utf-8",
     )
     logging.info(f"NXC: {'updated' if existing_path else 'created'} host note {host_path.name}")
     return host_path.stem
@@ -8673,7 +9095,7 @@ def _write_nxc_scan_note(vault_dir: Path, nxc_data: dict, scan_stem: str, scan_l
     lines += [OPERATOR_NOTES_SENTINEL, ""]
     lines.append(existing_op_notes if existing_op_notes else OPERATOR_NOTES_HINT)
 
-    scan_path.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(lines))
 
 
 def _resolve_nxc_workspace(args, base: Path) -> Path | None:
@@ -9065,9 +9487,9 @@ def build_canvas(
     final_nodes = preserved + our_nodes
     final_edges = our_edges
 
-    canvas_path.write_text(
+    _atomic_write_text(
+        canvas_path,
         json.dumps({"nodes": final_nodes, "edges": final_edges}, indent=2),
-        encoding="utf-8",
     )
     logging.info(
         f"Canvas written: {canvas_path.name} "
@@ -9327,7 +9749,7 @@ def _install_assessment_config(vault_dir: Path) -> None:
     cfg_path = vault_dir / _ASSESSMENT_CONFIG_FILENAME
     if not cfg_path.exists():
         vault_dir.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(_ASSESSMENT_CONFIG_TEMPLATE, encoding="utf-8")
+        _atomic_write_text(cfg_path, _ASSESSMENT_CONFIG_TEMPLATE)
         logging.info(f"Created {_ASSESSMENT_CONFIG_FILENAME}")
 
 
@@ -9423,7 +9845,7 @@ def _install_injestor(vault_dir: Path) -> None:
     """Create the Injestor page if it doesn't exist."""
     injestor_path = vault_dir / "Injestor.md"
     if not injestor_path.exists():
-        injestor_path.write_text(_INJESTOR_TEMPLATE, encoding="utf-8")
+        _atomic_write_text(injestor_path, _INJESTOR_TEMPLATE)
         logging.info("Created Injestor page")
 
 
@@ -9640,7 +10062,7 @@ def _rebuild_campaign_aggregates(page_path: Path) -> None:
             "is_aggregate": True,
         })
 
-    page_path.write_text(_sections_to_text(parsed), encoding="utf-8")
+    _atomic_write_text(page_path, _sections_to_text(parsed))
 
 
 def _append_injestor_to_credentials_md(
@@ -9678,7 +10100,7 @@ def _append_injestor_to_credentials_md(
             f"_Last updated: {dt.datetime.now().isoformat(timespec='seconds')}_",
             "",
         ]
-        page_path.write_text("\n".join(lines), encoding="utf-8")
+        _atomic_write_text(page_path, "\n".join(lines))
         existing_text = "\n".join(lines)
 
     parsed = _parse_credentials_md_sections(existing_text)
@@ -9784,7 +10206,7 @@ def _append_injestor_to_credentials_md(
                     sec["table_header"] = list(table_header_default)
                 added += 1
 
-    page_path.write_text(_sections_to_text(parsed), encoding="utf-8")
+    _atomic_write_text(page_path, _sections_to_text(parsed))
     _rebuild_campaign_aggregates(page_path)
     return added
 
@@ -9896,7 +10318,7 @@ def _add_host_access(
 
     # Rebuild the note
     new_text = write_frontmatter(fm) + "\n" + body
-    host_note.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(host_note, new_text)
     logging.info(f"[Access] Added {user}@{host_key} ({privilege} via {method})")
     return True
 
@@ -10021,7 +10443,7 @@ def _link_injestor_creds_to_host_note(
     else:
         new_body = body_without_loot.rstrip() + "\n\n## Loot\n\n" + new_loot + "\n"
 
-    host_note.write_text(fm_text + "\n" + new_body, encoding="utf-8")
+    _atomic_write_text(host_note, fm_text + "\n" + new_body)
     logging.debug(f"Updated Loot section in {host_note.name} with {cred_count} Injestor credentials")
 
 
@@ -10385,7 +10807,7 @@ def _process_review_requests(vault_dir: Path) -> int:
         # Write updated content to file without the [REVIEW] prefix
         new_name = review_path.name.removeprefix(REVIEW_FILENAME_PREFIX)
         new_path = scans_dir / new_name
-        new_path.write_text(new_text, encoding="utf-8")
+        _atomic_write_text(new_path, new_text)
         review_path.unlink()
         logging.info(f"[Review] Renamed {review_path.name} → {new_name}")
 
@@ -10659,7 +11081,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         ]
 
         body = "\n".join(body_lines)
-        host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+        _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
         logging.info(f"Injestor: created host note for {ip}")
 
     # ── NXC enrichment (adds shares, signing, vuln flags to existing/new notes) ──
@@ -10833,7 +11255,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             "</details>",
         ]
 
-    scan_path.write_text("\n".join(scan_lines), encoding="utf-8")
+    _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Injestor: wrote scan note {scan_path.name}")
 
     # ── Save structured credentials directly to Loot/Credentials.md ──
@@ -10882,7 +11304,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         logging.info(f"Injestor: recorded {access_added} access entr(ies) in host notes")
 
     # ── Reset the Injestor page ──
-    injestor_path.write_text(_INJESTOR_TEMPLATE, encoding="utf-8")
+    _atomic_write_text(injestor_path, _INJESTOR_TEMPLATE)
     logging.info("Injestor: page reset for next use")
 
     return {
@@ -11032,7 +11454,7 @@ def _write_campaign_targets_note(
     ]
 
     targets_path = hosts_dir / "_Campaign Targets.md"
-    targets_path.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(targets_path, "\n".join(lines))
     logging.info(
         f"Wrote Campaign Targets note: {len(ips)} IPs, "
         f"{len(subnets)} subnets, {len(hostnames)} hostnames"
@@ -11429,9 +11851,9 @@ def build_users_canvas(
     final_nodes = preserved + our_nodes
     final_edges = our_edges
 
-    canvas_path.write_text(
+    _atomic_write_text(
+        canvas_path,
         json.dumps({"nodes": final_nodes, "edges": final_edges}, indent=2),
-        encoding="utf-8",
     )
     logging.info(
         f"Users Canvas written: {canvas_path.name} "
@@ -11889,7 +12311,7 @@ def _install_findings_template(vault_dir: Path) -> None:
     findings_dir.mkdir(exist_ok=True)
     template_path = findings_dir / "_Template.md"
     if not template_path.exists():
-        template_path.write_text(_PLEXTRAC_FINDINGS_TEMPLATE, encoding="utf-8")
+        _atomic_write_text(template_path, _PLEXTRAC_FINDINGS_TEMPLATE)
         logging.info("Created Findings/_Template.md")
 
 
@@ -11913,7 +12335,7 @@ def _write_finding_note(findings_dir: Path, finding: dict) -> str:
             existing_set = set(existing)
             merged = existing + [a for a in new_assets if a not in existing_set]
             fm["affected_assets"] = merged
-            note_path.write_text(write_frontmatter(fm) + body, encoding="utf-8")
+            _atomic_write_text(note_path, write_frontmatter(fm) + body)
         except Exception as exc:
             logging.warning(f"Failed to update finding note {note_path.name}: {exc}")
         return stem
@@ -11958,9 +12380,9 @@ def _write_finding_note(findings_dir: Path, finding: dict) -> str:
         body_lines.append("_No references provided._")
     body_lines.append("")
 
-    note_path.write_text(
+    _atomic_write_text(
+        note_path,
         write_frontmatter(fm) + "\n".join(body_lines),
-        encoding="utf-8",
     )
     logging.debug(f"Created finding note: {note_path.name}")
     return stem
@@ -12207,7 +12629,7 @@ def _load_analysis_state(vault_dir: Path) -> dict[str, float]:
 def _save_analysis_state(vault_dir: Path, state: dict[str, float]) -> None:
     """Save the analysis state file."""
     state_path = vault_dir / STATE_FILENAME
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    _atomic_write_text(state_path, json.dumps(state, indent=2))
 
 
 def _file_needs_analysis(filepath: Path, state: dict[str, float]) -> bool:
@@ -12259,6 +12681,13 @@ def _snapshot_vault_files(vault_dir: Path) -> dict[str, float]:
     if creds.exists():
         try:
             snapshot[str(creds)] = creds.stat().st_mtime
+        except OSError:
+            pass
+
+    config_md = vault_dir / _ASSESSMENT_CONFIG_FILENAME
+    if config_md.exists():
+        try:
+            snapshot[str(config_md)] = config_md.stat().st_mtime
         except OSError:
             pass
 
@@ -12676,10 +13105,14 @@ def _process_vault_changes(
         _load_assessment_config(vault_dir)
         print("  [Vault] Assessment Config reloaded — system prompt updated")
 
-    # ── Credentials.md: rebuild Users Canvas ──
+    # ── Credentials.md: interpret notes, rebuild Users Canvas ──
     if creds_path in changed_files:
         any_action = True
         print("  [Vault] Credentials.md changed")
+        known = _build_known_hosts_lookup(vault_dir)
+        patched = _interpret_credential_operator_notes(vault_dir, args, known)
+        if patched:
+            print(f"  [Creds] Annotated {patched} section(s) — Users Canvas rebuilding")
         if not args.no_canvas and not args.no_users_canvas:
             build_users_canvas(vault_dir, all_loot_data)
             print("  [Vault] Users Canvas rebuilt")
@@ -13423,7 +13856,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int,
                     default=config_defaults.get("workers", 1),
                     metavar="N",
-                    help="Parallel LLM worker threads for deep dives and cross-source analysis (default: 1)")
+                    help="Parallel LLM worker threads for analysis: AutoRecon, loot, misc, deep dives, and cross-source (default: 1)")
     ap.add_argument("--skip-validation", action="store_true",
                     default=config_defaults.get("skip_validation", False),
                     help="Skip post-processing AI output validation (faster, no hallucination checks)")
@@ -13474,7 +13907,7 @@ def main() -> None:
         print(f"      5. python mAIpper.py --build-index")
         conf_path = Path(CONF_FILENAME)
         if not conf_path.exists():
-            conf_path.write_text(_DEFAULT_CONF, encoding="utf-8")
+            _atomic_write_text(conf_path, _DEFAULT_CONF)
             print(f"\n[+] Created default config: {conf_path.resolve()}")
         else:
             print(f"\n[*] Config already exists: {conf_path.resolve()}")
@@ -13527,7 +13960,7 @@ def main() -> None:
     # Auto-generate config if missing
     conf_path = Path(CONF_FILENAME)
     if not conf_path.exists():
-        conf_path.write_text(_DEFAULT_CONF, encoding="utf-8")
+        _atomic_write_text(conf_path, _DEFAULT_CONF)
         logging.info(f"Generated default config: {conf_path.resolve()}")
 
     # Auto-initialize when scans/ doesn't exist (unless --xml points to a specific file)
@@ -13616,7 +14049,7 @@ def _install_vault_css(vault_dir: Path) -> None:
 
     css_path = snippets_dir / "maipper.css"
     if not css_path.exists() or css_path.read_text(encoding="utf-8") != _MAIPPER_CSS:
-        css_path.write_text(_MAIPPER_CSS, encoding="utf-8")
+        _atomic_write_text(css_path, _MAIPPER_CSS)
         logging.info("Installed mAIpper CSS snippet")
 
     appearance_path = obsidian_dir / "appearance.json"
@@ -13628,7 +14061,7 @@ def _install_vault_css(vault_dir: Path) -> None:
     if "maipper" not in enabled:
         enabled.append("maipper")
         appearance["enabledCssSnippets"] = enabled
-        appearance_path.write_text(json.dumps(appearance, indent=2), encoding="utf-8")
+        _atomic_write_text(appearance_path, json.dumps(appearance, indent=2))
         logging.info("Auto-enabled mAIpper CSS snippet in Obsidian")
 
 
@@ -13654,7 +14087,7 @@ def _migrate_host_note_sections(vault_dir: Path) -> int:
             new = new.replace("\n## Cross-Source Analysis\n", "\n## Deep Dive\n")
             new = new.replace("> [!info]- Deep Dive: ", "> [!info]- Analysis: ")
             if new != text:
-                host_path.write_text(new, encoding="utf-8")
+                _atomic_write_text(host_path, new)
                 updated += 1
         except Exception as exc:
             logging.warning(f"Migration failed for {host_path.name}: {exc}")
@@ -14093,56 +14526,75 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             # Layer 2: Parse tool outputs and run AutoRecon-specific analysis
             autorecon_data = parse_autorecon_results(autorecon_dir)
 
-            for target in autorecon_data.get("targets", []):
+            ar_targets = autorecon_data.get("targets", [])
+
+            def _analyze_ar_target(target) -> tuple[str | None, list[str]]:
+                """Run the two-pass AutoRecon analysis for one target.
+
+                Returns (analysis_text, warnings). Pure compute + LLM calls —
+                no vault writes — so it is safe to run in parallel.
+                """
                 target_name = target.get("target", "unknown")
                 logging.info(f"AutoRecon Layer 2 → {target_name}")
-
-                ar_analysis: str | None = None
-                ar_warnings: list[str] = []
-                if not args.no_ollama and not skip_llm:
+                if args.no_ollama or skip_llm:
+                    return None, []
+                try:
+                    # Pass 1: fact extraction
+                    facts: str | None = None
                     try:
-                        # Pass 1: fact extraction
-                        facts: str | None = None
-                        try:
-                            fact_prompt = _build_autorecon_fact_extraction_prompt(
-                                target, operator_notes=operator_notes_lookup.get(target.get("ip", ""), "")
-                            )
-                            facts = ollama_chat(
-                                args.ollama_url, args.model, fact_prompt, args.temperature,
-                            )
-                            logging.info(
-                                f"AutoRecon Pass 1 complete ({target_name}): {len(facts)} chars"
-                            )
-                        except Exception as exc:
-                            logging.warning(
-                                f"AutoRecon Pass 1 failed ({target_name}): {exc}; "
-                                "falling back to single-pass"
-                            )
-
-                        # Pass 2: analysis (grounded in Pass 1 facts if available)
-                        p2_prompt = build_autorecon_ollama_prompt(
+                        fact_prompt = _build_autorecon_fact_extraction_prompt(
                             target, operator_notes=operator_notes_lookup.get(target.get("ip", ""), "")
                         )
-                        if facts:
-                            p2_prompt = (
-                                "The following facts have been extracted directly from the "
-                                "enumeration data. Base your analysis ONLY on these confirmed "
-                                "facts:\n\n" + facts + "\n\n" + p2_prompt
-                            )
-                        raw_analysis = ollama_chat(
-                            args.ollama_url, args.model, p2_prompt, args.temperature,
+                        facts = ollama_chat(
+                            args.ollama_url, args.model, fact_prompt, args.temperature,
                         )
-                        if not args.skip_validation:
-                            ar_analysis, ar_warnings = validate_ai_output(
-                                raw_analysis, {"hosts": [target]}, "autorecon"
-                            )
-                            for w in ar_warnings:
-                                logging.warning(f"[AutoRecon Validation] {w}")
-                        else:
-                            ar_analysis = raw_analysis
+                        logging.info(
+                            f"AutoRecon Pass 1 complete ({target_name}): {len(facts)} chars"
+                        )
                     except Exception as exc:
-                        logging.warning(f"Ollama failed (AutoRecon {target_name}): {exc}")
-                        ar_analysis = f"_Ollama failed: {exc}_"
+                        logging.warning(
+                            f"AutoRecon Pass 1 failed ({target_name}): {exc}; "
+                            "falling back to single-pass"
+                        )
+
+                    # Pass 2: analysis (grounded in Pass 1 facts if available)
+                    p2_prompt = build_autorecon_ollama_prompt(
+                        target, operator_notes=operator_notes_lookup.get(target.get("ip", ""), "")
+                    )
+                    if facts:
+                        p2_prompt = (
+                            "The following facts have been extracted directly from the "
+                            "enumeration data. Base your analysis ONLY on these confirmed "
+                            "facts:\n\n" + facts + "\n\n" + p2_prompt
+                        )
+                    raw_analysis = ollama_chat(
+                        args.ollama_url, args.model, p2_prompt, args.temperature,
+                    )
+                    if not args.skip_validation:
+                        analysis_text, warns = validate_ai_output(
+                            raw_analysis, {"hosts": [target]}, "autorecon"
+                        )
+                        for w in warns:
+                            logging.warning(f"[AutoRecon Validation] {w}")
+                        return analysis_text, warns
+                    return raw_analysis, []
+                except Exception as exc:
+                    logging.warning(f"Ollama failed (AutoRecon {target_name}): {exc}")
+                    return f"_Ollama failed: {exc}_", []
+
+            # Phase 1: analyze targets in parallel (LLM-bound, no writes)
+            ar_computed = _parallel_map(
+                ar_targets, _analyze_ar_target,
+                getattr(args, "workers", 1), label="autorecon",
+            )
+
+            # Phase 2: write vault notes serially (in original target order)
+            for target, computed in zip(ar_targets, ar_computed):
+                target_name = target.get("target", "unknown")
+                if isinstance(computed, Exception):
+                    ar_analysis, ar_warnings = f"_Ollama failed: {computed}_", []
+                else:
+                    ar_analysis, ar_warnings = computed
 
                 ar_scan_data = {
                     "source_file": str(autorecon_dir),
@@ -14196,30 +14648,40 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 analysis_by_host: dict[str, str] = {}
                 if not args.no_ollama and not skip_llm:
                     hosts_dir = vault_dir / "Hosts"
-                    for host_key, loot_files in loot_data["host_loot"].items():
+
+                    def _analyze_loot_host(item):
+                        host_key, loot_files = item
                         host_context = _build_host_context_for_loot(hosts_dir, host_key)
                         op_notes = operator_notes_lookup.get(host_key, "")
-                        try:
-                            prompt = build_loot_ollama_prompt(
-                                host_key, loot_files,
-                                host_context=host_context,
-                                operator_notes=op_notes,
+                        prompt = build_loot_ollama_prompt(
+                            host_key, loot_files,
+                            host_context=host_context,
+                            operator_notes=op_notes,
+                        )
+                        raw = ollama_chat(
+                            args.ollama_url, args.model, prompt, args.temperature,
+                        )
+                        if not args.skip_validation:
+                            analysis_text, loot_warnings = validate_ai_output(
+                                raw, {"hosts": []}, "loot"
                             )
-                            raw = ollama_chat(
-                                args.ollama_url, args.model, prompt, args.temperature,
-                            )
-                            if not args.skip_validation:
-                                analysis_text, loot_warnings = validate_ai_output(
-                                    raw, {"hosts": []}, "loot"
-                                )
-                                for w in loot_warnings:
-                                    logging.warning(f"[Loot Validation] {w}")
-                            else:
-                                analysis_text = raw
-                            analysis_by_host[host_key] = analysis_text
-                        except Exception as exc:
-                            logging.warning(f"Ollama failed (Loot {host_key}): {exc}")
-                            analysis_by_host[host_key] = f"_Ollama failed: {exc}_"
+                            for w in loot_warnings:
+                                logging.warning(f"[Loot Validation] {w}")
+                        else:
+                            analysis_text = raw
+                        return analysis_text
+
+                    loot_items = list(loot_data["host_loot"].items())
+                    loot_results = _parallel_map(
+                        loot_items, _analyze_loot_host,
+                        getattr(args, "workers", 1), label="loot",
+                    )
+                    for (host_key, _), res in zip(loot_items, loot_results):
+                        if isinstance(res, Exception):
+                            logging.warning(f"Ollama failed (Loot {host_key}): {res}")
+                            analysis_by_host[host_key] = f"_Ollama failed: {res}_"
+                        else:
+                            analysis_by_host[host_key] = res
 
                     if loot_data["campaign_loot"]:
                         try:
@@ -14279,7 +14741,8 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 analysis_by_file: dict[str, str] = {}
                 if not args.no_ollama and not skip_llm:
                     hosts_dir = vault_dir / "Hosts"
-                    for file_info in misc_data["files"]:
+
+                    def _analyze_misc_file(file_info):
                         tool_type = file_info.get("tool_type", "unknown")
                         analysis_level = file_info.get("analysis_level", "standard")
                         logging.info(
@@ -14294,35 +14757,41 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                         op_notes = operator_notes_lookup.get(
                             file_info["host_key"] or "", ""
                         )
-                        try:
-                            prompt = build_misc_ollama_prompt(
-                                file_info["filename"],
-                                file_info["content"],
-                                host_context=host_context,
-                                operator_notes=op_notes,
-                                tool_type=tool_type,
-                                analysis_level=analysis_level,
+                        prompt = build_misc_ollama_prompt(
+                            file_info["filename"],
+                            file_info["content"],
+                            host_context=host_context,
+                            operator_notes=op_notes,
+                            tool_type=tool_type,
+                            analysis_level=analysis_level,
+                        )
+                        raw = ollama_chat(
+                            args.ollama_url, args.model,
+                            prompt, args.temperature,
+                        )
+                        if not args.skip_validation:
+                            analysis_text, misc_warnings = validate_ai_output(
+                                raw, {"hosts": []}, "misc"
                             )
-                            raw = ollama_chat(
-                                args.ollama_url, args.model,
-                                prompt, args.temperature,
-                            )
-                            if not args.skip_validation:
-                                analysis_text, misc_warnings = validate_ai_output(
-                                    raw, {"hosts": []}, "misc"
-                                )
-                                for w in misc_warnings:
-                                    logging.warning(f"[Misc Validation] {w}")
-                            else:
-                                analysis_text = raw
-                            analysis_by_file[file_info["filename"]] = analysis_text
-                        except Exception as exc:
+                            for w in misc_warnings:
+                                logging.warning(f"[Misc Validation] {w}")
+                        else:
+                            analysis_text = raw
+                        return analysis_text
+
+                    misc_files = misc_data["files"]
+                    misc_analysis_results = _parallel_map(
+                        misc_files, _analyze_misc_file,
+                        getattr(args, "workers", 1), label="misc",
+                    )
+                    for file_info, res in zip(misc_files, misc_analysis_results):
+                        if isinstance(res, Exception):
                             logging.warning(
-                                f"Ollama failed (Misc {file_info['filename']}): {exc}"
+                                f"Ollama failed (Misc {file_info['filename']}): {res}"
                             )
-                            analysis_by_file[file_info["filename"]] = (
-                                f"_Ollama failed: {exc}_"
-                            )
+                            analysis_by_file[file_info["filename"]] = f"_Ollama failed: {res}_"
+                        else:
+                            analysis_by_file[file_info["filename"]] = res
 
                 misc_results = create_misc_vault(
                     vault_dir, misc_data,
