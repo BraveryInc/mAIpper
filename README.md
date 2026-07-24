@@ -50,7 +50,7 @@ Ollama provides LLM inference. It can run locally on your assessment machine or 
 ```bash
 # Install from https://ollama.com/download
 ollama serve
-ollama pull qwen2.5:14b-instruct-q5_K_M
+ollama pull llama3.1:8b
 ```
 
 ### Remote / Shared GPU Server
@@ -59,7 +59,7 @@ On the server, bind Ollama to the network interface:
 
 ```bash
 OLLAMA_HOST=0.0.0.0:11434 ollama serve
-ollama pull qwen2.5:32b-instruct-q5_K_M
+ollama pull llama3.1:70b-instruct-q4_K_M
 ```
 
 Point mAIpper at it from your assessment machine via `maipper.conf` or CLI flag:
@@ -68,12 +68,12 @@ Point mAIpper at it from your assessment machine via `maipper.conf` or CLI flag:
 # maipper.conf
 [ollama]
 ollama_url = http://<server-ip>:11434
-model = qwen2.5:32b-instruct-q5_K_M
+model = llama3.1:70b-instruct-q4_K_M
 ```
 
 ```bash
 # Or per-run
-python mAIpper.py --ollama-url http://<server-ip>:11434 --model qwen2.5:32b-instruct-q5_K_M
+python mAIpper.py --ollama-url http://<server-ip>:11434 --model llama3.1:70b-instruct-q4_K_M
 ```
 
 The vault stays local per operator per engagement. Only the LLM calls go to the remote server.
@@ -82,12 +82,12 @@ The vault stays local per operator per engagement. Only the LLM calls go to the 
 
 | VRAM | Model |
 |---|---|
-| ~8 GB | `qwen2.5:7b-instruct` |
-| ~10 GB | `qwen2.5:14b-instruct-q5_K_M` |
-| ~22 GB | `qwen2.5:32b-instruct-q5_K_M` |
-| ~40 GB | `qwen2.5:72b-instruct-q4_K_M` |
+| ~6 GB | `llama3.1:8b` (default, Q4_K_M) |
+| ~9 GB | `llama3.1:8b-instruct-q8_0` (higher fidelity) |
+| ~24 GB | `llama3.1:70b-instruct-q2_K` |
+| ~40 GB | `llama3.1:70b-instruct-q4_K_M` |
 
-Larger models produce noticeably better analysis, especially for cross-source correlation and deep dive synthesis.
+The default is **Llama 3.1 8B** (`llama3.1:8b`) — a solid all-round local model that runs comfortably on a single mid-range GPU or an Apple Silicon laptop. Larger models produce noticeably better analysis, especially for cross-source correlation and deep dive synthesis.
 
 ---
 
@@ -222,7 +222,7 @@ verbose = false
 
 [ollama]
 ollama_url = http://localhost:11434
-model = qwen2.5:14b-instruct-q5_K_M
+model = llama3.1:8b
 temperature = 0.15
 
 [interactive]

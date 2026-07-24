@@ -13831,7 +13831,7 @@ verbose = 1
 ollama_url = http://localhost:11434
 
 # LLM model to use
-model = qwen2.5:14b-instruct-q5_K_M
+model = llama3.1:8b
 
 # Sampling temperature (0.0-1.0, lower = more deterministic)
 temperature = 0.15
@@ -13977,7 +13977,7 @@ def main() -> None:
                     default=config_defaults.get("vault", "Obsidian"),
                     help="Obsidian vault output directory")
     ap.add_argument("--model",
-                    default=config_defaults.get("model", "qwen2.5:14b-instruct-q5_K_M"))
+                    default=config_defaults.get("model", "llama3.1:8b"))
     ap.add_argument("--ollama-url",
                     default=config_defaults.get("ollama_url", "http://localhost:11434"))
     ap.add_argument("--no-ollama",  action="store_true",

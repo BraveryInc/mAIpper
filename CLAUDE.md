@@ -68,7 +68,7 @@ pip install openpyxl          # required only for --excel
 pip install pypdf             # required only for RAG with PDFs
 ```
 
-Ollama must be running locally (`ollama start`) before invoking unless `--no-ollama` is used. Recommended model: `qwen2.5:14b-instruct-q5_K_M`.
+Ollama must be running locally (`ollama start`) before invoking unless `--no-ollama` is used. Default model: `llama3.1:8b` (Llama 3.1 8B Instruct).
 
 ## Configuration
 
