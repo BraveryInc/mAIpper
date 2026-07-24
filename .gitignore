@@ -15,6 +15,9 @@ Obsidian/
 # RAG reference docs — operator's own library
 docs/
 
+# PlexTrac reference template — vendor file, not project source
+PlexTrac Finding CSV Template v3.2.csv
+
 # Python
 __pycache__/
 *.py[cod]
