@@ -10,7 +10,7 @@ Supported input formats:
 - **Nmap XML** (`scans/nmap/*.xml`)
 - **Nessus** (`scans/nessus/*.nessus`)
 - **Burp Suite Issues XML** (`scans/burp/*.xml`)
-- **Nikto** (`scans/nikto/`) — nikto scan output (processed via misc pipeline for now)
+- **Nikto** (`scans/nikto/`) — directory is created by `--init` but **is not yet parsed**; drop nikto output in `scans/misc/` instead (it is auto-detected there). See roadmap gap #5.
 - **AutoRecon** (`scans/autorecon/<target>/scans/` or `--autorecon <dir>`)
 - **Loot** (`scans/loot/` or `--loot <dir>`) — credentials, hashes, keys, sensitive files
 - **Misc** (`scans/misc/` or `--misc <dir>`) — arbitrary tool text output for LLM interpretation
@@ -116,6 +116,9 @@ Everything lives in `mAIpper.py`. The flow is linear:
 32. **`_interpret_credential_operator_notes`** — on Credentials.md change, scans `### Operator Notes` blocks for freeform text; Pass 1 (Python) matches known host identifiers and auto-appends `[x] Confirmed on`; Pass 2 (LLM) handles ambiguous access-implying language and prints a suggestion
 33. **`_reattribute_campaign_credentials_by_notes`** — scans Campaign-Level credential table rows; when the Notes column contains a known host identifier (short or prose), moves the row to the correct host section and creates the section if needed
 34. **`_parse_creds_host_key`** / **`_patch_credential_operator_notes`** — helpers: parse `## [[Hosts/stem|key]]` headers; targeted in-place append to operator notes blocks without full file rewrite
+35. **`_find_section_bounds`** / **`_set_body_section`** — index-based, fence-aware `## ` section replace/append. **Use these for any note section write.** They replaced string-reconstruction + `re.sub`, which silently no-opped on whitespace drift and crashed on backslashes in LLM output
+36. **`_carry_forward_fm`** / **`PRESERVED_FM_KEYS`** — copies host-level frontmatter (`ips`, `domain`, loot counts, severity) that a single-source writer does not own. **Call in every host-note writer** after building `fm`
+37. **`_force_utf8_stdio`** — reconfigures stdout/stderr to UTF-8 at startup so Windows legacy codepages do not crash on arrows/box-drawing output
 
 ## Incremental Analysis
 
@@ -154,8 +157,8 @@ mAIpper tracks which files have been analyzed via `.maipper_state.json` in the v
 Assessors drop loot files into `scans/loot/` — credentials, hashes, keys, sensitive files.
 
 **Host association:**
-- **Subdirectory:** `loot/10.10.10.5/` or `loot/dante-ws03/` (IP or short hostname)
-- **Filename prefix:** `loot/10.10.10.5_creds.txt`, `loot/dante-ws03_dump.txt`, `loot/dc01.domain.local_sam.txt`
+- **Subdirectory:** `loot/10.10.10.5/` or `loot/corp-ws03/` (IP or short hostname)
+- **Filename prefix:** `loot/10.10.10.5_creds.txt`, `loot/corp-ws03_dump.txt`, `loot/dc01.domain.local_sam.txt`
 - **Unassociated:** `loot/cracked_hashes.txt` — campaign-level
 
 **Output:** Centralized `Loot/Credentials.md` and `Loot/Hashes.md` with per-host tables. Host notes get lightweight `## Loot` sections with summary stats and links. File listings stay inline.
@@ -285,7 +288,7 @@ Obsidian/
 
 1. **Python pre-processing** — structured fact extraction before LLM sees raw data
 2. **Prompt grounding rules** — `[CONFIRMED]`/`[INFERRED]`/`[ASSUMED]` tagging, English-only, explicit anti-hallucination instructions
-3. **Temperature control** — default 0.15. Adjustable via `--temperature`
+3. **Temperature control** — default 0.15. Adjustable via `--temperature` (applies to both the `/api/chat` path and the `/api/generate` fallback)
 4. **Post-processing validator** — cross-references CVEs, IPs, ports, hostnames against source data
 
 Nessus and AutoRecon use **two-pass analysis**: Pass 1 extracts facts, Pass 2 analyzes them.
@@ -299,6 +302,12 @@ Nessus and AutoRecon use **two-pass analysis**: Pass 1 extracts facts, Pass 2 an
 - **Versioning**: the file is `mAIpper.py` (no version suffix). Increment the version string in the module docstring header, then create a git tag (`git tag vX.Y && git push origin vX.Y`).
 - Host association (loot and misc): subdirectory name > filename IP prefix > filename FQDN prefix > campaign-level.
 - `--init` creates all scan subdirectories + `maipper.conf`; partial directories auto-completed on every run.
+- **Example data must be generic.** Never use hostnames, subnets, domains or hashes from a
+  real engagement or a commercial training lab (HackTheBox, TryHackMe, OffSec PG, etc.) in
+  code comments, docstrings, prompts, user-facing strings, docs or tests — including ones
+  that only look like a naming scheme. Use `10.10.10.x`, `CORP` / `corp-ws01` /
+  `dc01.corp.local`, and placeholders like `<32 hex chars>` for hash examples. Real values
+  are hard to remove later because they persist in git history.
 
 ## Prompt Architecture
 
@@ -395,69 +404,132 @@ Generates `Findings/` notes compatible with PlexTrac's CSV import format. Each f
 - `export_plextrac(vault_dir)` — reads all `Findings/*.md`, writes CSV
 - `_install_findings_template(vault_dir)` — creates `Findings/_Template.md` on vault init
 
-## Assessment & Roadmap (v0.14)
+## Testing
 
-### Recently resolved (v0.14)
+`tests/test_note_writing.py` guards the note-writing regression classes found in the
+v0.15 audit: section writes surviving whitespace drift, backslash-bearing LLM output,
+and host-level frontmatter preservation across all six writers.
 
-- **Host-note section data loss (fixed)** — all six writers now preserve `## Access` and `## NXC Enumeration`; the Nmap writer also preserves `## Cross-Source Analysis`. Previously a re-scan of a host silently dropped post-ex/AD/synthesis sections.
-- **Atomic vault writes (fixed, gap #13)** — every note/canvas/page write uses `_atomic_write_text` (temp file + `os.replace`); interruption no longer corrupts notes.
-- **RAG retrieval performance (fixed, part of gap #5 cost)** — with `numpy` installed, embeddings load once into an in-memory matrix and are scored with vectorized cosine, cached per run, replacing the pure-Python full-table scan on every query. Pure-Python streaming remains as fallback.
-- **Parallel analysis (partial, gap #5)** — `--workers` now parallelizes AutoRecon, loot, and misc LLM analysis in addition to deep dives / cross-source. Nmap/Nessus/Burp per-file loops remain serial (low file counts).
-- **Validator scope (fixed, gap #7)** — `validate_ai_output` already cross-references IPs, ports, and hostnames, not just CVEs.
-- **Fragile section parsing (partial, gap #14)** — `extract_body_section` is now fenced-code-block aware; a `## ` line inside a ``` fence no longer truncates a section.
+```bash
+python tests/test_note_writing.py      # standalone, no dependencies
+pytest tests/test_note_writing.py      # if pytest is installed
+```
+
+It imports `mAIpper.py` directly and writes only into `tempfile` directories, so it
+never touches a real vault. **Run it after any change to a host-note or scan-note
+writer, to `_set_body_section`, or to `PRESERVED_FM_KEYS`.** When adding a new
+host-level frontmatter key, add it to `PRESERVED_FM_KEYS` *and* to the `PRESERVED`
+dict in the test.
+
+## Assessment & Roadmap (v0.15)
+
+### Recently resolved (v0.15) — full-codebase audit
+
+A full-codebase review found four crashes and two data-loss bugs, each reproduced
+with a runnable test before being fixed. Those tests are now `tests/test_note_writing.py`
+(see **Testing** below) — 11 of its 12 cases fail against v0.14.
+
+**Crashes:**
+
+- **`--init` never worked** — `_init_scan_dirs` referenced a module-global `args` that does not exist, so `python mAIpper.py --init` died with `NameError` on every invocation, before creating `maipper.conf`, `docs/`, or `_Assessment Config.md`. It was masked because a normal run auto-generates the config separately. Now takes `vault_dir` as a parameter.
+- **`/analyze` and `/deepdive` crashed on backslashes in LLM output** — both passed raw model output as the *replacement template* of `re.sub`, where `\A`, `\W`, `\1` etc. are parsed as escapes/group references. Every realistic pentest string (`DOMAIN\Administrator`, `C:\Windows\Temp`, `\\host\share`) raised `re.error: bad escape`, the exception was swallowed, the analysis was lost and the LLM call wasted.
+- **Loot pipeline aborted any run with credentials** — `_CRED_TABLE_ROW_RE` was defined twice; the later loose 1-group matcher shadowed the 6-group column parser, so `_rebuild_campaign_aggregates` raised `IndexError: no such group`. The loose matcher is now `_CRED_TABLE_ANY_ROW_RE`.
+- **Windows `UnicodeEncodeError`** — arrows and box-drawing characters in CLI output crashed whenever stdout was redirected under a legacy codepage. `_force_utf8_stdio()` reconfigures stdout/stderr at startup.
+
+**Data loss:**
+
+- **Deep dive results silently discarded** — `_write_deep_dive_result` rebuilt the old section as a string and called `str.replace`. A blank line between `## Analysis` and its first content (standard Markdown, and what Obsidian produces on edit) made the match fail, so the write was a no-op — while the checkbox still flipped to `[/]` (green/done). Worst failure mode in the tool: it looked like success.
+- **Frontmatter keys dropped by every writer** — each of the six host-note writers rebuilt `fm` from scratch and kept only the keys it owned. `ips` (written only by `/merge`) was dropped by **all six**, silently un-merging multi-interface hosts on the next scan; `loot_*` counts and `autorecon_tools_run` were dropped by most, so the canvas, priority targets, Excel export and `/status` under-reported after a re-scan.
+
+**Correctness / cleanup:**
+
+- `validate_ai_output` read `target["nmap_scans"]`, a key the AutoRecon parser never writes — port hallucination checking was a silent no-op for AutoRecon. Now parses `nmap_xml_files`.
+- `/analyze` on an AutoRecon scan note only ever re-analyzed `targets[0]`; now matches the target named by the note.
+- The `/api/generate` fallback passed `temperature` at the top level instead of under `options`, silently discarding `--temperature` — the headline hallucination control was off in the fallback path.
+- NXC SQLite connections now close in a `finally` block instead of leaking on query failure.
+- `[rag] auto_build` and `[rag] max_chunks` were parsed from config but never reached `args`, so both were documented no-ops. Now wired via `--no-auto-build` and `--rag-max-chunks`.
+- Removed dead code: `_cosine_similarity`, `_decode_embedding_f16`, an unused `threading.local()`, an unreachable `_skip_words` re-check, the unused `base64` import, the dead `no_excel` config mapping.
+
+**Two helpers now guard the regression classes above** — use them rather than hand-rolling section or frontmatter merges:
+
+- `_set_body_section(text, header, content, *, append=False)` / `_find_section_bounds` — index-based, fence-aware section replacement. Never depends on reconstructing the old section as an exact string, and inserts content verbatim (no regex template parsing).
+- `_carry_forward_fm(fm, existing_fm)` over `PRESERVED_FM_KEYS` — call in every host-note writer after building `fm`.
+
+### Resolved in v0.14
+
+Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/IPs, RAG retrieval performance (numpy matrix), host-note `## Access` / `## NXC Enumeration` / `## Cross-Source Analysis` preservation, fence-aware `extract_body_section`.
 
 ### What works well
 
-- **Multi-source ingestion** — Nmap, Nessus, Burp, AutoRecon (10 tool extractors), Loot, Misc (25+ signature detections). Most assessment sources covered.
-- **LLM grounding** — CONFIRMED/INFERRED/ASSUMED tagging, two-pass fact-extraction (Nessus, AutoRecon), per-prompt anti-hallucination rules, source truth validation, operator notes feedback loop. Defensive LLM usage throughout.
+- **Multi-source ingestion** — Nmap, Nessus, Burp, AutoRecon (10 tool extractors), Loot, NXC, Misc (25+ signature detections). Most assessment sources covered.
+- **LLM grounding** — CONFIRMED/INFERRED/ASSUMED tagging, two-pass fact-extraction (Nessus, AutoRecon), per-prompt anti-hallucination rules, source truth validation, operator notes feedback loop.
 - **Obsidian as the UI** — host notes, canvases, watch loop, CSS checkbox snippets. Pentesters can live in one tool.
-- **Operator notes feedback loop** — `## Operator Notes` in host notes feeds back into every subsequent LLM prompt, making analysis smarter as you add context.
-- **`/deepdive` cross-source synthesis** — correlates Nmap + Nessus + Burp + AutoRecon + Loot per host, finds chains that only emerge when viewing all data together. Coverage Gaps section flags missing sources. Standout feature.
-- **Incremental state** — `.maipper_state.json` skips unchanged files; `--reanalyze` forces full redo; `/reanalyze` interactive equivalent.
+- **Operator notes feedback loop** — `## Operator Notes` feeds back into every subsequent LLM prompt, making analysis smarter as you add context.
+- **`/deepdive` cross-source synthesis** — correlates all sources per host; finds chains that only emerge when viewing everything together. Standout feature.
+- **Incremental state** — `.maipper_state.json` skips unchanged files; `--reanalyze` forces a full redo.
 - **PlexTrac integration** — auto-draft findings from Nessus/Burp, dedup by plugin/issue, accumulate affected_assets, export CSV matching PlexTrac v3.2.
 
 ### Known gaps (pentest workflow perspective)
 
 **Critical — missing workflow coverage:**
+
 1. **Post-exploitation tracking** — `status: exploited` exists but no structured place for access gained (user, privilege, method, sessions, lateral movement). The kill chain is not tracked.
 2. **BloodHound / AD path data** — AD assessments without BloodHound data miss critical attack paths. JSON exports would feed the Users Canvas and host prioritization directly.
-3. **Finding descriptions need LLM drafting** — PlexTrac notes are populated with raw Nessus plugin text. Need a `/draft-findings` step that rewrites descriptions as professional report findings using host context.
+3. **Finding descriptions need LLM drafting** — PlexTrac notes carry raw Nessus plugin text. Need `/draft-findings` to rewrite them as professional findings using host context.
 4. **Evidence collection is freeform** — no structured `## Evidence` section in finding notes; no link from evidence to findings.
 
+**Ingestion gaps (silently dropped input):**
+
+5. **`scans/nikto/` is created but never parsed** — it is not in `_SCAN_EXTENSIONS` and is not covered by the autorecon/loot/misc walkers, so files dropped there are silently ignored. Either route it through the misc pipeline or stop creating the directory.
+6. **`scans/nxc/` is not watched** — `_snapshot_scan_files` omits it, so dropping an NXC workspace in interactive mode never triggers reprocessing. Batch runs pick it up; the watch loop does not.
+
 **Important — quality and scale:**
-5. **Sequential LLM calls in the scan-file loops** — Nmap/Nessus/Burp per-file analysis is still serial (AutoRecon/loot/misc/deep-dive/cross-source are parallelized via `--workers`). Low priority since scan-file counts are usually small; a two-phase (parallel analyze → serial write) refactor would finish it.
-6. **Finding consolidation is inverted** — dedup by plugin_id is the right default but no way to split findings back out or manually group unrelated ones.
-7. ~~validate_ai_output only checks CVEs~~ — **RESOLVED**: now cross-references IPs, ports, and hostnames too.
-8. **Prompts are hardcoded** — no template system for engagement-specific context (client industry, compliance, assessment type), custom output sections, or per-prompt temperature tuning.
+
+7. **`/analyze` ignores `--workers`** — `_process_analyze_requests` is a plain serial loop. It is the slowest interactive path and the one actually used during an engagement; the v0.14 parallelism went to the batch paths instead. Two-phase (parallel analyze → serial write) would fix it, same shape as the AutoRecon loop.
+8. **`--workers` defaults to 1** — all parallelism ships off. Consider defaulting to 2-4.
+9. **`_find_host_note_by_ip` is O(n²)** — reads and parses *every* host note on every call, once per host per scan (≈250k file reads at 500 hosts). Build the lookup once per run, as `_build_known_hosts_lookup` already does.
+10. **Spinner output garbles under `--workers > 1`** — `_Spinner` writes `\r` to stderr unguarded from every worker thread; `_LLM_PRINT_LOCK` exists but does not cover it.
+11. **Sequential LLM calls in the Nmap/Nessus/Burp scan-file loops** — still serial. Low priority; scan-file counts are usually small.
+12. **Finding consolidation is inverted** — dedup by plugin_id is the right default but there is no way to split findings back out or manually group unrelated ones.
+13. **Prompts are hardcoded** — no template system for engagement-specific context, custom output sections, or per-prompt temperature.
+14. **`_extract_credentials` colon-split produces false positives** — the bare `user:pass` line scan turns any `Key: Value` line into a credential (`Server: Apache` → user `Server`). Needs a context guard or a confidence field.
+
+**RAG:**
+
+15. **`_load_rag_matrix` caches every chunk's full text in RAM** — the `meta` list holds `text` for all chunks, but only the top-k are ever read. On a large index that is hundreds of MB of needless resident memory. Keep ids/vectors in memory and fetch text for the k hits by id.
+16. **Pure-Python retrieval fallback is brittle** — `struct.unpack(f"{dim}e", blob)` raises on any dim mismatch, where the numpy path tolerates it via `frombuffer`.
+17. **RAG index path is `Path.cwd()`** — running mAIpper from a different directory silently loses the index.
 
 **Missing parsers (high-value):**
-9. **CrackMapExec** — bulk spray / domain enumeration results; daily-driver tool on internal assessments.
-10. **Responder logs** — LLMNR/NBT-NS hash captures.
-11. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
-12. **Metasploit db export** — sessions, loot, modules run.
+
+18. **CrackMapExec** — bulk spray / domain enumeration results.
+19. **Responder logs** — LLMNR/NBT-NS hash captures.
+20. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
+21. **Metasploit db export** — sessions, loot, modules run.
 
 **Architecture / robustness:**
-13. ~~No atomic writes~~ — **RESOLVED**: all writes go through `_atomic_write_text` (temp file + `os.replace`).
-14. **String-based section parsing is still string-based** — `extract_body_section` is now fenced-code-block aware, but section handling remains six copies of manual extract/emit logic per writer. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them and prevent future "forgot to preserve section X" regressions.
-15. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
-16. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
-17. **Interactive analysis requires Obsidian round-trip** — must check boxes in Obsidian, switch to terminal, run `/analyze`. Want `/analyze <host> <topic>` direct from prompt.
-18. **Persistent chat history** — session chat lost on exit; not saved to vault.
-19. **Multi-IP host merging** — assets with multiple network interfaces have multiple IPs. Need: (a) `ips` list in frontmatter alongside primary `ip`, (b) `/merge` to detect and collapse notes sharing a hostname even when all three notes have different IPs, (c) canvas and Users Canvas to resolve any IP in the `ips` list to the canonical note. Current `/merge` only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md all for the same physical host).
+
+22. **Six hand-maintained host-note writers** — `_set_body_section` and `_carry_forward_fm` now guard the two regression classes, but each writer still hand-lists all 11 body sections. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them. **The v0.15 frontmatter bug was this gap cashing out — do this before adding a 7th section.**
+23. **19 silent `except Exception: pass` handlers** — several hide real failures (e.g. loot/misc read errors). Audit and log at debug minimum.
+24. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
+25. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
+26. **Interactive analysis requires an Obsidian round-trip** — want `/analyze <host> <topic>` direct from the prompt.
+27. **Persistent chat history** — session chat is lost on exit.
+28. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
+29. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
+30. **Single 15k-line file** — navigable via the architecture list above, but the writer duplication (#22) is the concrete cost.
 
 ### Prioritized next steps
 
 | Priority | Item | Why |
 |---|---|---|
-| 1 | Exploitation / access tracking | Kill chain is the core of a pentest report; completely missing |
-| 2 | BloodHound parser + AD Canvas | Required for internal assessments; pairs with Users Canvas |
-| 3 | LLM-assisted finding drafting (`/draft-findings`) | Biggest reporting quality gap; raw plugin text ≠ professional finding |
-| 4 | Evidence blocks in findings | Bridges note-taking and reporting |
-| 5 | CrackMapExec + Responder parsers | Daily-driver tools, high return |
-| 6 | Scope management | Required for client-facing deliverables |
-| 7 | Single section-dict serializer for host notes | Collapses six manual writer copies; structurally prevents section-drop regressions |
-| 8 | Finish parallelizing Nmap/Nessus/Burp scan-file loops | Two-phase analyze→write; completes the `--workers` coverage |
-| 9 | `/analyze <host> <topic>` direct command | Removes Obsidian round-trip for active exploitation sessions |
-| 10 | Multi-IP host merging | Dual-homed assets produce split notes; `/merge` needs to unify by shared hostname across all IP notes |
-
-**Resolved in v0.14:** parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/IPs, RAG retrieval performance, host-note section data loss.
+| 1 | Single section-dict serializer for host notes (#22) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers |
+| 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing |
+| 3 | Fix ingestion gaps: nikto + nxc watching (#5, #6) | Input is silently dropped today — worst kind of bug for an evidence tool |
+| 4 | BloodHound parser + AD Canvas (#2, #20) | Required for internal assessments; pairs with Users Canvas |
+| 5 | LLM-assisted finding drafting (`/draft-findings`) (#3) | Biggest reporting quality gap |
+| 6 | Parallelize `/analyze` + raise `--workers` default (#7, #8) | Slowest interactive path; parallelism currently ships off |
+| 7 | Evidence blocks in findings (#4) | Bridges note-taking and reporting |
+| 8 | CrackMapExec + Responder parsers (#18, #19) | Daily-driver tools, high return |
+| 9 | `_find_host_note_by_ip` lookup cache (#9) | O(n²) file I/O; bites on large engagements |
+| 10 | Scope management (#25) | Required for client-facing deliverables |

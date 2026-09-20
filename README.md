@@ -260,7 +260,10 @@ python mAIpper.py [flags]
   --ollama-url URL        Ollama endpoint (default: http://localhost:11434)
   --model MODEL           Ollama model name
   --temperature FLOAT     LLM temperature 0.0–1.0 (default: 0.15)
-  --workers N             Parallel LLM workers for deep dives and cross-source analysis (default: 1)
+  --workers N             Parallel LLM workers for AutoRecon, loot, misc, deep dives,
+                          and cross-source analysis (default: 1 — parallelism off)
+  --rag-max-chunks N      Reference chunks injected per prompt (default: 5)
+  --no-auto-build         Never prompt to build the RAG index at startup
   --no-ollama             Skip all LLM analysis (parse and write notes only)
   --no-canvas             Skip canvas generation
   --reanalyze             Force re-analysis of all files (ignore saved state)
@@ -336,7 +339,7 @@ mAIpper scans operator notes on every Credentials.md change. If a known host ide
 ```yaml
 ip: 10.10.100.100
 ips: ["172.16.1.100"]
-hostnames: ["dante-web-nix01"]
+hostnames: ["corp-web-nix01"]
 ```
 
 `/merge` collapses separate IP notes into one canonical note and populates `ips` automatically.

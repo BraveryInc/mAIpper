@@ -1,7 +1,52 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.14 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.15 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.14:
+  - FIX (crash): `--init` raised NameError: name 'args' is not defined.
+    _init_scan_dirs referenced a global `args` that never existed, so the
+    documented first-run onboarding always died before creating maipper.conf
+    and the Assessment Config. It now takes vault_dir as a parameter.
+  - FIX (crash): /analyze and /deepdive raised re.error on any LLM output
+    containing a backslash -- domain-qualified usernames, Windows paths,
+    UNC share paths, or a regex group reference.
+    Section writes passed raw model output as an re.sub replacement template,
+    where backslash sequences are parsed as group references. Section writes
+    are now index-based and insert content verbatim.
+  - FIX (data loss): deep dive results were silently discarded whenever a
+    host note had a blank line between `## Analysis` and its first content —
+    the checkbox still flipped to [/] (green/done) and the LLM call was
+    wasted. Section lookup no longer depends on reconstructing the old
+    section as an exact string.
+  - FIX (crash): _CRED_TABLE_ROW_RE was defined twice; the later loose
+    1-group matcher shadowed the 6-group column parser, so rebuilding the
+    Campaign-Level aggregates in Loot/Credentials.md raised IndexError and
+    aborted the whole run on any assessment with credentials. The loose
+    matcher is now _CRED_TABLE_ANY_ROW_RE.
+  - FIX (data loss): host-note writers rebuilt frontmatter from scratch and
+    dropped keys they did not own. `ips` (written only by /merge) was dropped
+    by all six writers, silently un-merging multi-interface hosts; loot counts
+    and autorecon_tools_run were dropped by most. A single _carry_forward_fm
+    helper over PRESERVED_FM_KEYS now guards every writer.
+  - FIX: validate_ai_output read target["nmap_scans"], a key the AutoRecon
+    parser never writes, so nmap-discovered ports never counted as source
+    truth and port hallucination checking was a no-op for AutoRecon.
+  - FIX: /analyze on an AutoRecon scan note only ever re-analyzed targets[0];
+    it now matches the target named by the scan note.
+  - FIX: the /api/generate fallback passed temperature at the top level
+    instead of under "options", silently discarding --temperature.
+  - FIX (Windows): CLI output crashed with UnicodeEncodeError on arrows and
+    box-drawing characters whenever stdout was redirected under a legacy
+    codepage. stdout/stderr are now reconfigured to UTF-8 at startup.
+  - NXC SQLite connections are closed in a finally block instead of leaking
+    whenever a query raised.
+  - The documented [rag] options auto_build and max_chunks were parsed from
+    config but never reached args, so both were no-ops. They now have
+    --no-auto-build and --rag-max-chunks flags and take effect.
+  - Removed dead code: _cosine_similarity, _decode_embedding_f16, an unused
+    threading.local(), an unreachable _skip_words re-check, the unused base64
+    import, and the dead no_excel config mapping.
 
 Changes from v0.13:
   - FIX (data loss): host-note re-writes no longer drop ## Access or
@@ -163,7 +208,6 @@ import time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-import base64
 import heapq
 import sqlite3
 import struct
@@ -314,6 +358,7 @@ _RAG_INDEX: dict | None = None
 _RAG_BUILDER = None  # _RagIndexBuilder | None
 _RAG_OLLAMA_URL: str = ""
 _RAG_EMBEDDING_MODEL: str = RAG_DEFAULT_EMBEDDING_MODEL
+_RAG_MAX_CHUNKS: int = RAG_DEFAULT_MAX_CHUNKS
 # Cached numpy embedding matrix for fast retrieval, keyed by (db_path, mtime).
 # {"key": (str, float), "matrix": np.ndarray (N, dim) float32,
 #  "norms": np.ndarray (N,), "meta": list[dict]}
@@ -574,6 +619,29 @@ def read_frontmatter(text: str) -> tuple[dict, str]:
         except (json.JSONDecodeError, ValueError):
             fm[key] = raw if raw else None
     return fm, body
+
+
+# Host-level frontmatter keys that belong to the note as a whole rather than to
+# any one scanner. Every single-source writer must carry these forward or a
+# re-scan silently erases them -- `ips` in particular is written only by /merge,
+# so dropping it un-merges multi-interface hosts.
+PRESERVED_FM_KEYS = (
+    "ips",
+    "domain",
+    "nessus_max_severity",
+    "autorecon_tools_run",
+    "loot_file_count",
+    "loot_credential_count",
+    "loot_hash_count",
+)
+
+
+def _carry_forward_fm(fm: dict, existing_fm: dict) -> dict:
+    """Copy preserved host-level frontmatter keys that *fm* does not already set."""
+    for key in PRESERVED_FM_KEYS:
+        if key not in fm and key in existing_fm:
+            fm[key] = existing_fm[key]
+    return fm
 
 
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -1796,10 +1864,6 @@ def _extract_usernames(text: str, known_users: set[str] | None = None) -> list[s
             return False
         if w.isdigit():
             return False
-        # Reject bare common English words (all lowercase, no digits/specials)
-        # Allow things like "jsmith", "j.smith", "john_doe", "user01"
-        if w.isalpha() and w.lower() == w and len(w) <= 5 and w.lower() in _skip_words:
-            return False
         return True
 
     def _add(word: str) -> None:
@@ -2105,7 +2169,7 @@ def _resolve_host_from_path(
             return subdir
         if is_probable_fqdn(subdir):
             return subdir
-        # Short hostname subdirectory (e.g. loot/dante-ws03/)
+        # Short hostname subdirectory (e.g. loot/corp-ws03/)
         if known_hosts and subdir.lower() in known_hosts:
             return known_hosts[subdir.lower()]
 
@@ -2115,7 +2179,7 @@ def _resolve_host_from_path(
     m = LOOT_FQDN_PREFIX_RE.match(filepath.name)
     if m:
         return m.group(1)
-    # Short hostname filename prefix (e.g. dante-ws03_creds.txt).
+    # Short hostname filename prefix (e.g. corp-ws03_creds.txt).
     # Split on first _ only — hyphens are part of hostnames, not separators.
     if known_hosts and "_" in filepath.stem:
         prefix = filepath.stem.split("_")[0]
@@ -2140,7 +2204,7 @@ def _resolve_host_from_content(
 
     Checks for:
     1. Known host identifiers (hostnames, stems, IPs from existing vault notes)
-    2. Prose mentions like "for the server DANTE-WEB-NIX01"
+    2. Prose mentions like "for the server CORP-WEB-NIX01"
     3. IP addresses in text (single or dominant)
 
     known_hosts: {identifier_lower: host_key} mapping from vault
@@ -2576,8 +2640,8 @@ def parse_nxc_db(workspace_dir: Path) -> dict:
 
 def _parse_nxc_smb_db(db_path: Path, hosts: dict, creds: list) -> None:
     """Parse smb.db: hosts, users, admin_relations, shares, DPAPI secrets."""
+    conn: sqlite3.Connection | None = None
     try:
-        import sqlite3
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2669,15 +2733,17 @@ def _parse_nxc_smb_db(db_path: Path, hosts: dict, creds: list) -> None:
         except Exception:
             pass
 
-        conn.close()
     except Exception as exc:
         logging.warning(f"Failed to parse smb.db ({db_path}): {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _parse_nxc_ldap_db(db_path: Path, hosts: dict, creds: list) -> None:
     """Parse ldap.db: DC host enumeration and pillaged/enumerated user accounts."""
+    conn: sqlite3.Connection | None = None
     try:
-        import sqlite3
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2728,15 +2794,17 @@ def _parse_nxc_ldap_db(db_path: Path, hosts: dict, creds: list) -> None:
                 "enumerated_only": is_enum,
             })
 
-        conn.close()
     except Exception as exc:
         logging.warning(f"Failed to parse ldap.db ({db_path}): {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _parse_nxc_generic_db(db_path: Path, proto: str, hosts: dict, creds: list) -> None:
     """Parse a non-SMB/LDAP NXC protocol DB for additional hosts and credentials."""
+    conn: sqlite3.Connection | None = None
     try:
-        import sqlite3
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2785,9 +2853,11 @@ def _parse_nxc_generic_db(db_path: Path, proto: str, hosts: dict, creds: list) -
         except Exception:
             pass
 
-        conn.close()
     except Exception as exc:
         logging.warning(f"Failed to parse {proto}.db ({db_path}): {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _merge_nxc_results(stdout_data: dict | None, db_data: dict | None) -> dict:
@@ -3213,7 +3283,7 @@ Return your response in markdown using exactly these sections in this order:
                 services.append(svc["name"])
             if svc.get("product"):
                 services.append(svc["product"])
-    rag_context = _get_rag_context(_build_rag_query_from_services(services), top_k=5)
+    rag_context = _get_rag_context(_build_rag_query_from_services(services))
 
     rag_section = f"\n\n{rag_context}" if rag_context else ""
     prompt = f"{instructions}{rag_section}\n\nNmap Scan Summary\n=================\n{chr(10).join(lines)}\n\n{output_format}"
@@ -4213,8 +4283,10 @@ def ollama_chat(
             if effective_system:
                 full_prompt = effective_system + "\n\n"
             full_prompt += prompt
+            # /api/generate takes sampling params under "options", not at the
+            # top level -- passing it flat silently discarded --temperature.
             payload_gen = {"model": model, "prompt": full_prompt,
-                           "stream": False, "temperature": temperature}
+                           "stream": False, "options": {"temperature": temperature}}
             spinner2 = _Spinner("Querying Ollama (fallback)")
             spinner2.start()
             r2 = requests.post(url_gen, json=payload_gen, timeout=300)
@@ -4243,16 +4315,6 @@ def ollama_embed(base_url: str, model: str, text: str) -> list[float]:
     r = requests.post(url, json=payload, timeout=120)
     r.raise_for_status()
     return r.json()["embedding"]
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two vectors. Pure Python."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _rag_db_path() -> Path:
@@ -4293,11 +4355,6 @@ def _init_rag_db(db_path: Path) -> sqlite3.Connection:
 def _encode_embedding_f16(vec: list[float]) -> bytes:
     """Pack a float vector as float16 BLOB for SQLite storage."""
     return struct.pack(f"{len(vec)}e", *vec)
-
-
-def _decode_embedding_f16(blob: bytes, dim: int) -> list[float]:
-    """Unpack a float16 BLOB back to a float vector."""
-    return list(struct.unpack(f"{dim}e", blob))
 
 
 def _finalize_rag_db(conn: sqlite3.Connection, embedding_model: str, embedding_dim: int) -> dict:
@@ -4859,9 +4916,12 @@ def _build_rag_query_from_services(services: list[str], extra: str = "") -> str:
     return query[:500]
 
 
-def _get_rag_context(query_text: str, top_k: int = 5) -> str:
+def _get_rag_context(query_text: str, top_k: int | None = None) -> str:
     """Get formatted RAG context for a prompt. Returns empty string if unavailable."""
     global _RAG_INDEX, _RAG_BUILDER
+
+    if top_k is None:
+        top_k = _RAG_MAX_CHUNKS
 
     if _RAG_BUILDER is not None:
         idx = _RAG_BUILDER.get_index_nowait()
@@ -4947,7 +5007,14 @@ def validate_ai_output(
                 source_ips.add(target["ip"])
             if target.get("hostname"):
                 source_hostnames.add(target["hostname"].lower().rstrip("."))
-            for nmap_scan in target.get("nmap_scans", []):
+            # AutoRecon target records carry nmap_xml_files (paths), not parsed
+            # scans; parse them so nmap-discovered ports count as source truth.
+            for xml_file in target.get("nmap_xml_files", []):
+                try:
+                    nmap_scan = parse_nmap_xml(Path(xml_file))
+                except Exception as exc:
+                    logging.debug(f"Validator: cannot parse {xml_file}: {exc}")
+                    continue
                 for h in nmap_scan.get("hosts", []):
                     for hn in h.get("hostnames", []):
                         if hn.get("name"):
@@ -5349,6 +5416,60 @@ HOST CONTEXT:
     return prompt
 
 
+def _find_section_bounds(lines: list[str], header: str) -> tuple[int, int] | None:
+    """Locate a ``## `` section's content as (start, end) line indices, end exclusive.
+
+    Fenced code blocks are respected, so a ``## `` line inside a fence does not
+    end the section. Returns None when the header is absent.
+    """
+    target = header.strip()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == target:
+            start = i + 1
+            break
+    if start is None:
+        return None
+
+    in_fence = False
+    for j in range(start, len(lines)):
+        stripped = lines[j].lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and lines[j].startswith("## "):
+            return start, j
+    return start, len(lines)
+
+
+def _set_body_section(text: str, header: str, content: str, *, append: bool = False) -> str:
+    """Replace (or append to) a ``## `` section's body, creating it if absent.
+
+    Works on line indices rather than rebuilding the old section as a string for
+    str.replace / re.sub. That matters twice over: incidental whitespace (a blank
+    line after the header) can no longer turn the write into a silent no-op, and
+    LLM output containing backslashes is inserted verbatim instead of being
+    parsed as a regex replacement template.
+    """
+    lines = text.splitlines()
+    bounds = _find_section_bounds(lines, header)
+
+    if bounds is None:
+        block = [header, "", *content.splitlines(), ""]
+        for anchor in ["## Scan References", OPERATOR_NOTES_SENTINEL]:
+            idx = next((i for i, l in enumerate(lines) if l.strip() == anchor), None)
+            if idx is not None:
+                lines[idx:idx] = block
+                return "\n".join(lines)
+        return text.rstrip("\n") + "\n\n" + "\n".join(block[:-1]) + "\n"
+
+    start, end = bounds
+    existing = "\n".join(lines[start:end]).strip()
+    new_body = f"{existing}\n\n{content}" if (append and existing) else content
+    lines[start:end] = ["", *new_body.splitlines(), ""]
+    return "\n".join(lines)
+
+
 def _get_file_write_lock(path: Path) -> threading.Lock:
     """Return a per-file lock to prevent concurrent writes to the same host note."""
     key = str(path)
@@ -5467,38 +5588,21 @@ def _write_deep_dive_result(host_path: Path, topic: str, analysis: str) -> None:
     """Mark the checkbox as done and append the result to the ## Analysis section."""
     text = host_path.read_text(encoding="utf-8")
 
-    # Mark the checkbox as investigated: [x] → [/] (green in CSS)
-    escaped_topic = re.escape(topic)
+    # Mark the checkbox as investigated: [x] -> [/] (green in CSS).
+    # A callable replacement keeps any backslash in *topic* literal.
     text = re.sub(
-        rf"^(\s*)- \[x\] Investigate: {escaped_topic}$",
-        rf"\1- [/] Investigate: {topic}",
+        rf"^(\s*)- \[x\] Investigate: {re.escape(topic)}$",
+        lambda m: f"{m.group(1)}- [/] Investigate: {topic}",
         text,
         flags=re.MULTILINE,
     )
 
-    # Build the callout block
-    callout_lines = [
-        f"> [!info]- Analysis: {topic}",
-    ]
-    for line in analysis.strip().splitlines():
-        callout_lines.append(f"> {line}")
-    callout_block = "\n".join(callout_lines)
+    callout_lines = [f"> [!info]- Analysis: {topic}"]
+    callout_lines += [f"> {line}" for line in analysis.strip().splitlines()]
 
-    # Insert into ## Analysis section, or create it
-    if DEEP_DIVE_SECTION in text:
-        section_content = extract_body_section(text, DEEP_DIVE_SECTION)
-        old_section = f"{DEEP_DIVE_SECTION}\n{section_content}" if section_content else DEEP_DIVE_SECTION
-        new_section = f"{old_section}\n\n{callout_block}" if section_content else f"{DEEP_DIVE_SECTION}\n{callout_block}"
-        text = text.replace(old_section, new_section, 1)
-    else:
-        # Insert before Scan References or Operator Notes
-        for marker in ["## Scan References", OPERATOR_NOTES_SENTINEL]:
-            if marker in text:
-                text = text.replace(marker, f"{DEEP_DIVE_SECTION}\n{callout_block}\n\n{marker}", 1)
-                break
-        else:
-            text += f"\n\n{DEEP_DIVE_SECTION}\n{callout_block}"
-
+    text = _set_body_section(
+        text, DEEP_DIVE_SECTION, "\n".join(callout_lines), append=True
+    )
     _atomic_write_text(host_path, text)
     logging.info(f"[Analysis] Wrote result for: {topic}")
 
@@ -5584,22 +5688,9 @@ def build_cross_source_prompt(
 
 
 def _write_cross_source_result(host_path: Path, analysis: str) -> None:
-    """Write/replace the ## Cross-Source Analysis section in a host note."""
+    """Write/replace the cross-source synthesis section in a host note."""
     text = host_path.read_text(encoding="utf-8")
-    new_section = f"{CROSS_SOURCE_SECTION}\n\n{analysis.strip()}"
-    pattern = re.escape(CROSS_SOURCE_SECTION) + r"\n.*?(?=\n## |\Z)"
-
-    if re.search(pattern, text, re.DOTALL):
-        text = re.sub(pattern, new_section, text, count=1, flags=re.DOTALL)
-    else:
-        for anchor in ["## Scan References", OPERATOR_NOTES_SENTINEL]:
-            idx = text.find(f"\n{anchor}")
-            if idx != -1:
-                text = text[:idx] + f"\n\n{new_section}" + text[idx:]
-                break
-        else:
-            text += f"\n\n{new_section}"
-
+    text = _set_body_section(text, CROSS_SOURCE_SECTION, analysis.strip())
     _atomic_write_text(host_path, text)
     logging.info(f"[DeepDive] Wrote deep dive for: {host_path.stem}")
 
@@ -5662,8 +5753,6 @@ def _run_cross_source_deepdive(
 
     if workers > 1:
         print(f"  [*] Cross-source: {len(work_items)} hosts with {workers} parallel workers...")
-
-    processed_count = threading.local()
 
     def _run_one_cross(item: tuple) -> bool:
         host_path, ip, hostnames, prompt = item
@@ -5750,13 +5839,13 @@ def _update_scan_note_analysis(
     label: str,
     warnings: list[str] | None = None,
 ) -> None:
-    """Replace ## Analysis content in a scan note and mark [x] Analyze → [/]."""
+    """Replace ## Analysis content in a scan note and mark [x] Analyze -> [/]."""
     text = scan_path.read_text(encoding="utf-8")
 
-    escaped_label = re.escape(label)
+    # Callable replacement keeps any backslash in *label* literal.
     text = re.sub(
-        rf"^(\s*)- \[x\] Analyze: {escaped_label}$",
-        rf"\1- [/] Analyze: {label}",
+        rf"^(\s*)- \[x\] Analyze: {re.escape(label)}$",
+        lambda m: f"{m.group(1)}- [/] Analyze: {label}",
         text,
         flags=re.MULTILINE,
     )
@@ -5775,13 +5864,13 @@ def _update_scan_note_analysis(
     else:
         section_header = "## Analysis"
 
-    new_section = f"{section_header}\n\nModel: `{model_name}`\n\n{analysis}"
+    text = _set_body_section(
+        text, section_header, f"Model: `{model_name}`\n\n{analysis}"
+    )
     if warnings:
-        new_section += "\n\n## Validation Warnings\n\n"
-        new_section += "\n".join(f"- {w}" for w in warnings)
-
-    pattern = re.escape(section_header) + r"\n.*?(?=\n## |\Z)"
-    text = re.sub(pattern, new_section, text, count=1, flags=re.DOTALL)
+        text = _set_body_section(
+            text, "## Validation Warnings", "\n".join(f"- {w}" for w in warnings)
+        )
 
     _atomic_write_text(scan_path, text)
     logging.info(f"[Analyze] Wrote analysis for: {label} in {scan_path.name}")
@@ -5886,7 +5975,21 @@ def _reparse_and_analyze_scan(
         targets = ar_data.get("targets", [])
         if not targets:
             return False
-        target = targets[0]
+        # The scan note is per-target ("<target> - AutoRecon"), so pick the
+        # matching target rather than assuming the first one.
+        note_target = scan_path.stem
+        if note_target.endswith(" - AutoRecon"):
+            note_target = note_target[: -len(" - AutoRecon")]
+        target = next(
+            (t for t in targets
+             if safe_filename(t.get("target", "")) == note_target),
+            None,
+        )
+        if target is None:
+            logging.warning(
+                f"[Analyze] No AutoRecon target matching scan note: {note_target}"
+            )
+            return False
         facts = None
         try:
             fact_prompt = _build_autorecon_fact_extraction_prompt(
@@ -6351,10 +6454,7 @@ def _write_host_note(
         "tags":      merged_tags,
         "sources":   merged_sources,
     }
-    if "nessus_max_severity" in existing_fm:
-        fm["nessus_max_severity"] = existing_fm["nessus_max_severity"]
-    if "autorecon_tools_run" in existing_fm:
-        fm["autorecon_tools_run"] = existing_fm["autorecon_tools_run"]
+    _carry_forward_fm(fm, existing_fm)
 
     # Build body
     lines: list[str] = [f"**State:** {host['state']}"]
@@ -6568,6 +6668,7 @@ def _update_host_note_nessus(
         "sources":             existing_sources,
         "nessus_max_severity": merged_max_sev,
     }
+    _carry_forward_fm(fm, existing_fm)
 
     # Build body
     preamble = "\n".join(existing_preamble_lines).rstrip()
@@ -6788,8 +6889,7 @@ def _update_host_note_burp(
         "tags":      existing_fm.get("tags", []),
         "sources":   existing_sources,
     }
-    if "nessus_max_severity" in existing_fm:
-        fm["nessus_max_severity"] = existing_fm["nessus_max_severity"]
+    _carry_forward_fm(fm, existing_fm)
 
     preamble = "\n".join(existing_preamble_lines).rstrip()
     lines: list[str] = []
@@ -7168,6 +7268,7 @@ def _update_host_note_autorecon(
         "nessus_max_severity": existing_fm.get("nessus_max_severity", 0),
         "autorecon_tools_run": target_data.get("summary", {}).get("total_tools_run", 0),
     }
+    _carry_forward_fm(fm, existing_fm)
 
     # Build body
     preamble = "\n".join(existing_preamble_lines).rstrip()
@@ -7671,7 +7772,9 @@ def _interpret_credential_operator_notes(
     return len(updates)
 
 
-_CRED_TABLE_ROW_RE = re.compile(r"^\|(.+)\|$")
+# Loose 'is this line a table row at all?' test. Deliberately distinct from
+# _CRED_TABLE_ROW_RE above, which captures the six credential columns.
+_CRED_TABLE_ANY_ROW_RE = re.compile(r"^\|(.+)\|$")
 _CRED_HEADER_NAMES = {"username", "password", "hash", "hash type", "source", "notes"}
 
 
@@ -7683,8 +7786,8 @@ def _reattribute_campaign_credentials_by_notes(
     """Move Campaign-Level credential rows to the correct host section when
     the Notes column contains a known host identifier.
 
-    Handles both short notes ('Dante-WS01') and prose notes
-    ('from the SMB share on dante-ws01 with guest read').
+    Handles both short notes ('Corp-WS01') and prose notes
+    ('from the SMB share on corp-ws01 with guest read').
 
     Returns number of rows moved.
     """
@@ -7712,7 +7815,7 @@ def _reattribute_campaign_credentials_by_notes(
     rows_to_move: list[tuple[int, str, str]] = []  # (line_idx, raw_line, target_host_key)
     for i in range(camp_start, camp_end):
         line = file_lines[i]
-        if not _CRED_TABLE_ROW_RE.match(line.strip()):
+        if not _CRED_TABLE_ANY_ROW_RE.match(line.strip()):
             continue
         cols = [c.strip() for c in line.split("|")[1:-1]]
         if len(cols) < 6:
@@ -7777,7 +7880,7 @@ def _reattribute_campaign_credentials_by_notes(
                 stripped = new_lines[i].strip()
                 if stripped.startswith("## ") or stripped == _CRED_NOTES_SENTINEL:
                     break
-                if _CRED_TABLE_ROW_RE.match(stripped):
+                if _CRED_TABLE_ANY_ROW_RE.match(stripped):
                     last_table_row = i
             insert_at = last_table_row + 1
             for row in reversed(cred_rows):
@@ -8215,8 +8318,7 @@ def _update_host_note_loot(
         "loot_credential_count": sum(len(lf.get("credentials", [])) for lf in loot_files),
         "loot_hash_count":       sum(len(lf.get("hashes", [])) for lf in loot_files),
     }
-    if "autorecon_tools_run" in existing_fm:
-        fm["autorecon_tools_run"] = existing_fm["autorecon_tools_run"]
+    _carry_forward_fm(fm, existing_fm)
 
     preamble = "\n".join(existing_preamble_lines).rstrip()
     body_lines: list[str] = []
@@ -9056,9 +9158,7 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
     }
     if domain and not existing_fm.get("domain"):
         fm["domain"] = domain
-    for k in ("autorecon_tools_run", "loot_file_count", "loot_credential_count", "loot_hash_count"):
-        if k in existing_fm:
-            fm[k] = existing_fm[k]
+    _carry_forward_fm(fm, existing_fm)
 
     # Build ## NXC Enumeration section content
     nxc_lines: list[str] = [
@@ -9399,10 +9499,10 @@ def parse_kiwi_secretsdump(text: str, host: str = "") -> dict:
 
     # ── Format 3: kiwi lsa_dump_sam (meterpreter)  RID / User / Hash NTLM ──
     # Block structure:
-    #   Domain : DANTE-WS03
+    #   Domain : CORP-WS03
     #   RID  : 000001f4 (500)
     #   User : Administrator
-    #     Hash NTLM: c55ed3c3d34c4576bcd33c76420be934
+    #     Hash NTLM: <32 hex chars>
     if KIWI_HASH_LINE_RE.search(text):
         _rid_re    = re.compile(r"^\s*RID\s*:\s*[0-9a-fA-F]+\s*\(\d+\)", re.IGNORECASE)
         _user_re   = re.compile(r"^\s*User\s*:\s*(\S+)", re.IGNORECASE)
@@ -12924,7 +13024,7 @@ def _snapshot_scan_files(base: Path, args) -> dict[str, float]:
     return files
 
 
-def _init_scan_dirs(base: Path) -> None:
+def _init_scan_dirs(base: Path, vault_dir: Path) -> None:
     """Create the scans/ directory tree with empty subdirectories for each parser."""
     base.mkdir(parents=True, exist_ok=True)
     for sub in _SCAN_SUBDIRS:
@@ -12940,7 +13040,7 @@ def _init_scan_dirs(base: Path) -> None:
     print(f"      {base / 'loot/'}          — Loot (credentials, hashes, keys, sensitive files)")
     print(f"      {base / 'misc/'}          — Miscellaneous tool output (text files)")
     print(f"      {base / 'nxc/'}           — NetExec workspace DBs (smb.db, ldap.db, etc.)")
-    vault_init = Path(args.vault).resolve()
+    vault_init = Path(vault_dir).resolve()
     _install_assessment_config(vault_init)
     print(f"\n  Vault: {vault_init}/")
     print(f"    {vault_init / _ASSESSMENT_CONFIG_FILENAME}")
@@ -13343,7 +13443,7 @@ def _watch_loop(args, base: Path) -> None:
     print()
 
     if not base.exists():
-        _init_scan_dirs(base)
+        _init_scan_dirs(base, vault_dir)
 
     # Load operator notes for deep dive context
     operator_notes_lookup: dict[str, str] = {}
@@ -13777,7 +13877,7 @@ def _watch_loop(args, base: Path) -> None:
                 question = user_input[5:].strip()
                 if not question:
                     print("  Usage: /chat <question>")
-                    print("  Example: /chat what ports are open on DANTE-WS03?")
+                    print("  Example: /chat what ports are open on CORP-WS03?")
                 elif args.no_ollama:
                     print("  LLM is disabled (--no-ollama).")
                 else:
@@ -13887,7 +13987,8 @@ embedding_model = nomic-embed-text
 # Maximum reference chunks injected per analysis
 max_chunks = 5
 
-# Auto-build index on first run if missing (false = explicit --build-index only)
+# Prompt to build/update the index at startup when docs have changed.
+# false = never prompt, use --build-index explicitly (same as --no-auto-build).
 auto_build = true
 """
 
@@ -13922,7 +14023,6 @@ def _load_config() -> dict:
         ("parsers", "no_loot"):            ("no_loot",            bool),
         ("parsers", "no_misc"):            ("no_misc",            bool),
         ("parsers", "no_nxc"):             ("no_nxc",             bool),
-        ("parsers", "no_excel"):           ("no_excel",           bool),
         ("parsers", "skip_validation"):    ("skip_validation",    bool),
         ("nxc",     "nxc_workspace"):      ("nxc_workspace",      str),
         ("rag", "docs_dir"):               ("rag_docs_dir",       str),
@@ -13953,7 +14053,22 @@ def _load_config() -> dict:
 # Main
 # ============================================================
 
+def _force_utf8_stdio() -> None:
+    """Make stdout/stderr UTF-8 safe.
+
+    Windows consoles default to a legacy codepage (cp1252) that cannot encode
+    the arrows and box-drawing characters used throughout the CLI output, so
+    redirecting output to a file raised UnicodeEncodeError mid-run.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main() -> None:
+    _force_utf8_stdio()
     config_defaults = _load_config()
 
     ap = argparse.ArgumentParser(
@@ -14055,6 +14170,12 @@ def main() -> None:
     ap.add_argument("--rag-hacktricks-dir",
                     default=config_defaults.get("rag_hacktricks_dir", "docs/hacktricks"),
                     metavar="DIR", help="Directory containing HackTricks markdown clone (default: docs/hacktricks)")
+    ap.add_argument("--rag-max-chunks", type=int, metavar="N",
+                    default=config_defaults.get("rag_max_chunks", RAG_DEFAULT_MAX_CHUNKS),
+                    help=f"Reference chunks injected per prompt (default: {RAG_DEFAULT_MAX_CHUNKS})")
+    ap.add_argument("--no-auto-build", dest="rag_auto_build", action="store_false",
+                    default=config_defaults.get("rag_auto_build", True),
+                    help="Never prompt to build the RAG index at startup")
     ap.add_argument("--rag-embedding-model",
                     default=config_defaults.get("rag_embedding_model", RAG_DEFAULT_EMBEDDING_MODEL),
                     help=f"Ollama embedding model (default: {RAG_DEFAULT_EMBEDDING_MODEL})")
@@ -14076,7 +14197,7 @@ def main() -> None:
 
     # --init: create directory structure and config file, then exit
     if args.init:
-        _init_scan_dirs(base)
+        _init_scan_dirs(base, Path(args.vault))
         # Create docs/ directory for RAG reference books
         docs_path = Path(args.rag_docs_dir).resolve() if args.rag_docs_dir else base.parent / "docs"
         docs_path.mkdir(parents=True, exist_ok=True)
@@ -14148,7 +14269,7 @@ def main() -> None:
     # Auto-initialize when scans/ doesn't exist (unless --xml points to a specific file)
     if not base.exists() and not args.xml:
         logging.info(f"Scan directory not found: {base}")
-        _init_scan_dirs(base)
+        _init_scan_dirs(base, Path(args.vault))
         return
 
     # Ensure all subdirectories exist even if scans/ was partially created
@@ -14297,7 +14418,7 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     _load_assessment_config(vault_dir)
     _migrate_host_note_sections(vault_dir)
 
-    # Merge duplicate host notes before processing (e.g., 10.10.110.4.md + dante-web-nix01.md)
+    # Merge duplicate host notes before processing (e.g., 10.10.10.4.md + corp-web-nix01.md)
     merge_reports = _detect_and_merge_host_notes(vault_dir)
     for msg in merge_reports:
         logging.info(f"[Merge] {msg}")
@@ -14326,8 +14447,10 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     # RAG — load or build index                                            #
     # ------------------------------------------------------------------ #
     global _RAG_INDEX, _RAG_BUILDER, _RAG_OLLAMA_URL, _RAG_EMBEDDING_MODEL
+    global _RAG_MAX_CHUNKS
     _RAG_OLLAMA_URL = args.ollama_url
     _RAG_EMBEDDING_MODEL = getattr(args, "rag_embedding_model", RAG_DEFAULT_EMBEDDING_MODEL)
+    _RAG_MAX_CHUNKS = getattr(args, "rag_max_chunks", RAG_DEFAULT_MAX_CHUNKS)
 
     rag_enabled = (
         not getattr(args, "no_rag", False)
@@ -14353,7 +14476,12 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         new_mds = [m for m in all_mds if str(m) not in indexed_mtimes or m.stat().st_mtime != indexed_mtimes[str(m)]]
         new_count = len(new_pdfs) + len(new_mds)
 
-        if new_count > 0:
+        if new_count > 0 and not getattr(args, "rag_auto_build", True):
+            logging.info(
+                f"RAG: {new_count} new/changed source file(s); auto_build is off, "
+                "run --build-index when ready"
+            )
+        elif new_count > 0:
             parts = []
             if new_pdfs:
                 parts.append(f"{len(new_pdfs)} PDFs")
