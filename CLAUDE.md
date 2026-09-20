@@ -299,7 +299,20 @@ Nessus and AutoRecon use **two-pass analysis**: Pass 1 extracts facts, Pass 2 an
 - Obsidian internal links use `[[Hosts/<stem>|display]]` syntax — no `.md` extension.
 - Canvas file node paths are relative to the vault root, forward slashes only.
 - Ollama called with `stream: false`; response in `response.json()["response"]`.
-- **Versioning**: the file is `mAIpper.py` (no version suffix). Increment the version string in the module docstring header, then create a git tag (`git tag vX.Y && git push origin vX.Y`).
+- **Versioning**: the file is `mAIpper.py` (no version suffix). `__version__` near the top is
+  the single source of truth; `--version`, `--help` and the interactive header all read it.
+  Bump `__version__` **and** the module docstring header together — `tests/test_version.py`
+  fails if they drift, if a hardcoded `mAIpper vX.Y` string goes stale (this happened: `--help`
+  sat at v0.13 for two releases), or if CHANGELOG.md has no section for the current version.
+
+  **Release checklist:**
+  1. Bump `__version__` and the docstring header.
+  2. Add a `## vX.Y` section to `CHANGELOG.md`.
+  3. `python tests/test_note_writing.py && python tests/test_version.py` — both must pass.
+  4. Commit, then `git tag -a vX.Y -m "..."` and `git push origin main && git push origin vX.Y`.
+
+  Tag every release, even small ones. Tags are what make "this worked, that broke" recoverable:
+  `git checkout vX.Y` returns the tool to exactly that release.
 - Host association (loot and misc): subdirectory name > filename IP prefix > filename FQDN prefix > campaign-level.
 - `--init` creates all scan subdirectories + `maipper.conf`; partial directories auto-completed on every run.
 - **Example data must be generic.** Never use hostnames, subnets, domains or hashes from a
@@ -412,8 +425,12 @@ and host-level frontmatter preservation across all six writers.
 
 ```bash
 python tests/test_note_writing.py      # standalone, no dependencies
-pytest tests/test_note_writing.py      # if pytest is installed
+python tests/test_version.py           # version/CHANGELOG consistency
+pytest tests/                          # if pytest is installed
 ```
+
+`tests/test_version.py` keeps `__version__`, the docstring header, every hardcoded
+`mAIpper vX.Y` string, and the CHANGELOG in step.
 
 It imports `mAIpper.py` directly and writes only into `tempfile` directories, so it
 never touches a real vault. **Run it after any change to a host-note or scan-note

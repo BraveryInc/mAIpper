@@ -75,6 +75,11 @@ frontmatter fix below starts preserving fields on the next write.
   backslash-bearing LLM output, and frontmatter preservation across all writers.
   Runs standalone (`python tests/test_note_writing.py`) or under pytest; writes
   only into temp directories.
+- **`--version` flag**, and `__version__` as the single source of truth. The version
+  previously existed only as prose in a docstring, so there was no way to tell which
+  release you were running without opening the file — and the `--help` description had
+  silently drifted two releases behind (it said v0.13). `tests/test_version.py` now fails
+  if any copy of the version goes stale or the CHANGELOG lacks an entry.
 - `--rag-max-chunks N` and `--no-auto-build`. The documented `[rag] max_chunks`
   and `[rag] auto_build` config options were parsed but never reached `args`, so
   both were no-ops. They now take effect, and `--no-auto-build` suppresses the

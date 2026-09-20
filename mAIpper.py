@@ -214,6 +214,11 @@ import struct
 
 import requests
 
+# Single source of truth for the release version. Bump this and the header
+# line of the module docstring together (tests/test_version.py enforces it),
+# then tag: git tag -a vX.Y -m "..." && git push origin vX.Y
+__version__ = "0.15"
+
 try:
     import openpyxl
     from openpyxl.styles import PatternFill, Font, Alignment
@@ -13411,7 +13416,7 @@ def _watch_loop(args, base: Path) -> None:
     vault_dir.mkdir(parents=True, exist_ok=True)
     cfg = _load_assessment_config(vault_dir)
 
-    print(f"\n[*] mAIpper Interactive Mode  (Ctrl+C to exit)")
+    print(f"\n[*] mAIpper v{__version__} Interactive Mode  (Ctrl+C to exit)")
     print(f"    Scans dir : {base}")
     print(f"    Vault dir : {vault_dir}")
     print(f"    Polling   : every {interval}s")
@@ -14072,8 +14077,10 @@ def main() -> None:
     config_defaults = _load_config()
 
     ap = argparse.ArgumentParser(
-        description="mAIpper v0.13 — Pentest scan analysis and Obsidian vault generator"
+        description=f"mAIpper v{__version__} — Pentest scan analysis and Obsidian vault generator"
     )
+    ap.add_argument("--version",    action="version",
+                    version=f"mAIpper {__version__}")
     ap.add_argument("--config",     default=CONF_FILENAME,
                     help=f"Config file path (default: ./{CONF_FILENAME})")
     ap.add_argument("--init",       action="store_true",
