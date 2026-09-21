@@ -29,6 +29,17 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Diffs printed on failure can contain characters (e.g. checkmarks in the NXC
+# shares table) that a Windows console's legacy codepage cannot encode --
+# without this, a real failure's own diagnostic output crashes before it can
+# be read. Same fix as mAIpper.py's _force_utf8_stdio, applied here directly
+# since this file may run without importing mAIpper's __main__ path.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fixtures  # noqa: E402
 

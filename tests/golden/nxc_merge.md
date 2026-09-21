@@ -39,6 +39,11 @@ loot_hash_count: 2
 | SYSVOL | ✓ |  | Logon server share |
 | Data | ✓ | ✓ |  |
 
+## Access
+| User | Priv | Method |
+| --- | --- | --- |
+| adm | SYSTEM | psexec |
+
 ## Scan References
 - [[Scans/Prior - Nmap|Prior - Nmap]]
 - [[Scans/NXC - SMB|NXC - SMB]]

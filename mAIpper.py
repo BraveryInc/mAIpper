@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.16 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.17 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.16:
+  - FIX: _write_nxc_host_enrichment (the NXC host-note writer) now preserves
+    an existing ## Access section, matching the other five host-note writers.
+    This bug predated the v0.16 serializer refactor but was only discovered
+    while writing it; the refactor deliberately kept the bug (rather than
+    silently fixing it inside a "behaviour-preserving" commit) so its golden
+    diff stayed genuinely empty. This release is that one-line fix.
 
 Changes from v0.15:
   - Section-dict serializer for host notes: the six writers (_write_host_note,
@@ -245,7 +253,7 @@ import requests
 # Single source of truth for the release version. Bump this and the header
 # line of the module docstring together (tests/test_version.py enforces it),
 # then tag: git tag -a vX.Y -m "..." && git push origin vX.Y
-__version__ = "0.16"
+__version__ = "0.17"
 
 try:
     import openpyxl
@@ -8897,13 +8905,9 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
     """Create or update a host note with NXC enumeration data.
 
     Reads all existing sections, updates frontmatter with NXC metadata,
-    writes/replaces ## NXC Enumeration, and preserves everything else.
-
-    NOTE: unlike the other five writers, this one does not carry forward an
-    existing '## Access' section -- that gap predates this refactor (see
-    CLAUDE.md known gaps) and is deliberately preserved here rather than
-    silently fixed, so this change stays behaviour-identical. Fixing it is a
-    one-line follow-up: drop the "del sections[...]" line below.
+    writes/replaces ## NXC Enumeration, and preserves everything else,
+    including ## Access (fixed in v0.17 -- previously dropped; see CLAUDE.md
+    changelog).
     """
     ip = host.get("ip", "")
     if not ip:
@@ -8931,7 +8935,6 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
     state = _read_host_note_state(host_path)
     existing_fm = state["fm"]
     sections = state["sections"]
-    sections.pop("## Access", None)  # see docstring note above
 
     if host_path.exists():
         preamble = state["preamble"]

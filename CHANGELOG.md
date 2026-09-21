@@ -3,6 +3,26 @@
 Notable changes per release. Full per-version history lives in the module
 docstring at the top of `mAIpper.py`; releases are tagged `vX.Y`.
 
+## v0.17
+
+One-line bugfix release, closing the gap the v0.16 refactor found and
+deliberately left open.
+
+### Fixed
+
+- **NXC writer now preserves `## Access`.** `_write_nxc_host_enrichment` has
+  never carried forward an existing `## Access` section, unlike the other
+  five host-note writers -- a host enriched via NXC after having confirmed
+  access recorded (via `/merge`, `+access`, or manual edit) would silently
+  lose that table on the next NXC run. This bug predates v0.16; it was only
+  discovered while writing that release's section-dict serializer, which
+  deliberately kept it (rather than fixing it inside a commit whose whole
+  point was proving it changed no behaviour) so the golden-snapshot diff
+  proving the refactor safe stayed genuinely empty. This release removes the
+  one line that dropped the section. `tests/golden/nxc_merge.md` regenerated
+  and reviewed; the diff is exactly the `## Access` block appearing, nothing
+  else changed.
+
 ## v0.16
 
 Follow-up to the v0.15 audit: the roadmap item the audit itself flagged as
