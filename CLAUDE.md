@@ -308,7 +308,7 @@ Nessus and AutoRecon use **two-pass analysis**: Pass 1 extracts facts, Pass 2 an
   **Release checklist:**
   1. Bump `__version__` and the docstring header.
   2. Add a `## vX.Y` section to `CHANGELOG.md`.
-  3. `python tests/test_note_writing.py && python tests/test_version.py` — both must pass.
+  3. Run all three suites in `tests/` — all must pass.
   4. Commit, then `git tag -a vX.Y -m "..."` and `git push origin main && git push origin vX.Y`.
 
   Tag every release, even small ones. Tags are what make "this worked, that broke" recoverable:
@@ -424,13 +424,32 @@ v0.15 audit: section writes surviving whitespace drift, backslash-bearing LLM ou
 and host-level frontmatter preservation across all six writers.
 
 ```bash
-python tests/test_note_writing.py      # standalone, no dependencies
+python tests/test_note_writing.py      # behavioural guarantees
+python tests/test_writer_output.py     # golden snapshots of writer output
 python tests/test_version.py           # version/CHANGELOG consistency
 pytest tests/                          # if pytest is installed
 ```
 
-`tests/test_version.py` keeps `__version__`, the docstring header, every hardcoded
-`mAIpper vX.Y` string, and the CHANGELOG in step.
+- `tests/fixtures.py` holds the shared inputs. Both behavioural and golden tests
+  use it, so they cannot drift apart.
+- `tests/test_note_writing.py` asserts specific guarantees (sections survive
+  whitespace drift, backslashes are literal, frontmatter is carried forward).
+- `tests/test_writer_output.py` snapshots each writer's **complete** output in two
+  scenarios (fresh note, merge into a note holding every other source plus operator
+  sections). It does not assert output is *correct*, only *unchanged* — which is the
+  right check for a refactor. It catches reordering, spacing and dropped lines that
+  targeted assertions miss.
+
+  When a change is *meant* to alter writer output:
+
+  ```bash
+  python tests/test_writer_output.py --update
+  git diff tests/golden/     # this diff IS the behaviour change — review it closely
+  ```
+
+  Never regenerate snapshots to make a red test go green without reading that diff.
+- `tests/test_version.py` keeps `__version__`, the docstring header, every hardcoded
+  `mAIpper vX.Y` string, and the CHANGELOG in step.
 
 It imports `mAIpper.py` directly and writes only into `tempfile` directories, so it
 never touches a real vault. **Run it after any change to a host-note or scan-note
@@ -540,7 +559,7 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 
 | Priority | Item | Why |
 |---|---|---|
-| 1 | Single section-dict serializer for host notes (#22) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers |
+| 1 | Single section-dict serializer for host notes (#22) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers. `tests/test_writer_output.py` pins current output, so the refactor is done when that diff is empty |
 | 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing |
 | 3 | Fix ingestion gaps: nikto + nxc watching (#5, #6) | Input is silently dropped today — worst kind of bug for an evidence tool |
 | 4 | BloodHound parser + AD Canvas (#2, #20) | Required for internal assessments; pairs with Users Canvas |

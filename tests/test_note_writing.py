@@ -21,126 +21,22 @@ Run under pytest: pytest tests/test_note_writing.py
 
 from __future__ import annotations
 
-import importlib.util
+import sys
 import tempfile
 from pathlib import Path
 
-BS = chr(92)  # backslash, kept out of literals so this file stays escape-free
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fixtures  # noqa: E402
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "mAIpper.py"
+m = fixtures.load_maipper("maipper_under_test")
 
-
-def _load_maipper():
-    spec = importlib.util.spec_from_file_location("maipper_under_test", _MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+BS = fixtures.BS
+BACKSLASH_PAYLOADS = fixtures.BACKSLASH_PAYLOADS
+PRESERVED = fixtures.PRESERVED
 
 
-m = _load_maipper()
-
-
-# --------------------------------------------------------------------------
-# fixtures
-# --------------------------------------------------------------------------
-
-HOST_NOTE = """---
-ip: 10.10.10.5
-ips: ["172.16.1.100", "192.168.50.5"]
-hostnames: ["dc01.corp.local"]
-status: exploited
-tags: ["smb", "ldap"]
-sources: ["Prior - Nmap"]
-domain: CORP
-nessus_max_severity: 4
-autorecon_tools_run: 15
-loot_file_count: 3
-loot_credential_count: 7
-loot_hash_count: 2
----
-**State:** up
-**IP:** 10.10.10.5
-
-## Open Ports
-- **445/tcp** - microsoft-ds
-  - [ ] Investigate: SMB (tcp/445)
-
-## Access
-| User | Priv | Method |
-| --- | --- | --- |
-| adm | SYSTEM | psexec |
-
-## NXC Enumeration
-signing: false
-
-## Scan References
-- [[Scans/Prior - Nmap|Prior - Nmap]]
-
-## Operator Notes
-_Add your own findings, observations, and next steps below._
-
-operator wrote this
-"""
-
-NMAP_HOST = {
-    "state": "up",
-    "addresses": [{"addr": "10.10.10.5", "addrtype": "ipv4"}],
-    "hostnames": [{"name": "dc01.corp.local", "type": "PTR"}],
-    "open_ports": [
-        {
-            "protocol": "tcp",
-            "port": 445,
-            "service": {"name": "microsoft-ds", "product": "", "version": "",
-                        "extrainfo": "", "tunnel": ""},
-            "scripts": [],
-        }
-    ],
-}
-
-NESSUS_FINDING = {
-    "plugin_id": "12345", "plugin_name": "SMB Signing Disabled",
-    "severity_int": 3, "port": 445, "protocol": "tcp",
-    "description": "d", "solution": "s", "cves": [],
-    "cvss_base": "", "cvss3_base": "", "plugin_output": "",
-}
-
-BURP_ISSUE = {
-    "name": "XSS", "path": "/a", "location": "/a", "severity": "High",
-    "confidence": "Certain", "issue_detail": "d", "issue_background": "b",
-    "remediation_detail": "r", "remediation_background": "rb",
-}
-
-AUTORECON_TARGET = {
-    "target": "10.10.10.5", "ip": "10.10.10.5", "hostname": "dc01.corp.local",
-    "tool_results": {}, "commands_log": "", "manual_commands": "",
-    "nmap_xml_files": [],
-    "summary": {"total_tools_run": 9, "tools_with_findings": 0, "technologies": [],
-                "writable_shares": [], "null_session": False, "users_found": [],
-                "weak_tls": [], "community_strings": []},
-}
-
-LOOT_FILE = {
-    "filename": "c.txt", "filepath": "/x/c.txt", "size_bytes": 10,
-    "credentials": [], "hashes": [], "file_listings": [], "network_refs": [],
-    "standalone_usernames": [], "raw_preview": "", "category": "notes",
-}
-
-# LLM output that used to crash re.sub as a replacement template
-BACKSLASH_PAYLOADS = [
-    "Authenticate as DOMAIN" + BS + "Administrator.",
-    "Mount " + BS * 2 + "10.10.10.5" + BS + "C$ with smbclient.",
-    "Stage the payload in C:" + BS + "Windows" + BS + "Temp.",
-    "The pattern (a)" + BS + "1 matched twice.",
-    "Check the " + BS + "group directory.",
-]
-
-
-def _seeded_host(tmp: Path) -> tuple[Path, Path]:
-    hosts_dir = tmp / "Hosts"
-    hosts_dir.mkdir(parents=True, exist_ok=True)
-    note = hosts_dir / "10.10.10.5.md"
-    note.write_text(HOST_NOTE, encoding="utf-8")
-    return hosts_dir, note
+def _seeded_host(tmp: Path):
+    return fixtures.seed_host_note(tmp)
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +179,7 @@ def _assert_preserved(note: Path, owned: tuple[str, ...] = ()) -> None:
 def test_nmap_writer_preserves_host_frontmatter():
     with tempfile.TemporaryDirectory() as td:
         hosts_dir, note = _seeded_host(Path(td))
-        m._write_host_note(hosts_dir, NMAP_HOST, "New - Nmap", "New", "Nmap")
+        m._write_host_note(hosts_dir, fixtures.NMAP_HOST, "New - Nmap", "New", "Nmap")
         _assert_preserved(note)
 
 
@@ -291,7 +187,7 @@ def test_nessus_writer_preserves_host_frontmatter():
     with tempfile.TemporaryDirectory() as td:
         hosts_dir, note = _seeded_host(Path(td))
         m._update_host_note_nessus(
-            hosts_dir, "10.10.10.5", "dc01.corp.local", [NESSUS_FINDING], "New - Nessus"
+            hosts_dir, "10.10.10.5", "dc01.corp.local", fixtures.NESSUS_FINDINGS, "New - Nessus"
         )
         _assert_preserved(note)
 
@@ -300,7 +196,7 @@ def test_burp_writer_preserves_host_frontmatter():
     with tempfile.TemporaryDirectory() as td:
         hosts_dir, note = _seeded_host(Path(td))
         m._update_host_note_burp(
-            hosts_dir, "10.10.10.5", "http://dc01.corp.local/", [BURP_ISSUE], "New - Burp"
+            hosts_dir, "10.10.10.5", "http://dc01.corp.local/", fixtures.BURP_ISSUES, "New - Burp"
         )
         _assert_preserved(note)
 
@@ -309,7 +205,7 @@ def test_autorecon_writer_preserves_host_frontmatter():
     with tempfile.TemporaryDirectory() as td:
         hosts_dir, note = _seeded_host(Path(td))
         m._update_host_note_autorecon(
-            hosts_dir, "10.10.10.5", "dc01.corp.local", AUTORECON_TARGET, "New - AutoRecon"
+            hosts_dir, "10.10.10.5", "dc01.corp.local", fixtures.AUTORECON_TARGET, "New - AutoRecon"
         )
         _assert_preserved(note, owned=("autorecon_tools_run",))
 
@@ -318,7 +214,7 @@ def test_loot_writer_preserves_host_frontmatter():
     with tempfile.TemporaryDirectory() as td:
         hosts_dir, note = _seeded_host(Path(td))
         m._update_host_note_loot(
-            hosts_dir, "10.10.10.5", "dc01.corp.local", [LOOT_FILE], "Loot"
+            hosts_dir, "10.10.10.5", "dc01.corp.local", fixtures.LOOT_FILES, "Loot"
         )
         _assert_preserved(
             note, owned=("loot_file_count", "loot_credential_count", "loot_hash_count")
