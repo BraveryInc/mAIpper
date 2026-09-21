@@ -6374,6 +6374,90 @@ def _detect_and_merge_host_notes(vault_dir: Path) -> list[str]:
     return reports
 
 
+def _read_host_note_state(host_path: Path) -> dict:
+    """Read an existing host note into its constituent parts for merging.
+
+    Every host-note writer used to hand-list the same ~9 extract_body_section
+    calls; this is the single read side of that duplication. Returns a dict
+    with:
+      fm:             frontmatter (empty dict if the note does not exist)
+      preamble:       non-header body lines before the first '## ' heading
+      sections:       {header: content} for every header in BODY_SECTION_ORDER
+                       that has non-empty content, excluding '## Scan
+                       References' and the Operator Notes header (both are
+                       handled specially by _render_host_note_body)
+      operator_notes: extracted operator-authored text (without the hint line)
+
+    A writer overwrites the entry for the section(s) it owns before calling
+    _render_host_note_body; every other entry passes through untouched.
+    """
+    if not host_path.exists():
+        return {"fm": {}, "preamble": "", "sections": {}, "operator_notes": ""}
+
+    old_text = host_path.read_text(encoding="utf-8")
+    fm, body = read_frontmatter(old_text)
+
+    preamble_lines: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("## "):
+            break
+        preamble_lines.append(line)
+
+    sections: dict[str, str] = {}
+    for header in BODY_SECTION_ORDER:
+        if header in ("## Scan References", OPERATOR_NOTES_SENTINEL):
+            continue
+        content = extract_body_section(body, header)
+        if content:
+            sections[header] = content
+
+    return {
+        "fm": fm,
+        "preamble": "\n".join(preamble_lines).rstrip(),
+        "sections": sections,
+        "operator_notes": extract_operator_notes(body),
+    }
+
+
+def _render_host_note_body(
+    preamble: str,
+    sections: dict[str, str],
+    sources: list[str],
+    operator_notes: str,
+) -> str:
+    """Serialize preamble + sections (in BODY_SECTION_ORDER) + Scan References
+    + Operator Notes into the note body (frontmatter is written separately).
+
+    `sections` maps a BODY_SECTION_ORDER header (excluding Scan References and
+    Operator Notes) to its already-rendered content with no header line. Only
+    truthy entries are emitted -- every render function used to populate an
+    owned section already guarantees non-empty output (falling back to a
+    "_No X._" placeholder), so this reproduces the unconditional-insert-for-
+    owned / insert-if-present-for-preserved behaviour every writer used to
+    hand-code as a chain of ``if existing_X: lines += [...]``.
+    """
+    lines: list[str] = []
+    if preamble:
+        lines.append(preamble)
+
+    for header in BODY_SECTION_ORDER:
+        if header in ("## Scan References", OPERATOR_NOTES_SENTINEL):
+            continue
+        content = sections.get(header, "")
+        if content:
+            lines += ["", header, content]
+
+    lines += ["", "## Scan References"]
+    for src in sources:
+        lines.append(f"- [[Scans/{safe_filename(src)}|{src}]]")
+
+    lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
+    if operator_notes:
+        lines += ["", operator_notes]
+
+    return "\n".join(lines)
+
+
 def _write_host_note(
     hosts_dir: Path,
     host: dict,
@@ -6402,31 +6486,11 @@ def _write_host_note(
             display = host_stem
             logging.debug(f"Found existing host note by IP lookup: {host_path.name}")
 
-    existing_fm: dict  = {}
-    existing_op_notes  = ""
-    existing_nessus    = ""
-    existing_burp      = ""
-    existing_autorecon = ""
-    existing_loot      = ""
-    existing_deep_dives = ""
-    existing_cross_source = ""
-    existing_nxc       = ""
-    existing_access    = ""
-    existing_open_ports = ""
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes  = extract_operator_notes(old_body)
-        existing_open_ports = extract_body_section(old_body, "## Open Ports")
-        existing_nessus    = extract_body_section(old_body, "## Nessus Findings")
-        existing_burp      = extract_body_section(old_body, "## Burp Suite Findings")
-        existing_autorecon = extract_body_section(old_body, "## AutoRecon Enumeration")
-        existing_nxc       = extract_body_section(old_body, "## NXC Enumeration")
-        existing_loot      = extract_body_section(old_body, "## Loot")
-        existing_access    = extract_body_section(old_body, "## Access")
-        existing_deep_dives = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        existing_cross_source = extract_body_section(old_body, CROSS_SOURCE_SECTION)
         logging.debug(f"Merging Nmap host note: {host_path.name}")
     else:
         logging.debug(f"Creating Nmap host note: {host_path.name}")
@@ -6441,6 +6505,7 @@ def _write_host_note(
     merged_sources = existing_sources if scan_source in existing_sources else existing_sources + [scan_source]
 
     # Merge open ports: combine existing + new, keep richest service info per port
+    existing_open_ports = sections.get("## Open Ports", "")
     if existing_open_ports.strip():
         merged_ports, checkbox_states = _merge_port_lists(existing_open_ports, open_ports)
         # Re-derive tags from merged port set
@@ -6461,55 +6526,25 @@ def _write_host_note(
     }
     _carry_forward_fm(fm, existing_fm)
 
-    # Build body
-    lines: list[str] = [f"**State:** {host['state']}"]
+    # Preamble: Nmap always regenerates it from the current scan data rather
+    # than preserving what was there before -- the other five writers do the
+    # opposite (preserve unless the note is brand new).
+    preamble_lines: list[str] = [f"**State:** {host['state']}"]
     if primary_ip:
-        lines.append(f"**IP:** {primary_ip}")
-    lines.append(f"**Open Ports:** {len(merged_ports)}")
+        preamble_lines.append(f"**IP:** {primary_ip}")
+    preamble_lines.append(f"**Open Ports:** {len(merged_ports)}")
+    preamble = "\n".join(preamble_lines)
 
-    lines += ["", "## Open Ports"]
     if merged_ports:
         if checkbox_states:
-            lines.extend(_summarize_open_ports_merged(merged_ports, checkbox_states))
+            open_ports_content = "\n".join(_summarize_open_ports_merged(merged_ports, checkbox_states))
         else:
-            lines.extend(summarize_open_ports({"open_ports": merged_ports}))
+            open_ports_content = "\n".join(summarize_open_ports({"open_ports": merged_ports}))
     else:
-        lines.append("_No open ports detected._")
+        open_ports_content = "_No open ports detected._"
+    sections["## Open Ports"] = open_ports_content
 
-    if existing_nessus:
-        lines += ["", "## Nessus Findings", existing_nessus]
-
-    if existing_burp:
-        lines += ["", "## Burp Suite Findings", existing_burp]
-
-    if existing_autorecon:
-        lines += ["", "## AutoRecon Enumeration", existing_autorecon]
-
-    if existing_nxc:
-        lines += ["", "## NXC Enumeration", existing_nxc]
-
-    if existing_loot:
-        lines += ["", "## Loot", existing_loot]
-
-    if existing_access:
-        lines += ["", "## Access", existing_access]
-
-    if existing_deep_dives:
-        lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
-
-    if existing_cross_source:
-        lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
-
-    lines += ["", "## Scan References"]
-    for src in fm["sources"]:
-        src_stem = safe_filename(src)
-        lines.append(f"- [[Scans/{src_stem}|{src}]]")
-
-    lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        lines += ["", existing_op_notes]
-
-    body = "\n".join(lines)
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_stem
 
@@ -6610,42 +6645,21 @@ def _update_host_note_nessus(
             display = ip or hostname or "unknown-host"
         host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
 
-    existing_fm: dict = {}
-    existing_op_notes = ""
-    existing_open_ports_section = ""
-    existing_burp_section = ""
-    existing_autorecon_section = ""
-    existing_nxc_section = ""
-    existing_loot_section = ""
-    existing_access_section = ""
-    existing_deep_dives = ""
-    existing_cross_source = ""
-    existing_preamble_lines: list[str] = []
-    existing_scan_refs: list[str] = []
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes           = extract_operator_notes(old_body)
-        existing_open_ports_section = extract_body_section(old_body, "## Open Ports")
-        existing_burp_section       = extract_body_section(old_body, "## Burp Suite Findings")
-        existing_autorecon_section  = extract_body_section(old_body, "## AutoRecon Enumeration")
-        existing_nxc_section        = extract_body_section(old_body, "## NXC Enumeration")
-        existing_loot_section       = extract_body_section(old_body, "## Loot")
-        existing_access_section     = extract_body_section(old_body, "## Access")
-        existing_deep_dives         = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        existing_cross_source       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
-        for line in old_body.splitlines():
-            if line.startswith("## "):
-                break
-            existing_preamble_lines.append(line)
+        preamble = state["preamble"]
         logging.debug(f"Updating Nessus section in: {host_path.name}")
     else:
         # Minimal preamble for Nessus-only host
+        preamble_bits: list[str] = []
         if ip:
-            existing_preamble_lines.append(f"**IP:** {ip}")
+            preamble_bits.append(f"**IP:** {ip}")
         if hostname and hostname != ip:
-            existing_preamble_lines.append(f"**Hostname:** {hostname}")
+            preamble_bits.append(f"**Hostname:** {hostname}")
+        preamble = "\n".join(preamble_bits).rstrip()
         logging.debug(f"Creating Nessus-only host note: {host_path.name}")
 
     # Update frontmatter
@@ -6675,49 +6689,9 @@ def _update_host_note_nessus(
     }
     _carry_forward_fm(fm, existing_fm)
 
-    # Build body
-    preamble = "\n".join(existing_preamble_lines).rstrip()
-    lines: list[str] = []
+    sections["## Nessus Findings"] = _render_nessus_section(findings)
 
-    if preamble:
-        lines.append(preamble)
-
-    if existing_open_ports_section:
-        lines += ["", "## Open Ports", existing_open_ports_section]
-
-    lines += ["", "## Nessus Findings", _render_nessus_section(findings)]
-
-    if existing_burp_section:
-        lines += ["", "## Burp Suite Findings", existing_burp_section]
-
-    if existing_autorecon_section:
-        lines += ["", "## AutoRecon Enumeration", existing_autorecon_section]
-
-    if existing_nxc_section:
-        lines += ["", "## NXC Enumeration", existing_nxc_section]
-
-    if existing_loot_section:
-        lines += ["", "## Loot", existing_loot_section]
-
-    if existing_access_section:
-        lines += ["", "## Access", existing_access_section]
-
-    if existing_deep_dives:
-        lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
-
-    if existing_cross_source:
-        lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
-
-    lines += ["", "## Scan References"]
-    for src in fm["sources"]:
-        src_stem = safe_filename(src)
-        lines.append(f"- [[Scans/{src_stem}|{src}]]")
-
-    lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        lines += ["", existing_op_notes]
-
-    body = "\n".join(lines)
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
@@ -6836,40 +6810,20 @@ def _update_host_note_burp(
             display = ip or "unknown-host"
         host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
 
-    existing_fm: dict = {}
-    existing_op_notes = ""
-    existing_open_ports_section = ""
-    existing_nessus_section = ""
-    existing_autorecon_section = ""
-    existing_nxc_section = ""
-    existing_loot_section = ""
-    existing_access_section = ""
-    existing_deep_dives = ""
-    existing_cross_source = ""
-    existing_preamble_lines: list[str] = []
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes            = extract_operator_notes(old_body)
-        existing_open_ports_section  = extract_body_section(old_body, "## Open Ports")
-        existing_nessus_section      = extract_body_section(old_body, "## Nessus Findings")
-        existing_autorecon_section   = extract_body_section(old_body, "## AutoRecon Enumeration")
-        existing_nxc_section         = extract_body_section(old_body, "## NXC Enumeration")
-        existing_loot_section        = extract_body_section(old_body, "## Loot")
-        existing_access_section      = extract_body_section(old_body, "## Access")
-        existing_deep_dives          = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        existing_cross_source        = extract_body_section(old_body, CROSS_SOURCE_SECTION)
-        for line in old_body.splitlines():
-            if line.startswith("## "):
-                break
-            existing_preamble_lines.append(line)
+        preamble = state["preamble"]
         logging.debug(f"Updating Burp section in: {host_path.name}")
     else:
+        preamble_bits: list[str] = []
         if ip:
-            existing_preamble_lines.append(f"**IP:** {ip}")
+            preamble_bits.append(f"**IP:** {ip}")
         if url:
-            existing_preamble_lines.append(f"**URL:** {url}")
+            preamble_bits.append(f"**URL:** {url}")
+        preamble = "\n".join(preamble_bits).rstrip()
         logging.debug(f"Creating Burp-only host note: {host_path.name}")
 
     existing_sources: list = existing_fm.get("sources", [])
@@ -6896,48 +6850,9 @@ def _update_host_note_burp(
     }
     _carry_forward_fm(fm, existing_fm)
 
-    preamble = "\n".join(existing_preamble_lines).rstrip()
-    lines: list[str] = []
+    sections["## Burp Suite Findings"] = _render_burp_section(issues)
 
-    if preamble:
-        lines.append(preamble)
-
-    if existing_open_ports_section:
-        lines += ["", "## Open Ports", existing_open_ports_section]
-
-    if existing_nessus_section:
-        lines += ["", "## Nessus Findings", existing_nessus_section]
-
-    lines += ["", "## Burp Suite Findings", _render_burp_section(issues)]
-
-    if existing_autorecon_section:
-        lines += ["", "## AutoRecon Enumeration", existing_autorecon_section]
-
-    if existing_nxc_section:
-        lines += ["", "## NXC Enumeration", existing_nxc_section]
-
-    if existing_loot_section:
-        lines += ["", "## Loot", existing_loot_section]
-
-    if existing_access_section:
-        lines += ["", "## Access", existing_access_section]
-
-    if existing_deep_dives:
-        lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
-
-    if existing_cross_source:
-        lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
-
-    lines += ["", "## Scan References"]
-    for src in fm["sources"]:
-        src_stem = safe_filename(src)
-        lines.append(f"- [[Scans/{src_stem}|{src}]]")
-
-    lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        lines += ["", existing_op_notes]
-
-    body = "\n".join(lines)
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
@@ -7215,40 +7130,20 @@ def _update_host_note_autorecon(
             display = ip or hostname or "unknown-host"
         host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
 
-    existing_fm: dict = {}
-    existing_op_notes = ""
-    existing_open_ports_section = ""
-    existing_nessus_section = ""
-    existing_burp_section = ""
-    existing_nxc_section = ""
-    existing_loot = ""
-    existing_access_section = ""
-    existing_deep_dives = ""
-    existing_cross_source = ""
-    existing_preamble_lines: list[str] = []
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes           = extract_operator_notes(old_body)
-        existing_open_ports_section = extract_body_section(old_body, "## Open Ports")
-        existing_nessus_section     = extract_body_section(old_body, "## Nessus Findings")
-        existing_burp_section       = extract_body_section(old_body, "## Burp Suite Findings")
-        existing_nxc_section        = extract_body_section(old_body, "## NXC Enumeration")
-        existing_loot               = extract_body_section(old_body, "## Loot")
-        existing_access_section     = extract_body_section(old_body, "## Access")
-        existing_deep_dives         = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        existing_cross_source       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
-        for line in old_body.splitlines():
-            if line.startswith("## "):
-                break
-            existing_preamble_lines.append(line)
+        preamble = state["preamble"]
         logging.debug(f"Updating AutoRecon section in: {host_path.name}")
     else:
+        preamble_bits: list[str] = []
         if ip:
-            existing_preamble_lines.append(f"**IP:** {ip}")
+            preamble_bits.append(f"**IP:** {ip}")
         if hostname and hostname != ip:
-            existing_preamble_lines.append(f"**Hostname:** {hostname}")
+            preamble_bits.append(f"**Hostname:** {hostname}")
+        preamble = "\n".join(preamble_bits).rstrip()
         logging.debug(f"Creating AutoRecon-only host note: {host_path.name}")
 
     # Merge frontmatter
@@ -7275,49 +7170,9 @@ def _update_host_note_autorecon(
     }
     _carry_forward_fm(fm, existing_fm)
 
-    # Build body
-    preamble = "\n".join(existing_preamble_lines).rstrip()
-    body_lines: list[str] = []
+    sections["## AutoRecon Enumeration"] = _render_autorecon_section(target_data)
 
-    if preamble:
-        body_lines.append(preamble)
-
-    if existing_open_ports_section:
-        body_lines += ["", "## Open Ports", existing_open_ports_section]
-
-    if existing_nessus_section:
-        body_lines += ["", "## Nessus Findings", existing_nessus_section]
-
-    if existing_burp_section:
-        body_lines += ["", "## Burp Suite Findings", existing_burp_section]
-
-    body_lines += ["", "## AutoRecon Enumeration", _render_autorecon_section(target_data)]
-
-    if existing_nxc_section:
-        body_lines += ["", "## NXC Enumeration", existing_nxc_section]
-
-    if existing_loot:
-        body_lines += ["", "## Loot", existing_loot]
-
-    if existing_access_section:
-        body_lines += ["", "## Access", existing_access_section]
-
-    if existing_deep_dives:
-        body_lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
-
-    if existing_cross_source:
-        body_lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
-
-    body_lines += ["", "## Scan References"]
-    for src in fm["sources"]:
-        src_stem = safe_filename(src)
-        body_lines.append(f"- [[Scans/{src_stem}|{src}]]")
-
-    body_lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        body_lines += ["", existing_op_notes]
-
-    body = "\n".join(body_lines)
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
@@ -8262,42 +8117,20 @@ def _update_host_note_loot(
             display = ip or hostname or "unknown-host"
         host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
 
-    existing_fm: dict = {}
-    existing_op_notes = ""
-    existing_open_ports = ""
-    existing_nessus = ""
-    existing_burp = ""
-    existing_autorecon = ""
-    existing_nxc       = ""
-    existing_loot = ""
-    existing_access    = ""
-    existing_deep_dives = ""
-    existing_cross_source = ""
-    existing_preamble_lines: list[str] = []
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes  = extract_operator_notes(old_body)
-        existing_open_ports = extract_body_section(old_body, "## Open Ports")
-        existing_nessus    = extract_body_section(old_body, "## Nessus Findings")
-        existing_burp      = extract_body_section(old_body, "## Burp Suite Findings")
-        existing_autorecon = extract_body_section(old_body, "## AutoRecon Enumeration")
-        existing_nxc       = extract_body_section(old_body, "## NXC Enumeration")
-        existing_loot      = extract_body_section(old_body, "## Loot")
-        existing_access    = extract_body_section(old_body, "## Access")
-        existing_deep_dives = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        existing_cross_source = extract_body_section(old_body, CROSS_SOURCE_SECTION)
-        for line in old_body.splitlines():
-            if line.startswith("## "):
-                break
-            existing_preamble_lines.append(line)
+        preamble = state["preamble"]
         logging.debug(f"Updating Loot section in: {host_path.name}")
     else:
+        preamble_bits: list[str] = []
         if ip:
-            existing_preamble_lines.append(f"**IP:** {ip}")
+            preamble_bits.append(f"**IP:** {ip}")
         if hostname and hostname != ip:
-            existing_preamble_lines.append(f"**Hostname:** {hostname}")
+            preamble_bits.append(f"**Hostname:** {hostname}")
+        preamble = "\n".join(preamble_bits).rstrip()
         logging.debug(f"Creating Loot-only host note: {host_path.name}")
 
     existing_hostnames: list = existing_fm.get("hostnames", [])
@@ -8325,43 +8158,9 @@ def _update_host_note_loot(
     }
     _carry_forward_fm(fm, existing_fm)
 
-    preamble = "\n".join(existing_preamble_lines).rstrip()
-    body_lines: list[str] = []
-    if preamble:
-        body_lines.append(preamble)
-    if existing_open_ports:
-        body_lines += ["", "## Open Ports", existing_open_ports]
-    if existing_nessus:
-        body_lines += ["", "## Nessus Findings", existing_nessus]
-    if existing_burp:
-        body_lines += ["", "## Burp Suite Findings", existing_burp]
-    if existing_autorecon:
-        body_lines += ["", "## AutoRecon Enumeration", existing_autorecon]
+    sections["## Loot"] = _render_loot_section_lightweight(loot_files)
 
-    if existing_nxc:
-        body_lines += ["", "## NXC Enumeration", existing_nxc]
-
-    body_lines += ["", "## Loot", _render_loot_section_lightweight(loot_files)]
-
-    if existing_access:
-        body_lines += ["", "## Access", existing_access]
-
-    if existing_deep_dives:
-        body_lines += ["", DEEP_DIVE_SECTION, existing_deep_dives]
-
-    if existing_cross_source:
-        body_lines += ["", CROSS_SOURCE_SECTION, existing_cross_source]
-
-    body_lines += ["", "## Scan References"]
-    for src in fm["sources"]:
-        src_stem = safe_filename(src)
-        body_lines.append(f"- [[Scans/{src_stem}|{src}]]")
-
-    body_lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        body_lines += ["", existing_op_notes]
-
-    body = "\n".join(body_lines)
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     return display, host_path.stem
 
@@ -9071,6 +8870,12 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
 
     Reads all existing sections, updates frontmatter with NXC metadata,
     writes/replaces ## NXC Enumeration, and preserves everything else.
+
+    NOTE: unlike the other five writers, this one does not carry forward an
+    existing '## Access' section -- that gap predates this refactor (see
+    CLAUDE.md known gaps) and is deliberately preserved here rather than
+    silently fixed, so this change stays behaviour-identical. Fixing it is a
+    one-line follow-up: drop the "del sections[...]" line below.
     """
     ip = host.get("ip", "")
     if not ip:
@@ -9095,32 +8900,18 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
         display = hostname if hostname and is_probable_fqdn(hostname) else ip
         host_path = hosts_dir / ensure_md_suffix(safe_filename(display))
 
-    # Read all existing sections
-    existing_fm: dict = {}
-    existing_op_notes = ""
-    existing_preamble_lines: list[str] = []
-    sec_open_ports = sec_nessus = sec_burp = sec_autorecon = ""
-    sec_loot = sec_deep_dive = sec_cross = ""
+    state = _read_host_note_state(host_path)
+    existing_fm = state["fm"]
+    sections = state["sections"]
+    sections.pop("## Access", None)  # see docstring note above
 
     if host_path.exists():
-        old_text = host_path.read_text(encoding="utf-8")
-        existing_fm, old_body = read_frontmatter(old_text)
-        existing_op_notes = extract_operator_notes(old_body)
-        sec_open_ports  = extract_body_section(old_body, "## Open Ports")
-        sec_nessus      = extract_body_section(old_body, "## Nessus Findings")
-        sec_burp        = extract_body_section(old_body, "## Burp Suite Findings")
-        sec_autorecon   = extract_body_section(old_body, "## AutoRecon Enumeration")
-        sec_loot        = extract_body_section(old_body, "## Loot")
-        sec_deep_dive   = extract_body_section(old_body, DEEP_DIVE_SECTION)
-        sec_cross       = extract_body_section(old_body, CROSS_SOURCE_SECTION)
-        for line in old_body.splitlines():
-            if line.startswith("## "):
-                break
-            existing_preamble_lines.append(line)
+        preamble = state["preamble"]
     else:
-        existing_preamble_lines.append(f"**IP:** {ip}")
+        preamble_bits: list[str] = [f"**IP:** {ip}"]
         if hostname and hostname != ip:
-            existing_preamble_lines.append(f"**Hostname:** {hostname}")
+            preamble_bits.append(f"**Hostname:** {hostname}")
+        preamble = "\n".join(preamble_bits).rstrip()
 
     # Update frontmatter
     existing_hostnames: list = existing_fm.get("hostnames", [])
@@ -9212,45 +9003,10 @@ def _write_nxc_host_enrichment(hosts_dir: Path, host: dict, scan_label: str) -> 
             nxc_lines.append(f"| {sh['name']} | {r} | {w} | {sh.get('remark', '')} |")
         nxc_lines.append("")
 
-    nxc_content = "\n".join(nxc_lines).rstrip()
+    sections["## NXC Enumeration"] = "\n".join(nxc_lines).rstrip()
 
-    # Rebuild body in canonical order
-    preamble = "\n".join(existing_preamble_lines).rstrip()
-    body_parts: list[str] = []
-    if preamble:
-        body_parts.append(preamble)
-
-    for sec_header, sec_content in [
-        ("## Open Ports", sec_open_ports),
-        ("## Nessus Findings", sec_nessus),
-        ("## Burp Suite Findings", sec_burp),
-        ("## AutoRecon Enumeration", sec_autorecon),
-    ]:
-        if sec_content:
-            body_parts += ["", sec_header, sec_content]
-
-    body_parts += ["", "## NXC Enumeration", nxc_content]
-
-    for sec_header, sec_content in [
-        ("## Loot", sec_loot),
-        (DEEP_DIVE_SECTION, sec_deep_dive),
-        (CROSS_SOURCE_SECTION, sec_cross),
-    ]:
-        if sec_content:
-            body_parts += ["", sec_header, sec_content]
-
-    body_parts += ["", "## Scan References"]
-    for src in fm["sources"]:
-        body_parts.append(f"- [[Scans/{safe_filename(src)}|{src}]]")
-
-    body_parts += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
-    if existing_op_notes:
-        body_parts += ["", existing_op_notes]
-
-    _atomic_write_text(
-        host_path,
-        write_frontmatter(fm) + "\n" + "\n".join(body_parts),
-    )
+    body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
+    _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
     logging.info(f"NXC: {'updated' if existing_path else 'created'} host note {host_path.name}")
     return host_path.stem
 

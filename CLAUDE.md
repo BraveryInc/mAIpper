@@ -93,7 +93,7 @@ Everything lives in `mAIpper.py`. The flow is linear:
 9. **`build_operator_notes_lookup`** — reads `## Operator Notes` from existing host notes for feedback into all prompt builders
 10. **`build_ollama_prompt` / `build_nessus_ollama_prompt` / `build_burp_ollama_prompt` / `build_autorecon_ollama_prompt` / `build_loot_ollama_prompt` / `build_misc_ollama_prompt`** — assemble structured prompts with grounding rules; Nessus and AutoRecon use two-pass (fact extraction → analysis)
 11. **`validate_ai_output`** — post-processing validator that cross-references CVEs, IPs, ports, and hostnames against source data
-12. **`create_obsidian_vault`** / **`create_nessus_vault`** / **`create_burp_vault`** / **`create_autorecon_vault`** / **`create_loot_vault`** / **`create_misc_vault`** — writes and merges host notes; `status` and `## Operator Notes` are always preserved on re-run
+12. **`create_obsidian_vault`** / **`create_nessus_vault`** / **`create_burp_vault`** / **`create_autorecon_vault`** / **`create_loot_vault`** / **`create_misc_vault`** — writes and merges host notes; `status` and `## Operator Notes` are always preserved on re-run — each of the six underlying `_write_host_note` / `_update_host_note_*` / `_write_nxc_host_enrichment` writers reads existing state via `_read_host_note_state`, overwrites only the section it owns, and re-emits the note via `_render_host_note_body` in `BODY_SECTION_ORDER`
 13. **`_process_deep_dives`** — scans host notes for checked `[x] Investigate:` checkboxes, runs focused LLM analysis, writes results as collapsible callouts, marks `[/]` when complete
 14. **`_process_analyze_requests`** — scans scan notes for checked `[x] Analyze:` checkboxes, re-parses source files, injects scan-level operator notes, runs scan-type-specific LLM analysis, updates `## Analysis` sections
 15. **`_check_all_pending_boxes`** — marks every unchecked `[ ]` investigate/analyze box as `[x]`; used by `/analyze-full`
@@ -486,6 +486,22 @@ with a runnable test before being fixed. Those tests are now `tests/test_note_wr
 - `[rag] auto_build` and `[rag] max_chunks` were parsed from config but never reached `args`, so both were documented no-ops. Now wired via `--no-auto-build` and `--rag-max-chunks`.
 - Removed dead code: `_cosine_similarity`, `_decode_embedding_f16`, an unused `threading.local()`, an unreachable `_skip_words` re-check, the unused `base64` import, the dead `no_excel` config mapping.
 
+**Section-dict serializer for host notes** — the six writers no longer hand-list
+all 11 body sections as repeated `if existing_X: lines += [...]` chains (~250 lines
+removed). `_read_host_note_state(host_path)` reads frontmatter, preamble and every
+body section into one dict; a writer overwrites the entry for the section it owns
+and calls `_render_host_note_body(...)` to re-emit everything in
+`BODY_SECTION_ORDER`. Verified behaviour-identical against
+`tests/test_writer_output.py`: all 13 golden snapshots passed with **zero diffs**
+after the rewrite.
+
+Refactoring it surfaced a real, previously undocumented bug: the NXC writer
+(`_write_nxc_host_enrichment`) has never preserved an existing `## Access` section
+on any host it touches, contradicting the v0.14 changelog's claim that "all six
+writers" preserve Access — NXC was the missed one. The refactor deliberately
+**keeps** this bug (`sections.pop("## Access", None)`, called out in the function's
+docstring) so the golden diff stayed empty; see gap #14 below for the one-line fix.
+
 **Two helpers now guard the regression classes above** — use them rather than hand-rolling section or frontmatter merges:
 
 - `_set_body_section(text, header, content, *, append=False)` / `_find_section_bounds` — index-based, fence-aware section replacement. Never depends on reconstructing the old section as an exact string, and inserts content verbatim (no regex template parsing).
@@ -528,30 +544,29 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 11. **Sequential LLM calls in the Nmap/Nessus/Burp scan-file loops** — still serial. Low priority; scan-file counts are usually small.
 12. **Finding consolidation is inverted** — dedup by plugin_id is the right default but there is no way to split findings back out or manually group unrelated ones.
 13. **Prompts are hardcoded** — no template system for engagement-specific context, custom output sections, or per-prompt temperature.
-14. **`_extract_credentials` colon-split produces false positives** — the bare `user:pass` line scan turns any `Key: Value` line into a credential (`Server: Apache` → user `Server`). Needs a context guard or a confidence field.
-
-**RAG:**
-
-15. **Investigate checkbox labels are rebuilt from the current scan's service name, desyncing them from their own deep dive results.** `_summarize_open_ports_merged` (mAIpper.py:3113) renders the label as `f"- [{cb}] Investigate: {svc_name} ({port_label})"`, where `svc_name` comes from the *new* scan. `checkbox_states` is keyed by `(protocol, port)`, so the `[x]`/`[/]` state survives a re-scan — but the label does not. A host first scanned as `smb` and later as `microsoft-ds` flips `Investigate: SMB (tcp/445)` to `Investigate: MICROSOFT-DS (tcp/445)`.
+14. **NXC writer does not preserve an existing `## Access` section.** `_write_nxc_host_enrichment` never read or carried forward `## Access`, unlike the other five host-note writers — found while refactoring the section-dict serializer and deliberately preserved (not fixed) in that refactor to keep it behaviour-neutral; see `tests/golden/nxc_merge.md`. Fix is one line: drop the `sections.pop("## Access", None)` call and regenerate the two NXC golden snapshots.
+15. **`_extract_credentials` colon-split produces false positives** — the bare `user:pass` line scan turns any `Key: Value` line into a credential (`Server: Apache` → user `Server`). Needs a context guard or a confidence field.
+16. **Investigate checkbox labels are rebuilt from the current scan's service name, desyncing them from their own deep dive results.** `_summarize_open_ports_merged` (mAIpper.py:3113) renders the label as `f"- [{cb}] Investigate: {svc_name} ({port_label})"`, where `svc_name` comes from the *new* scan. `checkbox_states` is keyed by `(protocol, port)`, so the `[x]`/`[/]` state survives a re-scan — but the label does not. A host first scanned as `smb` and later as `microsoft-ds` flips `Investigate: SMB (tcp/445)` to `Investigate: MICROSOFT-DS (tcp/445)`.
 
     Why it matters: `_write_deep_dive_result` titles its callout `Analysis: <topic>` using the label *at analysis time*, and `_scan_host_note_for_deep_dives` matches topics by exact string. After a rename the `[/]` checkbox and its `## Analysis` callout no longer share a name, and re-checking the box appends a **second** callout for the same port under the new name. Surfaced by the `nmap_merge` golden snapshot.
 
     Options: key the label off the port and keep the first-seen service name; or store the original topic in the line so renames stay traceable. Either way `tests/golden/` must be regenerated and the diff reviewed.
 
-16. **`_load_rag_matrix` caches every chunk's full text in RAM** — the `meta` list holds `text` for all chunks, but only the top-k are ever read. On a large index that is hundreds of MB of needless resident memory. Keep ids/vectors in memory and fetch text for the k hits by id.
-17. **Pure-Python retrieval fallback is brittle** — `struct.unpack(f"{dim}e", blob)` raises on any dim mismatch, where the numpy path tolerates it via `frombuffer`.
-18. **RAG index path is `Path.cwd()`** — running mAIpper from a different directory silently loses the index.
+**RAG:**
+
+17. **`_load_rag_matrix` caches every chunk's full text in RAM** — the `meta` list holds `text` for all chunks, but only the top-k are ever read. On a large index that is hundreds of MB of needless resident memory. Keep ids/vectors in memory and fetch text for the k hits by id.
+18. **Pure-Python retrieval fallback is brittle** — `struct.unpack(f"{dim}e", blob)` raises on any dim mismatch, where the numpy path tolerates it via `frombuffer`.
+19. **RAG index path is `Path.cwd()`** — running mAIpper from a different directory silently loses the index.
 
 **Missing parsers (high-value):**
 
-19. **CrackMapExec** — bulk spray / domain enumeration results.
-20. **Responder logs** — LLMNR/NBT-NS hash captures.
-21. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
-22. **Metasploit db export** — sessions, loot, modules run.
+20. **CrackMapExec** — bulk spray / domain enumeration results.
+21. **Responder logs** — LLMNR/NBT-NS hash captures.
+22. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
+23. **Metasploit db export** — sessions, loot, modules run.
 
 **Architecture / robustness:**
 
-23. **Six hand-maintained host-note writers** — `_set_body_section` and `_carry_forward_fm` now guard the two regression classes, but each writer still hand-lists all 11 body sections. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them. **The v0.15 frontmatter bug was this gap cashing out — do this before adding a 7th section.**
 24. **19 silent `except Exception: pass` handlers** — several hide real failures (e.g. loot/misc read errors). Audit and log at debug minimum.
 25. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
 26. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
@@ -559,19 +574,19 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 28. **Persistent chat history** — session chat is lost on exit.
 29. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
 30. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
-31. **Single 15k-line file** — navigable via the architecture list above, but the writer duplication (#22) is the concrete cost.
+31. **Single 15k-line file** — navigable via the architecture list above, but the six-writer body-assembly duplication was the concrete cost until the v0.15 section-dict serializer collapsed it.
 
 ### Prioritized next steps
 
 | Priority | Item | Why |
 |---|---|---|
-| 1 | Single section-dict serializer for host notes (#23) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers. `tests/test_writer_output.py` pins current output, so the refactor is done when that diff is empty |
-| 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing |
+| 1 | Fix NXC writer's `## Access` preservation bug (#14) | One-line fix, already diagnosed; close it before building post-ex tracking on top of a writer known to drop a section |
+| 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing. The section-dict serializer (v0.15) means this now touches one shared render function instead of six writers |
 | 3 | Fix ingestion gaps: nikto + nxc watching (#5, #6) | Input is silently dropped today — worst kind of bug for an evidence tool |
-| 4 | BloodHound parser + AD Canvas (#2, #21) | Required for internal assessments; pairs with Users Canvas |
+| 4 | BloodHound parser + AD Canvas (#2, #22) | Required for internal assessments; pairs with Users Canvas |
 | 5 | LLM-assisted finding drafting (`/draft-findings`) (#3) | Biggest reporting quality gap |
 | 6 | Parallelize `/analyze` + raise `--workers` default (#7, #8) | Slowest interactive path; parallelism currently ships off |
 | 7 | Evidence blocks in findings (#4) | Bridges note-taking and reporting |
-| 8 | CrackMapExec + Responder parsers (#19, #20) | Daily-driver tools, high return |
+| 8 | CrackMapExec + Responder parsers (#20, #21) | Daily-driver tools, high return |
 | 9 | `_find_host_note_by_ip` lookup cache (#9) | O(n²) file I/O; bites on large engagements |
 | 10 | Scope management (#26) | Required for client-facing deliverables |
