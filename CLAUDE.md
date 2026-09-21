@@ -532,40 +532,46 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 
 **RAG:**
 
-15. **`_load_rag_matrix` caches every chunk's full text in RAM** — the `meta` list holds `text` for all chunks, but only the top-k are ever read. On a large index that is hundreds of MB of needless resident memory. Keep ids/vectors in memory and fetch text for the k hits by id.
-16. **Pure-Python retrieval fallback is brittle** — `struct.unpack(f"{dim}e", blob)` raises on any dim mismatch, where the numpy path tolerates it via `frombuffer`.
-17. **RAG index path is `Path.cwd()`** — running mAIpper from a different directory silently loses the index.
+15. **Investigate checkbox labels are rebuilt from the current scan's service name, desyncing them from their own deep dive results.** `_summarize_open_ports_merged` (mAIpper.py:3113) renders the label as `f"- [{cb}] Investigate: {svc_name} ({port_label})"`, where `svc_name` comes from the *new* scan. `checkbox_states` is keyed by `(protocol, port)`, so the `[x]`/`[/]` state survives a re-scan — but the label does not. A host first scanned as `smb` and later as `microsoft-ds` flips `Investigate: SMB (tcp/445)` to `Investigate: MICROSOFT-DS (tcp/445)`.
+
+    Why it matters: `_write_deep_dive_result` titles its callout `Analysis: <topic>` using the label *at analysis time*, and `_scan_host_note_for_deep_dives` matches topics by exact string. After a rename the `[/]` checkbox and its `## Analysis` callout no longer share a name, and re-checking the box appends a **second** callout for the same port under the new name. Surfaced by the `nmap_merge` golden snapshot.
+
+    Options: key the label off the port and keep the first-seen service name; or store the original topic in the line so renames stay traceable. Either way `tests/golden/` must be regenerated and the diff reviewed.
+
+16. **`_load_rag_matrix` caches every chunk's full text in RAM** — the `meta` list holds `text` for all chunks, but only the top-k are ever read. On a large index that is hundreds of MB of needless resident memory. Keep ids/vectors in memory and fetch text for the k hits by id.
+17. **Pure-Python retrieval fallback is brittle** — `struct.unpack(f"{dim}e", blob)` raises on any dim mismatch, where the numpy path tolerates it via `frombuffer`.
+18. **RAG index path is `Path.cwd()`** — running mAIpper from a different directory silently loses the index.
 
 **Missing parsers (high-value):**
 
-18. **CrackMapExec** — bulk spray / domain enumeration results.
-19. **Responder logs** — LLMNR/NBT-NS hash captures.
-20. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
-21. **Metasploit db export** — sessions, loot, modules run.
+19. **CrackMapExec** — bulk spray / domain enumeration results.
+20. **Responder logs** — LLMNR/NBT-NS hash captures.
+21. **BloodHound JSON** — shortest paths to DA, kerberoastable accounts, AS-REP targets.
+22. **Metasploit db export** — sessions, loot, modules run.
 
 **Architecture / robustness:**
 
-22. **Six hand-maintained host-note writers** — `_set_body_section` and `_carry_forward_fm` now guard the two regression classes, but each writer still hand-lists all 11 body sections. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them. **The v0.15 frontmatter bug was this gap cashing out — do this before adding a 7th section.**
-23. **19 silent `except Exception: pass` handlers** — several hide real failures (e.g. loot/misc read errors). Audit and log at debug minimum.
-24. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
-25. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
-26. **Interactive analysis requires an Obsidian round-trip** — want `/analyze <host> <topic>` direct from the prompt.
-27. **Persistent chat history** — session chat is lost on exit.
-28. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
-29. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
-30. **Single 15k-line file** — navigable via the architecture list above, but the writer duplication (#22) is the concrete cost.
+23. **Six hand-maintained host-note writers** — `_set_body_section` and `_carry_forward_fm` now guard the two regression classes, but each writer still hand-lists all 11 body sections. A single section-dict serializer (read → mutate one section → re-emit in `BODY_SECTION_ORDER`) would collapse them. **The v0.15 frontmatter bug was this gap cashing out — do this before adding a 7th section.**
+24. **19 silent `except Exception: pass` handlers** — several hide real failures (e.g. loot/misc read errors). Audit and log at debug minimum.
+25. **Canvas full rebuild on every run** — slow for large assessments; blows away manual positioning (mitigated by stable node IDs).
+26. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
+27. **Interactive analysis requires an Obsidian round-trip** — want `/analyze <host> <topic>` direct from the prompt.
+28. **Persistent chat history** — session chat is lost on exit.
+29. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
+30. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
+31. **Single 15k-line file** — navigable via the architecture list above, but the writer duplication (#22) is the concrete cost.
 
 ### Prioritized next steps
 
 | Priority | Item | Why |
 |---|---|---|
-| 1 | Single section-dict serializer for host notes (#22) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers. `tests/test_writer_output.py` pins current output, so the refactor is done when that diff is empty |
+| 1 | Single section-dict serializer for host notes (#23) | v0.15 proved this gap produces silent data loss; do it **before** post-ex tracking adds a 7th section to all six writers. `tests/test_writer_output.py` pins current output, so the refactor is done when that diff is empty |
 | 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing |
 | 3 | Fix ingestion gaps: nikto + nxc watching (#5, #6) | Input is silently dropped today — worst kind of bug for an evidence tool |
-| 4 | BloodHound parser + AD Canvas (#2, #20) | Required for internal assessments; pairs with Users Canvas |
+| 4 | BloodHound parser + AD Canvas (#2, #21) | Required for internal assessments; pairs with Users Canvas |
 | 5 | LLM-assisted finding drafting (`/draft-findings`) (#3) | Biggest reporting quality gap |
 | 6 | Parallelize `/analyze` + raise `--workers` default (#7, #8) | Slowest interactive path; parallelism currently ships off |
 | 7 | Evidence blocks in findings (#4) | Bridges note-taking and reporting |
-| 8 | CrackMapExec + Responder parsers (#18, #19) | Daily-driver tools, high return |
+| 8 | CrackMapExec + Responder parsers (#19, #20) | Daily-driver tools, high return |
 | 9 | `_find_host_note_by_ip` lookup cache (#9) | O(n²) file I/O; bites on large engagements |
-| 10 | Scope management (#25) | Required for client-facing deliverables |
+| 10 | Scope management (#26) | Required for client-facing deliverables |
