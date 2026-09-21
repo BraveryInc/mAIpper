@@ -119,6 +119,7 @@ Everything lives in `mAIpper.py`. The flow is linear:
 35. **`_find_section_bounds`** / **`_set_body_section`** — index-based, fence-aware `## ` section replace/append. **Use these for any note section write.** They replaced string-reconstruction + `re.sub`, which silently no-opped on whitespace drift and crashed on backslashes in LLM output
 36. **`_carry_forward_fm`** / **`PRESERVED_FM_KEYS`** — copies host-level frontmatter (`ips`, `domain`, loot counts, severity) that a single-source writer does not own. **Call in every host-note writer** after building `fm`
 37. **`_force_utf8_stdio`** — reconfigures stdout/stderr to UTF-8 at startup so Windows legacy codepages do not crash on arrows/box-drawing output
+38. **`FileLockedError` / `_atomic_write_text`** — the replace step retries with backoff before raising this instead of a bare `PermissionError` when the destination is held open (Obsidian, AV, sync client, indexer). **Catch this specifically at every per-host/per-scan-file loop iteration** (see the 6 `create_*_vault` writers) so one locked note is skipped with a warning instead of aborting the run; batch `main()` and the interactive loop each have a last-resort catch for anything else
 
 ## Incremental Analysis
 
@@ -513,6 +514,41 @@ Also lands `tests/test_writer_output.py` (golden-output tests for all six writer
 and `tests/test_version.py` + `__version__` (see **Testing** and gap history — the
 version previously existed only as prose in this docstring, with `--help` having
 silently drifted two releases stale). Full detail in `CHANGELOG.md`.
+
+### Recently resolved (v0.18)
+
+**A note open in Obsidian no longer crashes the whole run.** Reported bug:
+`os.replace()` inside `_atomic_write_text` failed with `PermissionError`
+([WinError 5]/[WinError 32]) whenever the destination host note was held
+open without `FILE_SHARE_DELETE` (Obsidian, an antivirus scan, a search
+indexer, a sync client), and the exception was unhandled all the way up to
+`main()` — batch mode died with a traceback, and interactive mode's `while
+True` loop had the same exposure.
+
+Fix has two parts:
+- `_atomic_write_text` retries the replace step with backoff (~3.8s total)
+  before giving up, absorbing the common transient case. If still locked,
+  it raises the new `FileLockedError(OSError)` instead of a bare
+  `PermissionError`, so callers can distinguish "this file is locked" from
+  "the write is actually broken."
+- Every per-host and per-scan-file write loop (all 6 `create_*_vault`
+  writers, `_process_deep_dives`, the canvas/campaign-targets/PlexTrac/state
+  writes at the end of `_run_processing`, and the per-scan-file call sites in
+  `_run_processing` itself) now catches `FileLockedError` at the smallest
+  loop iteration available, logs a warning, and moves on — one locked host
+  note skips only that host, not the rest of the scan file or the run.
+  Nothing is marked "analyzed" for a skipped file, so it's retried
+  automatically on the next run or watch cycle. Batch mode's `main()` and
+  interactive mode's outer loop each still have a last-resort catch for
+  anything not individually wrapped, so the worst case is a clean early
+  stop with an actionable message, never a raw traceback.
+
+Verified with a synthetic test: a 3-host Nmap scan with the middle host's
+note held open (simulating Obsidian) wrote the other two hosts and the scan
+note normally, logged one warning for the locked host, and raised nothing.
+`tests/test_note_writing.py` (12/12) and `tests/test_writer_output.py`
+(13/13, zero golden diffs) both pass unchanged — this was error-handling
+only, no writer output changed.
 
 ### Recently resolved (v0.17)
 

@@ -3,6 +3,38 @@
 Notable changes per release. Full per-version history lives in the module
 docstring at the top of `mAIpper.py`; releases are tagged `vX.Y`.
 
+## v0.18
+
+Reported bug: having a host note open in Obsidian while mAIpper runs crashed
+the whole tool with an unhandled `PermissionError`.
+
+### Fixed
+
+- **A locked note file no longer crashes the run.** On Windows, another
+  process holding a file open without `FILE_SHARE_DELETE` (Obsidian
+  rendering the note, a search indexer, an antivirus scan, a sync client)
+  makes `os.replace()` fail with `PermissionError` ([WinError 5]/[WinError
+  32]) during the atomic write, even though nothing else is wrong.
+  `_atomic_write_text()` now retries the replace step with backoff (~3.8s
+  total) to ride out the common transient case, and raises a new
+  `FileLockedError` — instead of a bare `PermissionError` — if the file is
+  still locked afterward.
+- **Locked files are skipped, not fatal.** Every per-host and per-scan-file
+  write loop (Nmap, Nessus, Burp, AutoRecon, Loot, Misc, NXC, deep dives,
+  canvases, Campaign Targets, PlexTrac export, incremental state) now catches
+  `FileLockedError` at the smallest reasonable granularity — usually one host
+  note — logs a warning, and moves on. Everything else in that run still
+  gets written. Nothing is marked "analyzed" for a file whose write failed,
+  so it's picked up automatically on the next run or watch cycle; no data is
+  lost, only deferred until the file is closed.
+- **Batch mode and interactive mode both have a last-resort catch** for any
+  `FileLockedError` not individually handled above, printing an actionable
+  message ("close the file and re-run") instead of a raw traceback.
+- The small window between an editor reading the old note and mAIpper's
+  `os.replace()` landing the new one is not otherwise a risk: `os.replace`
+  is atomic on both platforms, so a reader always sees either the fully-old
+  or fully-new file, never a partial write.
+
 ## v0.17
 
 One-line bugfix release, closing the gap the v0.16 refactor found and

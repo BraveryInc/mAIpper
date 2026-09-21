@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.17 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.18 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.17:
+  - FIX: a note open in Obsidian (or briefly held by an antivirus scan, search
+    indexer, or sync client) no longer crashes the whole run. On Windows,
+    os.replace() can fail with PermissionError ([WinError 5]/[WinError 32])
+    when the destination is held open without FILE_SHARE_DELETE.
+    _atomic_write_text() now retries the replace with backoff (~3.8s total)
+    to absorb transient locks, and raises the new FileLockedError instead of
+    a bare PermissionError if the file is still locked afterward.
+  - Every per-host and per-scan-file write loop (Nmap, Nessus, Burp,
+    AutoRecon, Loot, Misc, NXC, deep dives, canvases, campaign targets,
+    PlexTrac export, incremental state) now catches FileLockedError at the
+    smallest reasonable granularity: one locked host note is skipped with a
+    warning while every other host, scan file, and vault output for the run
+    still gets written. The skipped file is picked up automatically on the
+    next run or watch cycle -- nothing is marked "analyzed" for an item whose
+    write failed, so no data is lost, only deferred.
+  - A last-resort catch at the top of both batch mode and interactive mode
+    means any FileLockedError I didn't individually wrap still prints an
+    actionable message ("close the file and re-run") instead of a raw
+    traceback ending the process.
 
 Changes from v0.16:
   - FIX: _write_nxc_host_enrichment (the NXC host-note writer) now preserves
@@ -253,7 +274,7 @@ import requests
 # Single source of truth for the release version. Bump this and the header
 # line of the module docstring together (tests/test_version.py enforces it),
 # then tag: git tag -a vX.Y -m "..." && git push origin vX.Y
-__version__ = "0.17"
+__version__ = "0.18"
 
 try:
     import openpyxl
@@ -685,12 +706,35 @@ def _carry_forward_fm(fm: dict, existing_fm: dict) -> dict:
     return fm
 
 
+class FileLockedError(OSError):
+    """Raised when *path* cannot be replaced because another process (an editor
+    such as Obsidian, a sync client, an antivirus scanner) is holding it open.
+
+    Distinct from a bare OSError/PermissionError so callers can catch it
+    specifically and skip-and-continue (the file is retried on the next run
+    or watch cycle) instead of the whole process crashing.
+    """
+
+
+_ATOMIC_REPLACE_RETRY_DELAYS = (0.1, 0.2, 0.5, 1.0, 2.0)
+
+
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """Write text to *path* atomically (temp file in same dir + os.replace).
 
     Prevents note/canvas corruption if the process is interrupted (e.g. Ctrl+C
     during an LLM call) partway through a write. os.replace is atomic on both
     POSIX and Windows when source and destination are on the same filesystem.
+
+    On Windows, another process can briefly hold *path* open without
+    FILE_SHARE_DELETE (Obsidian rendering the note, a search indexer, an
+    antivirus scan, OneDrive/Dropbox syncing it), which makes the replace fail
+    with PermissionError ([WinError 5]/[WinError 32]) even though the note
+    itself isn't being written to. That's almost always transient, so the
+    replace is retried with backoff (~3.8s total) before giving up. If the
+    file is still locked after that (e.g. actively open for editing), this
+    raises FileLockedError instead of a bare PermissionError so callers can
+    skip that one write and move on rather than crash the whole run.
     """
     path = Path(path)
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -699,7 +743,19 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        for delay in (*_ATOMIC_REPLACE_RETRY_DELAYS, None):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                if delay is None:
+                    raise FileLockedError(
+                        f"{path} is locked by another process (open in "
+                        "Obsidian, a sync client, or an antivirus scan?) — "
+                        f"gave up after {len(_ATOMIC_REPLACE_RETRY_DELAYS)} "
+                        f"retries: {exc}"
+                    ) from exc
+                time.sleep(delay)
     except Exception:
         try:
             if tmp.exists():
@@ -5603,16 +5659,25 @@ def _process_deep_dives(
                 for w in warnings:
                     with _LLM_PRINT_LOCK:
                         logging.warning(f"[Analysis Validation] {w}")
-
-            file_lock = _get_file_write_lock(host_path)
-            with file_lock:
-                _write_deep_dive_result(host_path, topic, raw)
+            result_text = raw
         except Exception as exc:
             with _LLM_PRINT_LOCK:
                 logging.warning(f"[Analysis] Failed for {topic} on {ip}: {exc}")
-            file_lock = _get_file_write_lock(host_path)
+            result_text = f"_Deep dive failed: {exc}_"
+
+        file_lock = _get_file_write_lock(host_path)
+        try:
             with file_lock:
-                _write_deep_dive_result(host_path, topic, f"_Deep dive failed: {exc}_")
+                _write_deep_dive_result(host_path, topic, result_text)
+        except FileLockedError as exc:
+            with _LLM_PRINT_LOCK:
+                logging.warning(
+                    f"[Analysis] Could not save result for {topic} on {ip} — {exc}. "
+                    "Checkbox left checked; it will be re-analyzed on the next /analyze."
+                )
+        except Exception as exc:
+            with _LLM_PRINT_LOCK:
+                logging.warning(f"[Analysis] Failed to save result for {topic} on {ip}: {exc}")
         return True
 
     if workers <= 1:
@@ -6611,9 +6676,13 @@ def create_obsidian_vault(
 
     host_entries: list[tuple[str, str]] = []
     for host in scan_data["hosts"]:
-        display, host_stem = _write_host_note(
-            hosts_dir, host, scan_stem, scan_display, tool_name
-        )
+        try:
+            display, host_stem = _write_host_note(
+                hosts_dir, host, scan_stem, scan_display, tool_name
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         host_entries.append((display, host_stem))
 
     scan_lines = [
@@ -6756,13 +6825,17 @@ def create_nessus_vault(
 
     host_entries: list[tuple[str, str]] = []
     for host in nessus_data.get("hosts", []):
-        display, host_stem = _update_host_note_nessus(
-            hosts_dir,
-            host["ip"],
-            host.get("hostname", ""),
-            host["findings"],
-            scan_source,
-        )
+        try:
+            display, host_stem = _update_host_note_nessus(
+                hosts_dir,
+                host["ip"],
+                host.get("hostname", ""),
+                host["findings"],
+                scan_source,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         host_entries.append((display, host_stem))
 
     # Build scan note
@@ -6917,13 +6990,17 @@ def create_burp_vault(
 
     host_entries: list[tuple[str, str]] = []
     for host in burp_data.get("hosts", []):
-        display, host_stem = _update_host_note_burp(
-            hosts_dir,
-            host.get("ip", ""),
-            host.get("url", ""),
-            host["issues"],
-            scan_source,
-        )
+        try:
+            display, host_stem = _update_host_note_burp(
+                hosts_dir,
+                host.get("ip", ""),
+                host.get("url", ""),
+                host["issues"],
+                scan_source,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         host_entries.append((display, host_stem))
 
     total_issues = sum(len(h["issues"]) for h in burp_data.get("hosts", []))
@@ -7237,13 +7314,17 @@ def create_autorecon_vault(
 
     host_entries: list[tuple[str, str]] = []
     for target in targets:
-        display, host_stem = _update_host_note_autorecon(
-            hosts_dir,
-            target.get("ip", ""),
-            target.get("hostname", ""),
-            target,
-            scan_source,
-        )
+        try:
+            display, host_stem = _update_host_note_autorecon(
+                hosts_dir,
+                target.get("ip", ""),
+                target.get("hostname", ""),
+                target,
+                scan_source,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         host_entries.append((display, host_stem))
 
     # Build scan note
@@ -8226,16 +8307,26 @@ def create_loot_vault(
     for host_key, loot_files in loot_data.get("host_loot", {}).items():
         ip = host_key if IPV4_RE.match(host_key) else ""
         hostname = "" if ip else host_key
-        display, host_stem = _update_host_note_loot(
-            hosts_dir, ip, hostname, loot_files, scan_source,
-        )
+        try:
+            display, host_stem = _update_host_note_loot(
+                hosts_dir, ip, hostname, loot_files, scan_source,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         host_entries.append((display, host_stem))
         host_stem_map[host_key] = host_stem
         host_display_map[host_key] = display  # prefers hostname over IP
 
     # Write centralized Loot pages
-    _write_loot_credentials_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
-    _write_loot_hashes_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
+    try:
+        _write_loot_credentials_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
+    except FileLockedError as exc:
+        logging.warning(f"Skipping Loot/Credentials.md update — {exc}")
+    try:
+        _write_loot_hashes_page(loot_dir_out, loot_data, host_stem_map, host_display_map)
+    except FileLockedError as exc:
+        logging.warning(f"Skipping Loot/Hashes.md update — {exc}")
 
     # Write Loot/Overview.md (replaces old Scans/Loot.md)
     summary = loot_data.get("summary", {})
@@ -8399,7 +8490,11 @@ def create_misc_vault(
 
         if host_key:
             lines.append(f"- **Host:** {host_key}")
-            host_stem = _add_scan_reference_to_host(hosts_dir, host_key, scan_display)
+            try:
+                host_stem = _add_scan_reference_to_host(hosts_dir, host_key, scan_display)
+            except FileLockedError as exc:
+                logging.warning(f"Skipping host note update — {exc}")
+                host_stem = None
             if host_stem:
                 host_stems.append(host_stem)
                 lines[-1] = f"- **Host:** [[Hosts/{host_stem}|{host_key}]]"
@@ -8433,7 +8528,11 @@ def create_misc_vault(
         lines.append(analysis or "_No AI analysis generated._")
 
         lines = _preserve_scan_note_operator_notes(scan_path, lines)
-        _atomic_write_text(scan_path, "\n".join(lines))
+        try:
+            _atomic_write_text(scan_path, "\n".join(lines))
+        except FileLockedError as exc:
+            logging.warning(f"Skipping misc scan note — {exc}")
+            continue
         logging.info(f"Wrote misc scan note: {scan_path.name}")
 
         results.append({
@@ -9342,17 +9441,27 @@ def create_nxc_vault(vault_dir: Path, nxc_data: dict, scan_label: str = "NXC") -
 
     host_stems: list[str] = []
     for ip, host in nxc_data.get("hosts", {}).items():
-        stem = _write_nxc_host_enrichment(hosts_dir, host, scan_label)
+        try:
+            stem = _write_nxc_host_enrichment(hosts_dir, host, scan_label)
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host note update — {exc}")
+            continue
         if stem:
             host_stems.append(stem)
 
     if nxc_data.get("creds"):
-        _write_nxc_credentials(vault_dir, nxc_data["creds"], scan_label)
+        try:
+            _write_nxc_credentials(vault_dir, nxc_data["creds"], scan_label)
+        except FileLockedError as exc:
+            logging.warning(f"Skipping NXC credentials update — {exc}")
 
     protocols = (sorted({h["protocol"].upper() for h in nxc_data["hosts"].values()})
                  if nxc_data.get("hosts") else ["SMB"])
     scan_stem = safe_filename(f"{scan_label} - {', '.join(protocols)}")
-    _write_nxc_scan_note(vault_dir, nxc_data, scan_stem, scan_label)
+    try:
+        _write_nxc_scan_note(vault_dir, nxc_data, scan_stem, scan_label)
+    except FileLockedError as exc:
+        logging.warning(f"Skipping NXC scan note — {exc}")
 
     return {"scan_stem": scan_stem, "host_stems": host_stems}
 
@@ -13698,6 +13807,9 @@ def _watch_loop(args, base: Path) -> None:
 
     except KeyboardInterrupt:
         print("\n[*] Interactive mode stopped.")
+    except FileLockedError as exc:
+        print(f"\n[!] {exc}")
+        print("[!] Close the file above and restart mAIpper -i — nothing else was lost.")
 
 
 CONF_FILENAME = "maipper.conf"
@@ -14080,7 +14192,15 @@ def main() -> None:
     if args.interactive:
         _watch_loop(args, base)
     else:
-        _run_processing(args, base)
+        try:
+            _run_processing(args, base)
+        except FileLockedError as exc:
+            logging.error(str(exc))
+            logging.error(
+                "Close the file above (in Obsidian or elsewhere) and re-run "
+                "mAIpper — everything else in this run already completed."
+            )
+            sys.exit(1)
 
 
 _VAULT_SUBDIRS = ["Hosts", "Scans", "Loot", "Findings"]
@@ -14374,15 +14494,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         else:
             logging.info("Skipping Ollama (--no-ollama)")
 
-        result = create_obsidian_vault(
-            vault_dir,
-            xml_path.stem,
-            scan_data,
-            "Nmap",
-            analysis,
-            None if (args.no_ollama or skip_llm) else args.model,
-            validation_warnings=nmap_warnings or None,
-        )
+        try:
+            result = create_obsidian_vault(
+                vault_dir,
+                xml_path.stem,
+                scan_data,
+                "Nmap",
+                analysis,
+                None if (args.no_ollama or skip_llm) else args.model,
+                validation_warnings=nmap_warnings or None,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping Nmap vault write for {xml_path.name} — {exc}")
+            continue
 
         scan_host_map[result["scan_stem"]] = result["host_stems"]
         if analysis and not args.no_ollama:
@@ -14459,15 +14583,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                     logging.warning(f"Ollama failed ({nessus_path.name}): {exc}")
                     analysis = f"_Ollama failed: {exc}_"
 
-            result = create_nessus_vault(
-                vault_dir,
-                nessus_path.stem,
-                nessus_data,
-                analysis,
-                None if (args.no_ollama or skip_llm) else args.model,
-                validation_warnings=nessus_warnings or None,
-                no_findings=getattr(args, "no_findings", False),
-            )
+            try:
+                result = create_nessus_vault(
+                    vault_dir,
+                    nessus_path.stem,
+                    nessus_data,
+                    analysis,
+                    None if (args.no_ollama or skip_llm) else args.model,
+                    validation_warnings=nessus_warnings or None,
+                    no_findings=getattr(args, "no_findings", False),
+                )
+            except FileLockedError as exc:
+                logging.warning(f"Skipping Nessus vault write for {nessus_path.name} — {exc}")
+                continue
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
             if analysis and not args.no_ollama:
@@ -14528,15 +14656,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                     logging.warning(f"Ollama failed ({burp_path.name}): {exc}")
                     analysis = f"_Ollama failed: {exc}_"
 
-            result = create_burp_vault(
-                vault_dir,
-                burp_path.stem,
-                burp_data,
-                analysis,
-                None if (args.no_ollama or skip_llm) else args.model,
-                validation_warnings=burp_warnings or None,
-                no_findings=getattr(args, "no_findings", False),
-            )
+            try:
+                result = create_burp_vault(
+                    vault_dir,
+                    burp_path.stem,
+                    burp_data,
+                    analysis,
+                    None if (args.no_ollama or skip_llm) else args.model,
+                    validation_warnings=burp_warnings or None,
+                    no_findings=getattr(args, "no_findings", False),
+                )
+            except FileLockedError as exc:
+                logging.warning(f"Skipping Burp vault write for {burp_path.name} — {exc}")
+                continue
 
             scan_host_map[result["scan_stem"]] = result["host_stems"]
             if analysis and not args.no_ollama:
@@ -14612,15 +14744,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                             logging.warning(f"Ollama failed (AutoRecon Nmap {xml_file.name}): {exc}")
                             nmap_analysis = f"_Ollama failed: {exc}_"
 
-                    result = create_obsidian_vault(
-                        vault_dir,
-                        xml_file.stem,
-                        scan_data,
-                        f"Nmap (AutoRecon {target_subdir.name})",
-                        nmap_analysis,
-                        None if (args.no_ollama or skip_llm) else args.model,
-                        validation_warnings=nmap_warnings_ar or None,
-                    )
+                    try:
+                        result = create_obsidian_vault(
+                            vault_dir,
+                            xml_file.stem,
+                            scan_data,
+                            f"Nmap (AutoRecon {target_subdir.name})",
+                            nmap_analysis,
+                            None if (args.no_ollama or skip_llm) else args.model,
+                            validation_warnings=nmap_warnings_ar or None,
+                        )
+                    except FileLockedError as exc:
+                        logging.warning(f"Skipping AutoRecon Nmap vault write for {xml_file.name} — {exc}")
+                        continue
                     scan_host_map[result["scan_stem"]] = result["host_stems"]
                     if nmap_analysis and not args.no_ollama:
                         all_analyses.append((result["scan_display"], nmap_analysis))
@@ -14708,14 +14844,18 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                     "hosts": [target],
                 }
 
-                result = create_autorecon_vault(
-                    vault_dir,
-                    target_name,
-                    ar_scan_data,
-                    ar_analysis,
-                    None if (args.no_ollama or skip_llm) else args.model,
-                    validation_warnings=ar_warnings or None,
-                )
+                try:
+                    result = create_autorecon_vault(
+                        vault_dir,
+                        target_name,
+                        ar_scan_data,
+                        ar_analysis,
+                        None if (args.no_ollama or skip_llm) else args.model,
+                        validation_warnings=ar_warnings or None,
+                    )
+                except FileLockedError as exc:
+                    logging.warning(f"Skipping AutoRecon vault write for {target_name} — {exc}")
+                    continue
                 scan_host_map[result["scan_stem"]] = result["host_stems"]
                 if ar_analysis and not args.no_ollama:
                     all_analyses.append((result["scan_display"], ar_analysis))
@@ -14799,14 +14939,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                         except Exception as exc:
                             logging.warning(f"Ollama failed (campaign loot): {exc}")
 
-                result = create_loot_vault(
-                    vault_dir, loot_data,
-                    analysis_by_host if not args.no_ollama and not skip_llm else None,
-                    None if (args.no_ollama or skip_llm) else args.model,
-                )
-                scan_host_map[result["scan_stem"]] = result["host_stems"]
-                if result.get("scan_path_rel"):
-                    scan_path_overrides[result["scan_stem"]] = result["scan_path_rel"]
+                try:
+                    result = create_loot_vault(
+                        vault_dir, loot_data,
+                        analysis_by_host if not args.no_ollama and not skip_llm else None,
+                        None if (args.no_ollama or skip_llm) else args.model,
+                    )
+                except FileLockedError as exc:
+                    logging.warning(f"Skipping Loot/Overview.md update — {exc}")
+                    result = None
+                if result:
+                    scan_host_map[result["scan_stem"]] = result["host_stems"]
+                    if result.get("scan_path_rel"):
+                        scan_path_overrides[result["scan_stem"]] = result["scan_path_rel"]
                 for host_key, analysis_text in analysis_by_host.items():
                     if analysis_text and not analysis_text.startswith("_Ollama failed"):
                         all_analyses.append((f"Loot ({host_key})", analysis_text))
@@ -14988,16 +15133,19 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         else:
             priority_targets_text = _build_priority_targets_fallback(vault_dir)
 
-        build_canvas(
-            vault_dir,
-            args.canvas_name,
-            scan_host_map,
-            all_analyses,
-            canvas_cols=args.canvas_cols,
-            max_groups_per_row=args.canvas_groups_per_row,
-            priority_targets_text=priority_targets_text,
-            scan_path_overrides=scan_path_overrides,
-        )
+        try:
+            build_canvas(
+                vault_dir,
+                args.canvas_name,
+                scan_host_map,
+                all_analyses,
+                canvas_cols=args.canvas_cols,
+                max_groups_per_row=args.canvas_groups_per_row,
+                priority_targets_text=priority_targets_text,
+                scan_path_overrides=scan_path_overrides,
+            )
+        except FileLockedError as exc:
+            logging.warning(f"Skipping canvas rebuild — {exc}")
     else:
         logging.info("Skipping canvas (--no-canvas)")
 
@@ -15006,7 +15154,10 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     # ------------------------------------------------------------------ #
     if not args.no_users_canvas and not args.no_canvas:
         if all_loot_data:
-            build_users_canvas(vault_dir, all_loot_data)
+            try:
+                build_users_canvas(vault_dir, all_loot_data)
+            except FileLockedError as exc:
+                logging.warning(f"Skipping Users Canvas rebuild — {exc}")
         else:
             logging.info("Users Canvas: no loot data available, skipping")
     elif args.no_users_canvas:
@@ -15015,7 +15166,10 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     # ------------------------------------------------------------------ #
     # Campaign Targets Note                                                #
     # ------------------------------------------------------------------ #
-    _write_campaign_targets_note(vault_dir, loot_data=all_loot_data, misc_data=all_misc_data)
+    try:
+        _write_campaign_targets_note(vault_dir, loot_data=all_loot_data, misc_data=all_misc_data)
+    except FileLockedError as exc:
+        logging.warning(f"Skipping Campaign Targets update — {exc}")
 
     # ------------------------------------------------------------------ #
     # Excel export                                                         #
@@ -15032,13 +15186,20 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     # PlexTrac CSV export                                                  #
     # ------------------------------------------------------------------ #
     if getattr(args, "plextrac", False):
-        out = export_plextrac(vault_dir)
+        try:
+            out = export_plextrac(vault_dir)
+        except FileLockedError as exc:
+            logging.warning(f"Skipping PlexTrac export — {exc}")
+            out = None
         if out:
             print(f"  [+] PlexTrac export: {out}")
         else:
             print("  [!] PlexTrac export: no findings in Findings/ — run with Nessus/Burp data first.")
 
-    _save_analysis_state(vault_dir, analysis_state)
+    try:
+        _save_analysis_state(vault_dir, analysis_state)
+    except FileLockedError as exc:
+        logging.warning(f"Could not save incremental state — {exc}")
     logging.info("Done.")
 
 
