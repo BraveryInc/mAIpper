@@ -1,7 +1,35 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.15 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.16 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.15:
+  - Section-dict serializer for host notes: the six writers (_write_host_note,
+    _update_host_note_nessus/burp/autorecon/loot, _write_nxc_host_enrichment)
+    no longer hand-list all 11 body sections as repeated if/else chains.
+    _read_host_note_state() reads frontmatter, preamble, and every body
+    section into one dict; a writer overwrites the entry for the section it
+    owns and _render_host_note_body() re-emits everything in
+    BODY_SECTION_ORDER. Net -244 lines. Verified behaviour-identical via
+    tests/test_writer_output.py: all 13 golden snapshots passed with zero
+    diffs against pre-refactor output.
+  - Found (not yet fixed) while refactoring: _write_nxc_host_enrichment has
+    never preserved an existing ## Access section, unlike the other five
+    writers. Deliberately left as-is in the refactor to keep it
+    behaviour-neutral; tracked as CLAUDE.md known gap #14 with a one-line fix.
+  - __version__ is now the single source of truth for the release version,
+    read by --version, --help, and the interactive header. Previously the
+    version existed only as prose in this docstring, with no way to tell
+    which release was running without opening the file -- and a second copy
+    in the argparse description had silently drifted two releases behind
+    (--help said v0.13 while this docstring said v0.15).
+  - tests/test_writer_output.py: golden-output tests snapshotting each host-
+    note writer's complete output (fresh note + merge-into-existing-note),
+    to catch section reordering, spacing changes, or dropped content that
+    targeted assertions would miss. tests/fixtures.py holds inputs shared
+    with tests/test_note_writing.py so the two suites cannot drift apart.
+  - tests/test_version.py: fails if __version__, the docstring header, any
+    hardcoded "mAIpper vX.Y" string, or CHANGELOG.md falls out of step.
 
 Changes from v0.14:
   - FIX (crash): `--init` raised NameError: name 'args' is not defined.
@@ -217,7 +245,7 @@ import requests
 # Single source of truth for the release version. Bump this and the header
 # line of the module docstring together (tests/test_version.py enforces it),
 # then tag: git tag -a vX.Y -m "..." && git push origin vX.Y
-__version__ = "0.15"
+__version__ = "0.16"
 
 try:
     import openpyxl

@@ -3,6 +3,58 @@
 Notable changes per release. Full per-version history lives in the module
 docstring at the top of `mAIpper.py`; releases are tagged `vX.Y`.
 
+## v0.16
+
+Follow-up to the v0.15 audit: the roadmap item the audit itself flagged as
+highest priority (a single serializer for host-note writers) now exists,
+verified with golden-output tests, plus infrastructure to keep the version
+number itself from drifting the way `--help` once did.
+
+### Added
+
+- **Golden-output tests** (`tests/test_writer_output.py`). Each of the six
+  host-note writers is snapshotted in two scenarios (write a fresh note,
+  merge into a note already holding content from every other source). These
+  assert output is *unchanged*, not *correct* — the right check for a
+  refactor, which by definition should not alter behaviour. `tests/fixtures.py`
+  holds inputs shared with `tests/test_note_writing.py` so the two suites
+  cannot drift apart.
+- **`tests/test_version.py`** and **`__version__`** as the single source of
+  truth for the release version, read by `--version`, `--help`, and the
+  interactive header. Previously the version existed only as prose in the
+  module docstring — there was no way to tell which release was running
+  without opening the file, and a second copy in the `argparse` description
+  had silently drifted two releases behind (`--help` said v0.13 while the
+  docstring said v0.15). The test now fails if any copy of the version, or
+  the docstring header, or the CHANGELOG goes out of step.
+- `--version` flag.
+
+### Changed
+
+- **Section-dict serializer for host notes.** The six writers
+  (`_write_host_note`, `_update_host_note_nessus/burp/autorecon/loot`,
+  `_write_nxc_host_enrichment`) no longer hand-list all 11 body sections as
+  repeated `if existing_X: lines += [...]` chains — the exact duplication
+  that produced v0.15's frontmatter bug, where a section preserved by five
+  writers was silently dropped by the sixth. `_read_host_note_state()` now
+  reads frontmatter, preamble, and every body section into one dict; a
+  writer overwrites the entry for the section it owns and
+  `_render_host_note_body()` re-emits everything in `BODY_SECTION_ORDER`.
+  Net -244 lines in `mAIpper.py`. Verified behaviour-identical: all 13
+  golden snapshots passed with zero diffs against pre-refactor output, plus
+  a clean end-to-end run against synthetic multi-source scan data.
+
+### Known issue found (not yet fixed)
+
+Refactoring surfaced a real bug that predates this release: **the NXC writer
+has never preserved an existing `## Access` section**, unlike the other five
+host-note writers — contradicting the v0.14 changelog's claim that all six
+were fixed. The v0.16 refactor deliberately keeps this bug (rather than
+silently fixing it inside a "behaviour-preserving" refactor commit) so the
+golden-snapshot diff proving the refactor is safe stayed genuinely empty.
+Tracked as `CLAUDE.md` known gap #14 and priority #1 on the roadmap — the fix
+is one line plus regenerating two golden snapshots.
+
 ## v0.15
 
 A full-codebase audit found four crashes and two data-loss bugs. Each was

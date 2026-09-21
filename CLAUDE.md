@@ -457,7 +457,7 @@ writer, to `_set_body_section`, or to `PRESERVED_FM_KEYS`.** When adding a new
 host-level frontmatter key, add it to `PRESERVED_FM_KEYS` *and* to the `PRESERVED`
 dict in the test.
 
-## Assessment & Roadmap (v0.15)
+## Assessment & Roadmap (v0.16)
 
 ### Recently resolved (v0.15) — full-codebase audit
 
@@ -486,6 +486,13 @@ with a runnable test before being fixed. Those tests are now `tests/test_note_wr
 - `[rag] auto_build` and `[rag] max_chunks` were parsed from config but never reached `args`, so both were documented no-ops. Now wired via `--no-auto-build` and `--rag-max-chunks`.
 - Removed dead code: `_cosine_similarity`, `_decode_embedding_f16`, an unused `threading.local()`, an unreachable `_skip_words` re-check, the unused `base64` import, the dead `no_excel` config mapping.
 
+**Two helpers now guard the regression classes above** — use them rather than hand-rolling section or frontmatter merges:
+
+- `_set_body_section(text, header, content, *, append=False)` / `_find_section_bounds` — index-based, fence-aware section replacement. Never depends on reconstructing the old section as an exact string, and inserts content verbatim (no regex template parsing).
+- `_carry_forward_fm(fm, existing_fm)` over `PRESERVED_FM_KEYS` — call in every host-note writer after building `fm`.
+
+### Recently resolved (v0.16)
+
 **Section-dict serializer for host notes** — the six writers no longer hand-list
 all 11 body sections as repeated `if existing_X: lines += [...]` chains (~250 lines
 removed). `_read_host_note_state(host_path)` reads frontmatter, preamble and every
@@ -502,10 +509,10 @@ writers" preserve Access — NXC was the missed one. The refactor deliberately
 **keeps** this bug (`sections.pop("## Access", None)`, called out in the function's
 docstring) so the golden diff stayed empty; see gap #14 below for the one-line fix.
 
-**Two helpers now guard the regression classes above** — use them rather than hand-rolling section or frontmatter merges:
-
-- `_set_body_section(text, header, content, *, append=False)` / `_find_section_bounds` — index-based, fence-aware section replacement. Never depends on reconstructing the old section as an exact string, and inserts content verbatim (no regex template parsing).
-- `_carry_forward_fm(fm, existing_fm)` over `PRESERVED_FM_KEYS` — call in every host-note writer after building `fm`.
+Also lands `tests/test_writer_output.py` (golden-output tests for all six writers)
+and `tests/test_version.py` + `__version__` (see **Testing** and gap history — the
+version previously existed only as prose in this docstring, with `--help` having
+silently drifted two releases stale). Full detail in `CHANGELOG.md`.
 
 ### Resolved in v0.14
 
@@ -574,14 +581,14 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 28. **Persistent chat history** — session chat is lost on exit.
 29. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
 30. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
-31. **Single 15k-line file** — navigable via the architecture list above, but the six-writer body-assembly duplication was the concrete cost until the v0.15 section-dict serializer collapsed it.
+31. **Single 15k-line file** — navigable via the architecture list above, but the six-writer body-assembly duplication was the concrete cost until the v0.16 section-dict serializer collapsed it.
 
 ### Prioritized next steps
 
 | Priority | Item | Why |
 |---|---|---|
 | 1 | Fix NXC writer's `## Access` preservation bug (#14) | One-line fix, already diagnosed; close it before building post-ex tracking on top of a writer known to drop a section |
-| 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing. The section-dict serializer (v0.15) means this now touches one shared render function instead of six writers |
+| 2 | Exploitation / access tracking (#1) | Kill chain is the core of a pentest report; completely missing. The section-dict serializer (v0.16) means this now touches one shared render function instead of six writers |
 | 3 | Fix ingestion gaps: nikto + nxc watching (#5, #6) | Input is silently dropped today — worst kind of bug for an evidence tool |
 | 4 | BloodHound parser + AD Canvas (#2, #22) | Required for internal assessments; pairs with Users Canvas |
 | 5 | LLM-assisted finding drafting (`/draft-findings`) (#3) | Biggest reporting quality gap |
