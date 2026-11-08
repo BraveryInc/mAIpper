@@ -43,9 +43,13 @@ autorecon_tools_run: 15
 loot_file_count: 3
 loot_credential_count: 7
 loot_hash_count: 2
+critical_flags: ["Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010) (CVE-2017-0143) - tcp/445"]
 ---
 **State:** up
 **IP:** 10.10.10.5
+
+## Critical Findings
+- [CONFIRMED] **Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)** (tcp/445) — `smb-vuln-ms17-010` CVE-2017-0143 — risk: HIGH
 
 ## Open Ports
 - **445/tcp** - microsoft-ds
@@ -77,10 +81,12 @@ PRESERVED = {
     "loot_file_count": 3,
     "loot_credential_count": 7,
     "loot_hash_count": 2,
+    "critical_flags": ["Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010) (CVE-2017-0143) - tcp/445"],
 }
 
 # Body content that must survive every writer
-OPERATOR_CONTENT = ("## Access", "psexec", "## NXC Enumeration", "operator wrote this")
+OPERATOR_CONTENT = ("## Access", "psexec", "## NXC Enumeration", "operator wrote this",
+                    "## Critical Findings", "smb-vuln-ms17-010")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,35 @@ NMAP_HOST = {
             "service": {"name": "ldap", "product": "Active Directory LDAP",
                         "version": "", "extrainfo": "", "tunnel": ""},
             "scripts": [],
+        },
+    ],
+}
+
+NMAP_HOST_MS17_010 = {
+    "state": "up",
+    "addresses": [{"addr": "10.10.10.5", "addrtype": "ipv4"}],
+    "hostnames": [{"name": "dc01.corp.local", "type": "PTR"}],
+    "open_ports": [
+        {
+            "protocol": "tcp",
+            "port": 445,
+            "service": {"name": "microsoft-ds", "product": "Windows Server 2019",
+                        "version": "10.0", "extrainfo": "", "tunnel": ""},
+            "scripts": [],
+        },
+    ],
+    "host_scripts": [
+        {
+            "id": "smb-vuln-ms17-010",
+            "output": (
+                "\n  VULNERABLE:\n"
+                "  Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)\n"
+                "    State: VULNERABLE\n"
+                "    IDs:  CVE:CVE-2017-0143\n"
+                "    Risk factor: HIGH\n"
+                "      A critical remote code execution vulnerability exists in Microsoft SMBv1"
+                " servers (ms17-010).\n"
+            ),
         },
     ],
 }

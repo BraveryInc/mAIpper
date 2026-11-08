@@ -26,7 +26,7 @@ A single-file Python CLI for pentesters. Ingests scan output from multiple tools
 ## Installation
 
 ```bash
-git clone https://github.com/<your-org>/mAIpper.git
+git clone https://github.com/BraveryInc/mAIpper.git
 cd mAIpper
 pip install -r requirements.txt
 ```

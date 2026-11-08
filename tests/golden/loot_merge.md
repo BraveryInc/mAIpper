@@ -12,10 +12,21 @@ loot_hash_count: 1
 ips: ["172.16.1.100", "192.168.50.5"]
 domain: CORP
 autorecon_tools_run: 15
+critical_flags: ["Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010) (CVE-2017-0143) - tcp/445"]
 ---
 
 **State:** up
 **IP:** 10.10.10.5
+
+## Critical Findings
+- [CONFIRMED] **Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010)** (tcp/445) — `smb-vuln-ms17-010` CVE-2017-0143 — risk: HIGH
+
+## Creds
+_One row per credential for this host. Password takes a cleartext password or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run (or Enter in interactive mode)._
+
+| Username | Password | Notes |
+|----------|----------|-------|
+|  |  |  |
 
 ## Open Ports
 - **445/tcp** - microsoft-ds

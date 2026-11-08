@@ -84,7 +84,7 @@ Everything lives in `mAIpper.py`. The flow is linear:
 
 1. **`main`** — loads config, parses args, handles `--init` and `-i` interactive mode, dispatches to `_run_processing`
 2. **`_run_processing`** — loads operator notes, resolves scan files across all parsers, skips unchanged files (incremental state), collects `scan_host_map` and `all_analyses`, processes deep dives, calls vault writers and canvas builder, optionally exports Excel
-3. **`parse_nmap_xml`** — parses Nmap XML; filters hosts with no open ports
+3. **`parse_nmap_xml`** — parses Nmap XML; filters hosts with no open ports. Also parses `<hostscript>` (NSE scripts that run without a specific port context, e.g. `smb-vuln-ms17-010` — a sibling of `<ports>`, not nested under any `<port>`) into `host["host_scripts"]`; `_extract_critical_nse_findings` scans both this and per-port `scripts` for the shared vulns.lua `State: VULNERABLE` marker to produce deterministic, tool-verified critical findings (see `## Critical Findings` under Host Note Format)
 4. **`parse_nessus_xml`** — parses `.nessus` files; filters hosts with only informational findings
 5. **`parse_burp_xml`** — parses Burp Issues XML into hosts with issues
 6. **`parse_autorecon_results`** — walks AutoRecon results; filters targets with no scan data
@@ -111,7 +111,7 @@ Everything lives in `mAIpper.py`. The flow is linear:
 27. **`_write_finding_note`** / **`_write_nessus_finding_notes`** / **`_write_burp_finding_notes`** — create/update `Findings/*.md` PlexTrac notes; deduplicate by plugin_id or issue name; merge affected_assets across hosts
 28. **`export_plextrac`** — reads all `Findings/*.md`, writes `Findings/PlexTrac Export.csv` matching PlexTrac v3.2 import format
 29. **`detect_kiwi_secretsdump`** — detects kiwi/mimikatz/secretsdump output format from text; returns `"sam"`, `"kiwi_sekurlsa"`, `"kiwi_lsa_dump"`, or `None`
-30. **`parse_kiwi_secretsdump`** — Python fast-path parser for three kiwi formats: SAM dump lines (`user:RID:LM:NTLM:::`), sekurlsa blocks (`* Username / * NTLM`), and meterpreter lsa_dump_sam (`RID: / User: / Hash NTLM:` blocks); skips empty/null NTLM hashes
+30. **`parse_kiwi_secretsdump`** — Python fast-path parser for four kiwi formats: SAM dump lines (`user:RID:LM:NTLM:::`), sekurlsa blocks (`* Username / * NTLM`), meterpreter lsa_dump_sam (`RID: / User: / Hash NTLM:` blocks), and meterpreter lsa_dump_secrets (`Secret: <name> / cur/text: <value>` blocks — only secrets with a decoded `cur/text` become credentials; hex-only secrets like `DPAPI_SYSTEM` are DPAPI key material, not a crackable password hash, so no credential is fabricated for them). The secret's *name* (e.g. `DefaultPassword`) is not a username — this format never reveals the associated account — so the row is recorded as username `LSA Secret: <name>` with a note prompting manual correlation, never a fabricated identity. Skips empty/null NTLM hashes. Host attribution for all kiwi/mimikatz pastes goes through `_infer_host_from_pasted_text`, which falls back from IP matching to known vault hostnames since mimikatz/meterpreter output identifies the target by hostname, not IP
 31. **`_llm_extract_tool_output`** — LLM-based credential/host extraction for freeform Notes content; temperature 0.05, JSON-only output; results written to `## Pending Review` in the archive note for operator confirmation
 32. **`_interpret_credential_operator_notes`** — on Credentials.md change, scans `### Operator Notes` blocks for freeform text; Pass 1 (Python) matches known host identifiers and auto-appends `[x] Confirmed on`; Pass 2 (LLM) handles ambiguous access-implying language and prints a suggestion
 33. **`_reattribute_campaign_credentials_by_notes`** — scans Campaign-Level credential table rows; when the Notes column contains a known host identifier (short or prose), moves the row to the correct host section and creates the section if needed
@@ -119,7 +119,9 @@ Everything lives in `mAIpper.py`. The flow is linear:
 35. **`_find_section_bounds`** / **`_set_body_section`** — index-based, fence-aware `## ` section replace/append. **Use these for any note section write.** They replaced string-reconstruction + `re.sub`, which silently no-opped on whitespace drift and crashed on backslashes in LLM output
 36. **`_carry_forward_fm`** / **`PRESERVED_FM_KEYS`** — copies host-level frontmatter (`ips`, `domain`, loot counts, severity) that a single-source writer does not own. **Call in every host-note writer** after building `fm`
 37. **`_force_utf8_stdio`** — reconfigures stdout/stderr to UTF-8 at startup so Windows legacy codepages do not crash on arrows/box-drawing output
-38. **`FileLockedError` / `_atomic_write_text`** — the replace step retries with backoff before raising this instead of a bare `PermissionError` when the destination is held open (Obsidian, AV, sync client, indexer). **Catch this specifically at every per-host/per-scan-file loop iteration** (see the 6 `create_*_vault` writers) so one locked note is skipped with a warning instead of aborting the run; batch `main()` and the interactive loop each have a last-resort catch for anything else
+38. **`_sync_host_creds_tables`** / **`_parse_host_creds_table`** / **`_merge_creds_sections`** / **`_ensure_host_creds_section`** — per-host `## Creds` table (`Username | Password | Notes`): one-way, idempotent push of each host note's rows into that host's `Loot/Credentials.md` section via `_append_injestor_to_credentials_md(..., host_stems=...)`; `_host_creds_section_key` reuses whichever section already belongs to the host (loot keys by display name, Injestor by IP) so it never gets a second one. Runs right after `_process_injestor` in `_run_processing` and on host-note changes in `_process_vault_changes`. Inserts the empty table into notes that predate it
+39. **`_parse_pivot_line`** / **`_find_pivot_entities`** / **`_build_pivot_host_index`** / **`_read_pivots`** / **`_add_pivots`** / **`_refresh_pivots`** / **`_add_pivots_to_canvas`** — pivot tracking. `Pivots.md` is the source of truth; `_refresh_pivots` regenerates every host's `## Pivots` section (via `_set_host_section_ordered`, which inserts at the `BODY_SECTION_ORDER` position or removes the section) and, given a canvas name, re-overlays the canvas in place. `build_canvas` applies the same overlay before writing. See **Pivots** below
+40. **`FileLockedError` / `_atomic_write_text`** — the replace step retries with backoff before raising this instead of a bare `PermissionError` when the destination is held open (Obsidian, AV, sync client, indexer). **Catch this specifically at every per-host/per-scan-file loop iteration** (see the 6 `create_*_vault` writers) so one locked note is skipped with a warning instead of aborting the run; batch `main()` and the interactive loop each have a last-resort catch for anything else
 
 ## Incremental Analysis
 
@@ -163,6 +165,37 @@ Assessors drop loot files into `scans/loot/` — credentials, hashes, keys, sens
 - **Unassociated:** `loot/cracked_hashes.txt` — campaign-level
 
 **Output:** Centralized `Loot/Credentials.md` and `Loot/Hashes.md` with per-host tables. Host notes get lightweight `## Loot` sections with summary stats and links. File listings stay inline.
+
+`_write_loot_credentials_page` fully rebuilds `Loot/Credentials.md` from a fresh `scans/loot/` scan on every run — but a row added by Injestor (kiwi/NXC paste, LSA secret, `+cred`) has no backing loot file to be re-derived from, so a naive rebuild silently deleted it the moment this ran after it was added. It now diffs the fresh scan against the existing page and carries forward (`_orphan_raw_rows`) any row this run's scan didn't reproduce, so a routine re-scan never drops a credential that only ever existed in the file.
+
+## Host Creds Table
+
+Every host note has a `## Creds` section (second in `BODY_SECTION_ORDER`, after `## Critical Findings`) holding a `| Username | Password | Notes |` table. Operators add a row per credential found on/for that host; the Password cell takes a cleartext password, a hash (classified by `_split_cred_value` and filed in the Hash column) or `hash:cracked`. Rows are synced into the host's section of `Loot/Credentials.md` (source `Host note`) on every run and whenever a host note changes in interactive mode.
+
+- **One way, idempotent.** A username already in that host's Credentials.md section is skipped, so rows simply stay in the table as the host's record. Editing a password in the host table later does **not** update the existing Credentials.md row.
+- **Always present.** `_render_host_note_body` emits the blank table when a note has none; `_ensure_host_creds_section` backfills notes written before it existed; Injestor-created notes include it. All writers pass a filled table through untouched.
+- **`/merge`** unions both notes' rows into one table (dedup on username+password).
+
+## Pivots
+
+The Injestor's `## Pivots` section takes one pivot per line in plain words; `_parse_pivot_line` (Python only, no LLM) extracts entities — hosts (IPs, `[[Hosts/...]]` links, or any stem/hostname/short-name/IP from `Hosts/` frontmatter), subnets (CIDR, or `172.16.2.x` / `172.16.2.*` → /24) and IPs with no note yet — plus the tool (`_PIVOT_METHODS`, first match wins) and the direction:
+
+| Form | Pivot |
+|---|---|
+| `A -> B -> C` (also `=>`, `→`) | chain: A→B, B→C |
+| `from A to B` | A |
+| `B via/through/behind/from A` (entities on both sides) | A |
+| anything else | first entity; every later one is a target |
+
+A subnet can't be the pivot side. Lines that don't resolve are reported (console + `## Pivots` in the archive note), never guessed. IPs named in a pivot line get host notes like any other new Injestor IP.
+
+**`Pivots.md`** (vault root, created by `_install_injestor`) holds `| From | To | Method | Notes | Source |`, deduplicated on (from, to). Host cells are written `[[Hosts/stem\|stem]]` (Obsidian needs the escaped pipe inside tables). Entities are **re-resolved on every read**, so an IP turns into a link once its note exists and a stem `/merge` deleted resolves to the survivor through its IP/hostname; `_refresh_pivots` rewrites the cells canonically. Operator text outside the table is preserved.
+
+**Derived from it, never edited directly:**
+- Host `## Pivots` section (after `## Access` in `BODY_SECTION_ORDER`): "Pivot point — gives access to" (with known hosts inside a target subnet) and "Reached through" (direct, or via a subnet containing any of the host's IPs). Removed when no pivot applies. Writers pass it through; `/merge` drops it and then refreshes.
+- Canvas: purple (`PIVOT_CANVAS_COLOR`) edges labelled `pivot · <method>` from the pivot's host card to the target card or `/24` subnet group, a **Pivot Paths** panel of full chains (a target subnet containing another pivot host continues the chain), and cards for targets not on the canvas. Everything carries `PIVOT_ID_PREFIX` and is stripped before re-adding, so the overlay is idempotent and removal works.
+
+**Refresh points:** `_run_processing` (after all writers, before the canvas), the Injestor (sections only), `/merge`, and in interactive mode on a `Pivots.md` change or Injestor pivots (sections + canvas overlay, no rebuild).
 
 ## Credential Annotations
 
@@ -225,7 +258,9 @@ Interactive mode starts with **no LLM analysis**. All structured data is generat
 3. Run `/analyze` → LLM re-parses source file, fills `## Analysis` section (scan-level operator notes injected automatically)
 4. `- [/] Analyze: Nmap` — complete
 
-Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per-host Loot (`- [ ] Analyze: Loot — {host}`). Injestor archive notes also get a `- [ ] Analyze: Misc` checkbox and a `## Analysis` section.
+Scan analysis checkboxes exist for: Nmap, Nessus, Burp, AutoRecon, Misc, and per-host Loot (`- [ ] Analyze: Loot — {host}`). Injestor archive notes also get a `- [ ] Analyze: Misc` checkbox, a `## Analysis` section, and a `## Operator Notes` section (marked `- **Source:** Injestor`).
+
+**Operator-guided credential re-extraction (Misc/Injestor notes):** writing a correction into a Misc scan note's `## Operator Notes` — e.g. "it missed the cleartext password in the comment from that LDAP dump, make sure this gets entered" — and re-running `/analyze` doesn't just get echoed back as prose. `_reparse_and_analyze_scan`'s `misc` branch prepends the operator note to the note's original raw content and calls `_llm_extract_tool_output` a second time; anything genuinely new it finds is normalized (`_normalize_llm_extracted_cred`) and written straight to `Loot/Credentials.md` and the relevant host's `## Loot` section, with a one-line summary prepended to `## Analysis`. This applies to any Misc-labeled scan note with operator notes, not just Injestor-originated ones — a partial answer to known gap #32 (still no *dedicated* `Analyze: Operator Notes` checkbox, and this doesn't cover Nmap/Nessus/Burp/AutoRecon/host-note operator notes, only Misc's credential-extraction path).
 
 **`/analyze-full`** — marks every unchecked `[ ]` box across all host notes and scan notes as `[x]`, then runs the full analysis pass. Equivalent to checking everything manually and running `/analyze`.
 
@@ -254,10 +289,13 @@ autorecon_tools_run: 15
 loot_file_count: 3
 loot_credential_count: 5
 loot_hash_count: 2
+critical_flags: ["Remote Code Execution vulnerability in Microsoft SMBv1 servers (ms17-010) (CVE-2017-0143) - tcp/445"]
 ---
 ```
 
 `ips` is optional — only present on multi-interface hosts. All IPs in `ips` resolve to this note in `_build_known_hosts_lookup`, so loot files prefixed with any of the host's IPs attribute correctly. `/merge` populates `ips` automatically when collapsing separate IP notes.
+
+`critical_flags` is optional — only present when `_extract_critical_nse_findings` found a confirmed-VULNERABLE Nmap NSE script result (the shared vulns.lua `State: VULNERABLE` marker used by `smb-vuln-*`, `ssl-heartbleed`, `http-vuln-*`, etc.). Backs the always-visible `## Critical Findings` host-note section (first in `BODY_SECTION_ORDER`) and lets the Priority Targets fallback and prompt rank the host above pure port-count/Nessus-severity ties instead of relying on the LLM to mention it in prose.
 
 ## Output Layout
 
@@ -267,6 +305,7 @@ Obsidian/
 ├─ Hosts/<hostname-or-ip>.md        # frontmatter + ports + findings + deep dives + operator notes
 ├─ Hosts/_Campaign Targets.md       # copy-paste target lists (IPs, subnets, hostnames, domains)
 ├─ Injestor.md                     # operator drop zone — paste anything, processed on next run
+├─ Pivots.md                       # pivot table (From | To | Method) — source for host ## Pivots + canvas edges
 ├─ Scans/<scan-name> - Nmap.md      # per-scan note with AI analysis
 ├─ Scans/<scan-name> - Nessus.md
 ├─ Scans/<scan-name> - Burp.md
@@ -333,12 +372,16 @@ Seven prompts, each with GROUNDING RULES header (English-only, anti-hallucinatio
 | Nessus | `build_nessus_ollama_prompt` | Key Observations, Exploitation Priority, Attack Chains, Remediation Focus |
 | Burp | `build_burp_ollama_prompt` | Key Observations, Exploitation Priority, Attack Chains, False Positive Risk, Remediation Focus |
 | AutoRecon | `build_autorecon_ollama_prompt` | Key Observations, Service-Specific Findings, Credential & Access Findings, Attack Paths, Manual Follow-Up |
-| Loot | `build_loot_ollama_prompt` | Loot Analysis, Credential Impact, Recommended Next Steps |
+| Loot | `build_loot_ollama_prompt` | Commands to Try, Notes (only if non-obvious) |
 | Misc (full/standard) | `build_misc_ollama_prompt` | Tool Identification (auto-detected or ask LLM), Key Findings, Notable Items, Recommended Next Steps; tool-specific hints for 25+ tools |
 | Misc (minimal) | `_build_misc_minimal_prompt` | Key Facts only (IPs, creds, versions); used for notes/todo files |
-| Deep Dive | `build_deep_dive_prompt` | Attack Surface, Enumeration Commands, Known Vulnerabilities, Attack Paths, Next Steps |
+| Deep Dive | `build_deep_dive_prompt` | Commands, Findings (only if non-obvious), Next Step |
 | Cross-Source | `build_cross_source_prompt` | Correlated Findings, Attack Path Synthesis, Coverage Gaps, Priority Actions |
 | Priority Targets | `build_priority_targets_prompt` | Numbered ranked list, evidence citation required |
+
+Nmap and Priority Targets are both grounded with `_extract_critical_nse_findings` output (confirmed-VULNERABLE Nmap NSE script results, e.g. MS17-010) injected as a "CONFIRMED VULNERABILITIES" block — the LLM is instructed to lead with these rather than re-deriving them from the version banner, and Priority Targets is instructed to rank that host near #1 regardless of port count.
+
+**Brevity policy (v0.19):** every narrative prompt's GROUNDING RULES carries three shared bullets — don't explain what a well-known service/protocol/tool is, keep every bullet to one line (no paragraphs), and omit a section entirely rather than padding it. `_ASSESSMENT_CONFIG_TEMPLATE`'s System Prompt (the `_active_system_prompt` global, prepended to every `ollama_chat` call by default — see `_load_assessment_config`) carries the same policy, so it's the single global lever for tone/verbosity without touching individual prompt builders. Reported gap: the per-port Deep Dive callouts and the Loot analysis were reading as generic IT-textbook explanation ("this service allows X, which could expose Y") instead of commands — Deep Dive and Loot were also restructured directly (5 sections → 3, 3 sections → 2) to lead with ready-to-run commands and only include a findings/notes bullet when it's genuinely non-obvious.
 
 ## Cross-Source Deep Dive
 
@@ -368,7 +411,7 @@ Three sections with distinct processing pipelines:
 
 **`## Notes`** — smart detection runs in priority order:
 1. **NXC fast-path** — `NXC_STATUS_LINE_RE` match → `parse_nxc_stdout`; goes directly to `Loot/Credentials.md`, no review
-2. **Kiwi fast-path** — `detect_kiwi_secretsdump` match → `parse_kiwi_secretsdump`; handles SAM lines, sekurlsa blocks, and meterpreter lsa_dump_sam format; goes directly to `Loot/Credentials.md`, no review
+2. **Kiwi fast-path** — `detect_kiwi_secretsdump` match → `parse_kiwi_secretsdump`; handles SAM lines, sekurlsa blocks, meterpreter lsa_dump_sam, and meterpreter lsa_dump_secrets format; goes directly to `Loot/Credentials.md`, no review. Host attribution (`_infer_host_from_pasted_text`) tries an in-scope IP first, then falls back to matching a known vault hostname/short-name in the pasted text — mimikatz/meterpreter output names the target host, not its IP
 3. **LLM → Pending Review** — freeform/unknown content; `_llm_extract_tool_output` at temperature 0.05; results held in `## Pending Review` in the archive note until operator confirms
 
 **`## Tool Output`** — same smart detection priority order as Notes; NXC and kiwi bypass LLM; anything else adds to the LLM batch
@@ -622,9 +665,13 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 25. **No scope tracking** — no in-scope/out-of-scope list, no "confirmed tested" vs "discovered untested" distinction.
 26. **Interactive analysis requires an Obsidian round-trip** — want `/analyze <host> <topic>` direct from the prompt.
 27. **Persistent chat history** — session chat is lost on exit.
-28. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker.
+28. **Multi-IP host merging** — `/merge` still only matches IP+hostname pairs on a single note, not the three-note case (IP-A.md + IP-B.md + hostname.md for one physical host). Note that `ips` now survives re-scans as of v0.15, which was the blocker. `_detect_and_merge_host_notes` (mAIpper.py:6394) currently does pairwise `(keep, delete)` merges one pair at a time; the three-note case needs either a transitive/union-find grouping pass (merge all notes sharing any signal into one group before picking a single keeper) or repeated `/merge` passes to fully converge — a single pass over a 3-note group only merges the first pair found for a given key, leaving the third note unmerged until the next run.
 29. **Burp XML is parsed twice per file** — once for the root-tag check, once by `parse_burp_xml`.
 30. **Single 15k-line file** — navigable via the architecture list above, but the six-writer body-assembly duplication was the concrete cost until the v0.16 section-dict serializer collapsed it.
+31. **`/merge` is silent until manually invoked — Enter-refresh doesn't mention pending duplicate notes.** The Empty Enter flow already reports pending analyze/investigate checkboxes; it should also run (or dry-run) `_detect_and_merge_host_notes`-style detection and surface something like `2 host notes look like duplicates — run /merge` alongside the existing pending-items report, so operators don't have to think to run `/merge` after adding a hostname/IP cross-reference by hand.
+32. **No dedicated "Analyze: Operator Notes" checkbox.** Today `## Operator Notes` (host notes and scan notes) is only ever injected as passive `[OPERATOR]` / `[OPERATOR SCAN NOTES]` context into *other* prompt builders (`build_operator_notes_lookup`, mAIpper.py:3006) — there's no way to ask the LLM to look at what you just wrote on its own terms. Two exceptions now exist: `Loot/Credentials.md` operator notes get a dedicated two-pass interpretation (`_interpret_credential_operator_notes`, mAIpper.py:7657: Python regex match → LLM fallback for ambiguous access language), and Misc/Injestor scan notes (v0.19) run a targeted credential re-extraction pass on `/analyze` when operator notes are present (see **Operator-guided credential re-extraction** above) — but that's still folded into the generic `Analyze: Misc` checkbox, not a dedicated one, and it only covers Misc's credential-extraction path. Nmap/Nessus/Burp/AutoRecon scan notes and host notes still only get the passive injection. A real `- [ ] Analyze: Operator Notes` checkbox, wired through the existing `/analyze` checkbox flow for every note type, that runs a focused pass over just that section — surfacing implied action items, flagging contradictions with scan data, or catching missed credentials/access the same way the Credentials.md and Misc passes do — is still the more general fix.
+
+33. **`/merge` drops `## Access`, `## NXC Enumeration` and `## Critical Findings`.** `_merge_two_host_notes` rebuilds the kept note from a hard-coded `MERGE_SECTIONS` list that predates those three sections (and the `critical_flags` they back), so merging an IP note into a hostname note silently discards confirmed-access tables, NXC enumeration and confirmed NSE vulnerabilities from both. `## Creds` is handled separately (v0.19). Fix: drive the merge from `BODY_SECTION_ORDER` instead of its own list.
 
 ### Prioritized next steps
 
@@ -639,3 +686,6 @@ Parallel LLM calls (AutoRecon/loot/misc), atomic vault writes, validator ports/I
 | 7 | CrackMapExec + Responder parsers (#19, #20) | Daily-driver tools, high return |
 | 8 | `_find_host_note_by_ip` lookup cache (#9) | O(n²) file I/O; bites on large engagements |
 | 9 | Scope management (#25) | Required for client-facing deliverables |
+| 10 | Surface pending merges on Enter-refresh (#31) | `/merge` only runs when the operator remembers to type it; cross-referencing a hostname/IP by hand today produces a mergeable pair that nothing flags |
+| 11 | Transitive multi-note merge (#28) | Pairwise merge leaves 3-note duplicate groups (two IPs + a hostname note) only partially merged in one pass |
+| 12 | `Analyze: Operator Notes` checkbox (#32) | Host/scan operator notes only ever feed *other* prompts passively; no way to ask the LLM to react to them directly, unlike Credentials.md notes which already get this |

@@ -11,6 +11,13 @@ sources: ["Internal - Nmap"]
 **IP:** 10.10.10.5
 **Open Ports:** 2
 
+## Creds
+_One row per credential for this host. Password takes a cleartext password or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run (or Enter in interactive mode)._
+
+| Username | Password | Notes |
+|----------|----------|-------|
+|  |  |  |
+
 ## Open Ports
 - **tcp/445** — microsoft-ds Windows Server 2019 10.0
   - [ ] Investigate: MICROSOFT-DS (tcp/445)

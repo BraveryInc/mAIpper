@@ -14,6 +14,13 @@ loot_hash_count: 1
 **IP:** 10.10.10.5
 **Hostname:** dc01.corp.local
 
+## Creds
+_One row per credential for this host. Password takes a cleartext password or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run (or Enter in interactive mode)._
+
+| Username | Password | Notes |
+|----------|----------|-------|
+|  |  |  |
+
 ## Loot
 **Loot files:** 1  ·  **Credentials:** 1  ·  **Hashes:** 1
 

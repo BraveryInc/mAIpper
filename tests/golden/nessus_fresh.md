@@ -11,6 +11,13 @@ nessus_max_severity: 3
 **IP:** 10.10.10.5
 **Hostname:** dc01.corp.local
 
+## Creds
+_One row per credential for this host. Password takes a cleartext password or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run (or Enter in interactive mode)._
+
+| Username | Password | Notes |
+|----------|----------|-------|
+|  |  |  |
+
 ## Nessus Findings
 #### [High] SMB Signing Disabled (Plugin 12345)
 - [ ] Investigate: Nessus SMB Signing Disabled (Plugin 12345, High)

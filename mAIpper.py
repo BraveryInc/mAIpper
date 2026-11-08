@@ -1,7 +1,114 @@
 #!/usr/bin/env python3
 
 """
-mAIpper v0.18 - Pentest Tool Analysis & Obsidian Export Tool
+mAIpper v0.19 - Pentest Tool Analysis & Obsidian Export Tool
+
+Changes from v0.18:
+  - NEW: confirmed Nmap NSE vulnerability findings (smb-vuln-ms17-010,
+    ssl-heartbleed, and every other script built on the shared vulns.lua
+    "State: VULNERABLE" convention) are now surfaced deterministically
+    instead of depending on the LLM to notice them in prose. parse_nmap_xml
+    now parses <hostscript> (host-level NSE results live there, not nested
+    under any <port>, so they were silently dropped entirely).
+    _extract_critical_nse_findings() reads both host- and port-level script
+    output; matching results are written to a new, always-visible
+    "## Critical Findings" host-note section (first in BODY_SECTION_ORDER)
+    and a new `critical_flags` frontmatter list (added to PRESERVED_FM_KEYS,
+    merged across re-scans so a narrower follow-up scan can't drop an
+    earlier confirmed finding). The static Priority Targets fallback now
+    ranks any host with critical_flags above pure port-count/Nessus-severity
+    ties, the AI-ranked Priority Targets prompt is told to do the same, and
+    build_ollama_prompt injects the confirmed findings as ground truth so the
+    per-host analysis leads with them instead of re-deriving (or mis-deriving)
+    them from the version banner. Reported gap: a domain controller confirmed
+    vulnerable to MS17-010/EternalBlue didn't appear in Priority Targets at
+    all, and the one mention of it in the host note was LLM prose buried in a
+    collapsed callout, not grounded in the NSE script data that was already
+    sitting in the scan file.
+  - FIX: Loot/Credentials.md table corruption on every Injestor append once a
+    table had been reformatted (e.g. by Obsidian's own table editor, which
+    pads separator rows as "| --- |" instead of "|---|"). The parser's
+    separator check only recognised the unpadded form, so a padded separator
+    was misfiled as a data/trailing line on the next parse+rewrite, and the
+    Campaign-Level table lost its separator row entirely.
+    _is_markdown_table_separator_row() tolerates any padding/alignment
+    colons; _sections_to_text() also self-heals a table whose separator was
+    already lost by an earlier run instead of re-emitting a broken table.
+  - FIX: credentials pasted into the Injestor as raw kiwi/mimikatz/meterpreter
+    output (secretsdump, sekurlsa, lsa_dump_secrets) were attributed to the
+    wrong host -- or no host at all -- because host detection only looked for
+    a literal IPv4 address in the pasted text. Mimikatz and meterpreter
+    output identify the target by hostname ("Local name : HOST",
+    "Running module against HOST"), never by IP, so every such paste fell
+    through to Campaign-Level with no link back to the box it came from.
+    _infer_host_from_pasted_text() now also matches against known vault host
+    identifiers (IP/hostname/short-name) when no IP is present.
+  - FIX: the lsa_dump_secrets parser (format 4, added last release) recorded
+    the LSA secret's *name* (e.g. "DefaultPassword") as if it were a
+    username. That name identifies the secret slot, not the account -- this
+    output format never reveals which account a decoded secret belongs to.
+    The row is now recorded as username "LSA Secret: <name>" with a note
+    prompting manual correlation (and, for DefaultPassword specifically, the
+    registry key that names the actual account) instead of fabricating a
+    fake identity that silently discarded the real credential.
+  - FIX: found while verifying the fix above -- any Injestor-added credential
+    with no backing scans/loot/ file (kiwi paste, LSA secret, +cred) was
+    silently deleted by the very next run. _write_loot_credentials_page
+    fully rebuilt Loot/Credentials.md from a fresh loot-directory scan every
+    time; it now diffs against the existing page and carries forward
+    (_orphan_raw_rows) any row the fresh scan didn't reproduce, so a routine
+    re-scan can no longer delete a credential that only ever existed because
+    Injestor added it.
+  - FIX: a short, explicit credential line pasted into the templated ##
+    Notes section (e.g. "for CORP-WS03 administrator:HASH:CrackedPw123")
+    was silently dropped with no feedback. Templated ## Notes only ever
+    tried NXC/kiwi detection, then gated everything else behind an
+    8-non-IP-word threshold before considering the LLM -- a precise one-line
+    credential never reaches 8 words. _parse_injestor_creds_with_host (the
+    deterministic parser previously reachable only in "legacy" freeform
+    Injestor pages) now runs as a fast-path in both ## Notes and ## Tool
+    Output regardless of length. It also gained a host-first pattern ("for
+    HOST user:pass", not just "user:pass on HOST") and now splits a
+    "user:hash:crackedpassword" value into hash (primary) + cracked password
+    (note), matching parse_kiwi_secretsdump's existing convention.
+  - FIX: found while adding the fast-path above -- _link_injestor_creds_to_
+    host_note called split_frontmatter(), a function that does not exist
+    anywhere in this file. Every single Injestor credential that resolved to
+    a host (i.e. every case where host attribution actually worked) crashed
+    with an unhandled NameError while trying to write the host note's ##
+    Loot summary. Fixed to use the existing read_frontmatter/write_frontmatter
+    pair, same pattern already used by _add_host_access.
+  - Reworked LLM output for brevity: reported feedback was that analysis
+    read as generic IT-textbook explanation ("this service allows X, which
+    could expose Y") instead of actionable commands. Every narrative
+    prompt's GROUNDING RULES now carries three shared rules -- don't explain
+    what a well-known service/protocol/tool is, one line per bullet (no
+    paragraphs), omit a section rather than pad it -- and
+    _ASSESSMENT_CONFIG_TEMPLATE's System Prompt (prepended to every
+    ollama_chat call by default via _active_system_prompt) carries the same
+    policy, making it the one global lever for tone/verbosity. Deep Dive
+    (5 sections -> 3: Commands / Findings / Next Step) and Loot analysis
+    (3 sections -> 2: Commands to Try / Notes) were restructured directly
+    since they were named in the report.
+  - NEW: Injestor/Misc scan notes gained a "## Operator Notes" section
+    ("- **Source:** Injestor" marks the note). Writing a correction there
+    (e.g. "it missed the cleartext password in the comment from that LDAP
+    dump, make sure this gets entered") and re-running /analyze doesn't just
+    get echoed back as prose -- _reparse_and_analyze_scan's "misc" branch
+    prepends the operator note to the note's original raw content and calls
+    _llm_extract_tool_output a second time; genuinely new results are
+    normalized (_normalize_llm_extracted_cred) and written straight to
+    Loot/Credentials.md and the host's ## Loot section, with a one-line
+    summary prepended to ## Analysis. Applies to any Misc-labeled note with
+    operator notes, not just Injestor-originated ones.
+  - FIX: found while wiring the above -- _append_injestor_to_credentials_md's
+    is_hash check only recognised the "<TYPE>_hash"/"hash" suffix naming
+    convention (_classify_password, parse_kiwi_secretsdump), not the bare
+    hash-type names ("NTLM", "SHA1", "bcrypt") that _parse_pending_review_row
+    and _classify_hash use. Every credential promoted via /review with a
+    recognised hash type was silently mislabeled as a cleartext password
+    (empty Hash/Hash Type columns) instead of a hash. New _cred_type_is_hash()
+    recognises both conventions.
 
 Changes from v0.17:
   - FIX: a note open in Obsidian (or briefly held by an antivirus scan, search
@@ -254,6 +361,7 @@ import concurrent.futures
 import configparser
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -274,7 +382,7 @@ import requests
 # Single source of truth for the release version. Bump this and the header
 # line of the module docstring together (tests/test_version.py enforces it),
 # then tag: git tag -a vX.Y -m "..." && git push origin vX.Y
-__version__ = "0.18"
+__version__ = "0.19"
 
 try:
     import openpyxl
@@ -341,6 +449,16 @@ _CRED_WITH_HOST_INLINE_RE = re.compile(
     r"([a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253})\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# "for HOST user:pass" / "on HOST user:hash:password" -- host stated before the
+# credential. _CRED_WITH_HOST_INLINE_RE above only covers the reverse order
+# (cred first, host last); this is the natural phrasing for "I cracked a
+# password for <host>, here it is".
+_CRED_HOST_FIRST_RE = re.compile(
+    r"^(?:for|on|creds?\s+for|creds?\s+on)\s+"
+    r"([a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253})[:\-]?\s+"
+    r"([^\s:/]{1,64}):([^\s]{1,128})\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # "username is frank", "user: frank" (inline, same line as context keyword)
 _INLINE_USERNAME_RE = re.compile(
@@ -385,6 +503,28 @@ NESSUS_SEVERITY_CANVAS_COLORS: dict[int, str] = {
 
 OPERATOR_NOTES_SENTINEL = "## Operator Notes"
 OPERATOR_NOTES_HINT = "_Add your own findings, observations, and next steps below._"
+
+# Per-host credential entry table. Operator-owned: every writer passes it
+# through untouched; _sync_host_creds_tables pushes its rows (one way) into
+# Loot/Credentials.md under this host's section.
+CREDS_SECTION = "## Creds"
+CREDS_HINT = (
+    "_One row per credential for this host. Password takes a cleartext password "
+    "or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run "
+    "(or Enter in interactive mode)._"
+)
+CREDS_TABLE_HEADER = "| Username | Password | Notes |"
+CREDS_TABLE_SEP    = "|----------|----------|-------|"
+CREDS_DEFAULT_CONTENT = "\n".join([
+    CREDS_HINT, "", CREDS_TABLE_HEADER, CREDS_TABLE_SEP, "|  |  |  |",
+])
+
+# Pivots: Pivots.md (vault root) is the source of truth; each host note's
+# ## Pivots section and the canvas pivot edges are generated from it.
+PIVOT_SECTION      = "## Pivots"
+PIVOTS_FILENAME    = "Pivots.md"
+PIVOT_CANVAS_COLOR = "6"        # purple
+PIVOT_ID_PREFIX    = "pivot-"   # canvas node/edge ids owned by the pivot overlay
 
 DEEP_DIVE_SECTION = "## Analysis"        # per-port/finding level callouts
 CROSS_SOURCE_SECTION = "## Deep Dive"   # per-host synthesis from /deepdive
@@ -455,6 +595,9 @@ KIWI_HASH_LINE_RE = re.compile(
     r"^\s+Hash NTLM:\s*[a-fA-F0-9]{32}",
     re.MULTILINE,
 )
+# Format 4: meterpreter lsa_dump_secrets  "Secret  : <name>" / "cur/text: <value>" blocks
+LSA_SECRET_LINE_RE = re.compile(r"^\s*Secret\s*:\s*\S", re.MULTILINE)
+LSA_SECRET_VALUE_RE = re.compile(r"^\s*cur/(?:text|hex)\s*:", re.IGNORECASE | re.MULTILINE)
 # Shared header patterns across all kiwi/mimikatz formats
 MIMIKATZ_HEADER_RE = re.compile(
     r"mimikatz|sekurlsa|lsadump|Authentication Id\s*:|kiwi|Dumping SAM|SysKey\s*:",
@@ -474,6 +617,8 @@ _LLM_WRITE_LOCKS: dict[str, threading.Lock] = {}
 _LLM_WRITE_LOCKS_MUTEX = threading.Lock()
 
 BODY_SECTION_ORDER = [
+    "## Critical Findings",
+    CREDS_SECTION,
     "## Open Ports",
     "## Nessus Findings",
     "## Burp Suite Findings",
@@ -481,6 +626,7 @@ BODY_SECTION_ORDER = [
     "## NXC Enumeration",
     "## Loot",
     "## Access",
+    PIVOT_SECTION,
     DEEP_DIVE_SECTION,
     CROSS_SOURCE_SECTION,
     "## Scan References",
@@ -695,6 +841,7 @@ PRESERVED_FM_KEYS = (
     "loot_file_count",
     "loot_credential_count",
     "loot_hash_count",
+    "critical_flags",
 )
 
 
@@ -991,11 +1138,25 @@ def parse_nmap_xml(xml_path: Path) -> dict:
                     "scripts":  scripts,
                 })
 
+        # Host-level NSE scripts (e.g. smb-vuln-ms17-010, ssl-heartbleed) run
+        # without a specific port context and appear in <hostscript>, a sibling
+        # of <ports> -- not nested under any <port>. Dropping these silently
+        # discards confirmed vulnerability results (VULNERABLE/CVE/risk factor)
+        # that would otherwise only ever reach the analysis as LLM guesswork.
+        host_scripts = []
+        hostscript_parent = host.find("hostscript")
+        if hostscript_parent is not None:
+            host_scripts = [
+                {"id": s.get("id", ""), "output": s.get("output", "")}
+                for s in hostscript_parent.findall("script")
+            ]
+
         host_record = {
             "state":      state,
             "addresses":  addresses,
             "hostnames":  hostnames,
             "open_ports": sorted(ports, key=lambda p: (p["protocol"], p["port"])),
+            "host_scripts": host_scripts,
         }
         scan_info["hosts"].append(host_record)
         logging.debug(
@@ -1016,6 +1177,96 @@ def parse_nmap_xml(xml_path: Path) -> dict:
 
     logging.info(f"Nmap done: {xml_path.name} | hosts={len(scan_info['hosts'])}")
     return scan_info
+
+
+# Shared marker used by nmap's vulns.lua NSE library across dozens of
+# "*-vuln-*" scripts (smb-vuln-ms17-010, smb-vuln-ms08-067, ssl-heartbleed,
+# http-vuln-cve*, ftp-vuln-cve*, ...). Any script using this library that
+# actually found the target vulnerable prints this exact line, so matching on
+# it (rather than a hardcoded per-CVE/per-script-id list) generically catches
+# every confirmed-vulnerable NSE result without needing to know which script
+# produced it. This is tool-verified ground truth, not an LLM inference.
+_NSE_VULN_STATE_RE = re.compile(r"State:\s*VULNERABLE", re.IGNORECASE)
+_NSE_VULN_TITLE_RE = re.compile(r"VULNERABLE:\s*\n\s*(.+)")
+_NSE_RISK_FACTOR_RE = re.compile(r"Risk factor:\s*(\S+)")
+
+
+def _extract_critical_nse_findings(host: dict) -> list[dict]:
+    """Pull confirmed-VULNERABLE NSE script results out of a parsed Nmap host.
+
+    Scans both host-level scripts (host.get("host_scripts")) and per-port
+    scripts for the vulns.lua "State: VULNERABLE" marker. Returns one dict per
+    match: {"script_id", "title", "cves", "risk_factor", "port_label"}
+    (port_label is "" for a host-level script). No LLM involved -- this is
+    exactly what `nmap --script vuln` already told us, just not being read.
+    """
+    findings: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _scan(scripts: list[dict], port_label: str) -> None:
+        for s in scripts:
+            output = s.get("output", "") or ""
+            if not _NSE_VULN_STATE_RE.search(output):
+                continue
+            script_id = s.get("id", "")
+            key = (script_id, port_label)
+            if key in seen:
+                continue
+            seen.add(key)
+            title_m = _NSE_VULN_TITLE_RE.search(output)
+            title = title_m.group(1).strip() if title_m else (script_id or "Unnamed vulnerability")
+            risk_m = _NSE_RISK_FACTOR_RE.search(output)
+            findings.append({
+                "script_id":   script_id,
+                "title":       title,
+                "cves":        sorted(set(CVE_RE.findall(output))),
+                "risk_factor": risk_m.group(1).strip() if risk_m else "",
+                "port_label":  port_label,
+            })
+
+    _scan(host.get("host_scripts", []), "")
+    for p in host.get("open_ports", []):
+        _scan(p.get("scripts", []), f"{p['protocol']}/{p['port']}")
+
+    return findings
+
+
+def _render_critical_finding_lines(findings: list[dict]) -> list[str]:
+    """Render extracted NSE vuln findings as host-note bullet lines."""
+    lines = []
+    for f in findings:
+        loc = f" ({f['port_label']})" if f["port_label"] else ""
+        cve_str = " " + ", ".join(f["cves"]) if f["cves"] else ""
+        risk_str = f" — risk: {f['risk_factor']}" if f["risk_factor"] else ""
+        lines.append(
+            f"- [CONFIRMED] **{f['title']}**{loc} — `{f['script_id']}`{cve_str}{risk_str}"
+        )
+    return lines
+
+
+def _merge_critical_finding_lines(existing_content: str, new_lines: list[str]) -> list[str]:
+    """Union existing '## Critical Findings' bullet lines with newly-detected ones.
+
+    Deduplicates by exact line text. A re-scan that doesn't re-run vuln scripts
+    (or phrases a finding slightly differently) can at worst produce a
+    duplicate-looking line, never lose a previously confirmed finding.
+    """
+    existing_lines = [l for l in existing_content.splitlines() if l.strip().startswith("- ")]
+    merged = list(existing_lines)
+    for line in new_lines:
+        if line not in merged:
+            merged.append(line)
+    return merged
+
+
+def _critical_flag_labels(findings: list[dict]) -> list[str]:
+    """Short frontmatter-friendly labels for extracted NSE vuln findings."""
+    labels = []
+    for f in findings:
+        loc = f" - {f['port_label']}" if f["port_label"] else ""
+        cve_str = f" ({', '.join(f['cves'])})" if f["cves"] else ""
+        labels.append(f"{f['title']}{cve_str}{loc}")
+    return labels
 
 
 # ============================================================
@@ -1846,6 +2097,46 @@ def _classify_password(pw: str) -> str:
     return "cleartext"
 
 
+def _split_cred_value(value: str) -> tuple[str, str, str]:
+    """Split a credential value that may be 'hash:crackedpassword' as well as
+    a plain 'password' or 'hash' -- e.g. "svc_sql:aad3b435...:Summer2026!"
+    from a cracking tool. Returns (password_field, cred_type, notes_extra).
+
+    Only splits on the embedded colon when the first segment actually looks
+    like a hash (_classify_password != "cleartext"); otherwise a password
+    that happens to contain a colon is left intact. When both a hash and its
+    cracked plaintext are present, the hash is kept as the primary value
+    (reusable for pass-the-hash) and the cracked password goes in notes --
+    matching the convention already used by parse_kiwi_secretsdump's _add().
+    """
+    if ":" in value:
+        first, rest = value.split(":", 1)
+        if rest and _classify_password(first) != "cleartext":
+            return first, _classify_password(first), f"cracked password: {rest}"
+    return value, _classify_password(value), ""
+
+
+_KNOWN_HASH_TYPE_NAMES = {
+    "ntlm", "ntlmv2", "netntlmv2", "lm", "sha1", "sha256", "sha512",
+    "bcrypt", "md5crypt", "sha512crypt", "dcc2", "as-rep", "tgs", "hash",
+}
+
+
+def _cred_type_is_hash(cred_type: str) -> bool:
+    """True if a cred_type string denotes a hash rather than a cleartext
+    password. Two naming conventions coexist in this codebase -- the
+    '<TYPE>_hash' / 'hash' suffix form (_classify_password, _split_cred_value,
+    parse_kiwi_secretsdump) and bare hash-type names (_classify_hash,
+    _parse_pending_review_row's 'type:' field) -- and callers of
+    _append_injestor_to_credentials_md use either one, so this recognises
+    both instead of only the suffix form.
+    """
+    if not cred_type:
+        return False
+    ct = cred_type.lower()
+    return ct.endswith("_hash") or ct in _KNOWN_HASH_TYPE_NAMES
+
+
 def _extract_credentials(text: str) -> list[dict]:
     """Extract credential pairs from loot text."""
     creds: list[dict] = []
@@ -2056,10 +2347,14 @@ def _parse_injestor_creds_with_host(text: str) -> list[dict]:
     """Parse credentials from Injestor content with host context detection.
 
     Supports:
-      ## <hostname/ip>          — Markdown header sets host for following creds
-      creds for <host>:         — block header sets host
-      user:pass on <host>       — inline host annotation
-      user:pass                 — uses current host context (or None = Campaign-Level)
+      ## <hostname/ip>              — Markdown header sets host for following creds
+      creds for <host>:             — block header sets host
+      user:pass on <host>           — inline host annotation, host last
+      for <host> user:pass          — inline host annotation, host first
+                                       ("I cracked a password for <host>...")
+      user:pass                     — uses current host context (or None = Campaign-Level)
+    Any credential value may itself be "hash:crackedpassword" (e.g.
+    "svc_sql:aad3b435...:Summer2026!") -- see _split_cred_value.
     """
     creds: list[dict] = []
     seen: set[tuple] = set()
@@ -2090,18 +2385,38 @@ def _parse_injestor_creds_with_host(text: str) -> list[dict]:
             current_host = m.group(1)
             continue
 
+        # "for server2 user:pass" / "on server2 user:hash:password" -- host first
+        m = _CRED_HOST_FIRST_RE.match(stripped)
+        if m:
+            host, user, val_raw = m.group(1), m.group(2), m.group(3)
+            val_raw, line_note = _strip_password_note(val_raw)
+            pw, cred_type, split_note = _split_cred_value(val_raw)
+            note = "; ".join(filter(None, [split_note, line_note]))
+            if pw and user and not user.startswith("/") and "://" not in stripped:
+                key = (user.lower(), pw, host.lower())
+                if key not in seen:
+                    seen.add(key)
+                    creds.append({
+                        "username": user, "password": pw, "cred_type": cred_type,
+                        "host": host, "notes": note,
+                        "source_pattern": "inline_host",
+                    })
+            continue
+
         # "user:pass on server2" inline host
         m = _CRED_WITH_HOST_INLINE_RE.match(stripped)
         if m:
-            user, pw_raw, host = m.group(1), m.group(2), m.group(3)
-            pw, note = _strip_password_note(pw_raw)
+            user, val_raw, host = m.group(1), m.group(2), m.group(3)
+            val_raw, line_note = _strip_password_note(val_raw)
+            pw, cred_type, split_note = _split_cred_value(val_raw)
+            note = "; ".join(filter(None, [split_note, line_note]))
             if pw and user and not user.startswith("/") and "://" not in stripped:
                 key = (user.lower(), pw, host.lower())
                 if key not in seen:
                     seen.add(key)
                     creds.append({
                         "username": user, "password": pw,
-                        "cred_type": _classify_password(pw),
+                        "cred_type": cred_type,
                         "host": host, "notes": note,
                         "source_pattern": "inline_host",
                     })
@@ -2114,14 +2429,16 @@ def _parse_injestor_creds_with_host(text: str) -> list[dict]:
             if (user and pw_raw and len(user) <= 64 and len(pw_raw) <= 128
                     and " " not in user and not user.startswith("/")
                     and not (all(c in "0123456789abcdefABCDEF" for c in user) and len(user) > 20)):
-                pw, note = _strip_password_note(pw_raw)
+                pw_raw, line_note = _strip_password_note(pw_raw)
+                pw, cred_type, split_note = _split_cred_value(pw_raw)
+                note = "; ".join(filter(None, [split_note, line_note]))
                 if pw:
                     key = (user.lower(), pw, (current_host or "").lower())
                     if key not in seen:
                         seen.add(key)
                         creds.append({
                             "username": user, "password": pw,
-                            "cred_type": _classify_password(pw),
+                            "cred_type": cred_type,
                             "host": current_host, "notes": note,
                             "source_pattern": "colon",
                         })
@@ -2413,6 +2730,27 @@ def _build_known_hosts_lookup(vault_dir: Path) -> dict[str, str]:
             lookup[hp.stem.lower()] = host_key
 
     return lookup
+
+
+def _infer_host_from_pasted_text(content: str, known_hosts: dict[str, str] | None = None) -> str:
+    """Guess which host a pasted tool-output blob belongs to.
+
+    Tries a literal IPv4 in scope first. Falls back to matching any word in
+    the text against known vault host identifiers (IP/hostname/short-name) --
+    mimikatz and meterpreter output identify the box by hostname
+    ("Local name : CORP-WS03", "Running module against CORP-WS03"), never
+    by IP, so IP-only matching silently misses every one of those pastes and
+    the credential lands in Campaign-Level with no link back to its host.
+    """
+    for ip in IP_IN_TEXT_RE.findall(content):
+        if _is_target_ip(ip):
+            return ip
+    if known_hosts:
+        for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]{3,}", content):
+            host_key = known_hosts.get(word.lower())
+            if host_key:
+                return host_key
+    return ""
 
 
 def parse_loot_dir(loot_dir: Path, known_hosts: dict[str, str] | None = None) -> dict:
@@ -3245,6 +3583,8 @@ Your job is to produce practical, concise, operator-focused analysis.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Only reference ports, services, CVEs, and findings that are explicitly present
   in the data provided. Do not invent or infer CVE IDs, version numbers, or
   service details not shown.
@@ -3256,6 +3596,10 @@ GROUNDING RULES — follow these strictly:
     [ASSUMED]    — requires verification; explain why
 - Do not suggest an attack path is viable unless the scan data provides
   supporting evidence for each step.
+- If a host's data includes a "CONFIRMED VULNERABILITIES (Nmap NSE)" block,
+  that is a tool-verified positive result, not something you inferred. Lead
+  the "Notable Risks" section for that host with those exact findings, tagged
+  [CONFIRMED], ahead of any other observation for that host.
 
 Priorities:
 - Identify notable exposed services and likely attack surface
@@ -3336,6 +3680,14 @@ When suggesting tools, favor practical enumeration tools such as:
                     lines.append(f"      script:{script.get('id', '')} -> {out}")
             for hint in get_port_hints(p["port"], svc_name, product, extrainfo):
                 lines.append(f"      hint: {hint}")
+        critical = _extract_critical_nse_findings(host)
+        if critical:
+            lines.append("  CONFIRMED VULNERABILITIES (Nmap NSE, ground truth -- do not re-derive, just cite):")
+            for f in critical:
+                loc = f" ({f['port_label']})" if f["port_label"] else ""
+                cve_str = f" {', '.join(f['cves'])}" if f["cves"] else ""
+                risk_str = f" risk:{f['risk_factor']}" if f["risk_factor"] else ""
+                lines.append(f"    - {f['title']}{loc} script:{f['script_id']}{cve_str}{risk_str}")
         if operator_notes_by_ip and ip in operator_notes_by_ip:
             lines.append(_format_operator_notes_for_prompt(operator_notes_by_ip[ip]))
         lines.append("")
@@ -3405,6 +3757,8 @@ Your job is to produce practical, concise, operator-focused analysis.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Only reference ports, services, CVEs, and findings that are explicitly present
   in the data provided. Do not invent or infer CVE IDs, version numbers, or
   service details not shown.
@@ -3570,6 +3924,8 @@ Your job is to produce practical, concise, operator-focused analysis.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Only reference ports, services, CVEs, and findings that are explicitly present
   in the data provided. Do not invent or infer CVE IDs, version numbers, or
   service details not shown.
@@ -3901,6 +4257,8 @@ enumeration results for target {label}.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - All data below was pre-extracted from tool outputs by an automated parser.
   Every finding is [CONFIRMED] unless stated otherwise.
 - Only reference paths, shares, users, technologies, and findings explicitly
@@ -4056,6 +4414,8 @@ during an engagement for target {label}.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - ONLY reference credentials, hashes, and file listings that appear in the
   "Loot Summary" section below. If it says "NONE", there are NONE — do not
   invent example credentials, usernames, passwords, or hashes.
@@ -4072,22 +4432,19 @@ GROUNDING RULES — follow these strictly:
 - Assess password reuse risk if the same username appears with different passwords."""
 
     output_format = """
-Respond using EXACTLY these section headers:
+Respond using EXACTLY these section headers, bullets only, one line per bullet:
 
-## Loot Analysis
-- Significance of discovered credentials and hashes
-- Cross-correlation with scan findings (which services accept these creds?)
-- File listing analysis (sensitive files, config files, potential data exposure)
+## Commands to Try
+- Specific commands to test each credential against the services this host
+  actually exposes (use the actual IP). Include hashcat mode + wordlist for
+  any hash. This is the primary section -- most of your response goes here.
 
-## Credential Impact
-- Which credentials might grant access to which services
-- Password reuse risk across hosts
-- Privilege level assessment (admin, service account, user)
-
-## Recommended Next Steps
-- Specific commands to test credentials against services (with actual IPs)
-- Hash cracking suggestions with hashcat modes
-- Files to examine further
+## Notes
+- Only include a bullet for something genuinely non-obvious: password reuse
+  across hosts, a privilege level that changes priority (e.g. this is a
+  service account with DB-only access), a sensitive file worth pulling.
+  Skip this section entirely if there's nothing beyond the obvious (e.g. a
+  single cracked user credential needs no commentary -- just the commands).
 """.strip()
 
     prompt = (f"{instructions}\n\nLoot Summary\n{'=' * 30}\n"
@@ -4274,6 +4631,8 @@ under a signed Rules of Engagement. Accuracy matters more than completeness.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Only reference findings that are explicitly present in the tool output.
 - Do not invent CVEs, version numbers, or service details not shown.
 - Tag each finding as [CONFIRMED], [INFERRED], or [ASSUMED].
@@ -5472,30 +5831,28 @@ DEEP DIVE TOPIC: {topic}
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Base your analysis ONLY on the host context provided below.
 - Tag each finding as [CONFIRMED], [INFERRED], or [ASSUMED].
 - Do not invent CVEs, version numbers, or service details not in the data.
 - Every command must use the actual target IP ({ip}).
 
-Provide a thorough, operator-focused analysis covering:
+Respond with EXACTLY these three headers, bullets only, one line per bullet:
 
-1. **Attack Surface Analysis** — What does this service/finding expose? What is the
-   risk in context of the other services on this host?
+## Commands
+- Ready-to-run commands to enumerate/exploit {topic} in depth, most useful
+  first. Include multiple tools where relevant. Use the actual target IP.
 
-2. **Enumeration Commands** — Provide ready-to-run commands to enumerate this service
-   in depth. Include multiple tools where relevant. Use the actual target IP.
+## Findings
+- Only specific, actionable facts: a CVE with an exploitability tag
+  ([MSF]/[POC]/[THEORETICAL]) grounded in the version/config data below, a
+  real misconfiguration, or a credential-reuse/chaining opportunity visible
+  in the host context. Skip this section entirely if there's nothing beyond
+  the obvious.
 
-3. **Known Vulnerabilities & Exploits** — Based on the version/config data available,
-   what known vulnerabilities apply? Include CVE IDs only if the version data supports
-   them. Tag exploitability: [MSF] for Metasploit modules, [POC] for public PoC,
-   [THEORETICAL] for version-plausible but unconfirmed.
-
-4. **Attack Paths** — How could this service be leveraged to gain access or pivot?
-   Consider credential reuse, chaining with other services on this host, and lateral
-   movement opportunities.
-
-5. **Recommended Next Steps** — Prioritized checklist of what the operator should do
-   next, in order of likely impact.
+## Next Step
+- The single highest-value next action. One line.
 
 HOST CONTEXT:
 {host_context}
@@ -5735,6 +6092,8 @@ def build_cross_source_prompt(
         "GROUNDING RULES:",
         "- Respond ONLY in English.",
         "- NEVER fabricate, invent, or hallucinate data not present in the sections below.",
+        "- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary. Assume the reader is an experienced pentester.",
+        "- Keep every bullet to ONE line — no multi-sentence paragraphs. Omit a section entirely rather than padding it.",
         "- Tag each finding as [CONFIRMED], [INFERRED], or [ASSUMED].",
         "- Only reference ports, CVEs, credentials, or services that appear in the data.",
         "- If a section is empty or missing, note the coverage gap — do not invent content.",
@@ -6157,6 +6516,55 @@ def _reparse_and_analyze_scan(
         else:
             analysis = raw
 
+        # Operator notes on this note can guide a targeted credential
+        # re-extraction pass -- e.g. "it missed the cleartext password in a
+        # comment in that LDAP dump, make sure this gets entered" -- so a
+        # correction actually reaches Loot/Credentials.md instead of only
+        # being echoed back as prose in ## Analysis.
+        has_op_notes = bool(scan_op_notes and scan_op_notes != OPERATOR_NOTES_HINT.strip())
+        if has_op_notes and args and not getattr(args, "no_ollama", True):
+            guided_content = (
+                f"[OPERATOR NOTE — the assessor flagged something specific to "
+                f"look for below]\n{scan_op_notes}\n\n---\n\n{content}"
+            )
+            reextracted = _llm_extract_tool_output(guided_content, args)
+            new_creds = [
+                nc for nc in (_normalize_llm_extracted_cred(c) for c in reextracted["credentials"])
+                if nc["username"] and nc["password"]
+            ]
+            new_usernames = [u["username"] for u in reextracted["usernames"] if u.get("username")]
+            if new_creds or new_usernames:
+                if any(not c.get("host") for c in new_creds):
+                    fallback_host = _infer_host_from_pasted_text(
+                        content, _build_known_hosts_lookup(vault_dir)
+                    ) or None
+                    for c in new_creds:
+                        c["host"] = c.get("host") or fallback_host
+                added = _append_injestor_to_credentials_md(
+                    vault_dir, new_creds, new_usernames, f"{fname} (operator-guided re-analysis)",
+                )
+                if added:
+                    hosts_dir = vault_dir / "Hosts"
+                    host_cred_counts: dict[str, int] = collections.defaultdict(int)
+                    for c in new_creds:
+                        if c.get("host"):
+                            host_cred_counts[c["host"]] += 1
+                    for host_key, count in host_cred_counts.items():
+                        _link_injestor_creds_to_host_note(hosts_dir, host_key, count, fname)
+                    logging.info(
+                        f"[Analyze] Operator-guided re-extraction added {added} "
+                        f"entr{'y' if added == 1 else 'ies'} to Loot/Credentials.md"
+                    )
+                    if analysis:
+                        analysis = (
+                            f"**Operator-guided re-extraction:** added {added} new "
+                            f"entr{'y' if added == 1 else 'ies'} to Loot/Credentials.md.\n\n"
+                        ) + analysis
+                else:
+                    logging.info("[Analyze] Operator-guided re-extraction found nothing new")
+            else:
+                logging.info("[Analyze] Operator-guided re-extraction found nothing new")
+
     elif label_lower.startswith("loot"):
         parts = label.split("—", 1)
         host_key = parts[1].strip() if len(parts) > 1 else "campaign"
@@ -6323,6 +6731,13 @@ def _merge_two_host_notes(keep_path: Path, delete_path: Path, vault_dir: Path) -
     while body_lines and not body_lines[-1].strip():
         body_lines.pop()
 
+    # Creds tables: union the rows into one table (concatenating two
+    # sections would leave a second header row mid-table).
+    body_lines += ["", CREDS_SECTION, _merge_creds_sections(
+        extract_body_section(keep_body, CREDS_SECTION),
+        extract_body_section(delete_body, CREDS_SECTION),
+    )]
+
     for section in MERGE_SECTIONS:
         k = extract_body_section(keep_body, section).strip()
         d = extract_body_section(delete_body, section).strip()
@@ -6472,6 +6887,14 @@ def _detect_and_merge_host_notes(vault_dir: Path) -> list[str]:
         except Exception as exc:
             logging.warning(f"[Merge] Failed {keep_path.stem}+{delete_path.stem}: {exc}")
 
+    if reports:
+        # The merged body drops ## Pivots (it's derived, not merged) and
+        # Pivots.md may name the deleted stem; regenerate both.
+        try:
+            _refresh_pivots(vault_dir)
+        except Exception as exc:
+            logging.warning(f"[Merge] Pivot refresh failed: {exc}")
+
     return reports
 
 
@@ -6545,6 +6968,8 @@ def _render_host_note_body(
         if header in ("## Scan References", OPERATOR_NOTES_SENTINEL):
             continue
         content = sections.get(header, "")
+        if not content and header == CREDS_SECTION:
+            content = CREDS_DEFAULT_CONTENT  # always offer the entry table
         if content:
             lines += ["", header, content]
 
@@ -6644,6 +7069,21 @@ def _write_host_note(
     else:
         open_ports_content = "_No open ports detected._"
     sections["## Open Ports"] = open_ports_content
+
+    # Critical findings: confirmed-VULNERABLE Nmap NSE results (e.g. MS17-010),
+    # surfaced deterministically so they don't depend on the LLM noticing them
+    # in prose. Merged with whatever a prior scan already found so a narrower
+    # re-scan (no vuln scripts) never drops an earlier confirmed finding.
+    new_critical = _extract_critical_nse_findings(host)
+    if new_critical:
+        new_labels = _critical_flag_labels(new_critical)
+        existing_labels = fm.get("critical_flags", [])
+        fm["critical_flags"] = existing_labels + [l for l in new_labels if l not in existing_labels]
+    merged_critical_lines = _merge_critical_finding_lines(
+        sections.get("## Critical Findings", ""), _render_critical_finding_lines(new_critical)
+    )
+    if merged_critical_lines:
+        sections["## Critical Findings"] = "\n".join(merged_critical_lines)
 
     body = _render_host_note_body(preamble, sections, fm["sources"], state["operator_notes"])
     _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
@@ -7531,6 +7971,26 @@ _CRED_TABLE_ROW_RE = re.compile(
     r"\s*(.*?)\s*\|$"          # Notes
 )
 
+_TABLE_SEP_CELL_RE = re.compile(r"^:?-{2,}:?$")
+
+
+def _is_markdown_table_separator_row(line: str) -> bool:
+    """True for a markdown table separator row, tolerant of Obsidian's padding.
+
+    Obsidian's own table editor reformats separators as '| --- | :--- |'
+    (padded, optionally with alignment colons). A plain `stripped.startswith
+    ("|---")` check misses that as soon as a human -- or Obsidian itself --
+    touches the table, which misfiles the separator as a data row on the next
+    parse/rewrite round-trip and corrupts the table (missing separator,
+    rows silently reordered past it). This tolerates any whitespace/colon
+    padding so the round-trip survives a reformatted table.
+    """
+    s = line.strip()
+    if not (s.startswith("|") and s.endswith("|")) or len(s) < 3:
+        return False
+    cells = s.strip("|").split("|")
+    return bool(cells) and all(_TABLE_SEP_CELL_RE.match(c.strip()) for c in cells)
+
 
 def _read_credential_annotations(creds_path: Path) -> dict[str, str]:
     """Read existing per-host operator notes from Credentials.md.
@@ -8066,77 +8526,105 @@ def _write_loot_credentials_page(
     host_stem_map: dict[str, str],
     host_display_map: dict[str, str] | None = None,
 ) -> None:
-    """Write Loot/Credentials.md with all credentials organized by host."""
+    """Write Loot/Credentials.md with all credentials organized by host.
+
+    This rebuilds the page from a fresh scan of scans/loot/ on every run --
+    but rows added by Injestor (kiwi/NXC pastes, LSA secrets, +cred) or a
+    now-deleted loot file have no scans/loot/ file to be re-derived from. A
+    naive rebuild silently deletes them the moment this runs after they're
+    added. `_orphan_raw_rows` carries forward any existing row this run's
+    loot-dir scan didn't reproduce, so a routine re-scan never drops a
+    credential that only ever existed in this file.
+    """
     page_path = loot_dir_out / "Credentials.md"
 
     existing_annotations = _read_credential_annotations(page_path)
     existing_row_notes = _read_credential_row_notes(page_path)
+    existing_text = page_path.read_text(encoding="utf-8") if page_path.exists() else ""
+    existing_sections = {
+        s["key"]: s for s in _parse_credentials_md_sections(existing_text)["sections"]
+        if not s["is_aggregate"]
+    }
+
+    def _orphan_raw_rows(section_key: str, covered_usernames: set[str]) -> list[str]:
+        old_sec = existing_sections.get(section_key)
+        if not old_sec:
+            return []
+        return [r["raw"] for r in old_sec["rows"] if r["username"].lower() not in covered_usernames]
+
+    body_lines: list[str] = []
+    total_creds = 0
+    has_content = False
+
+    all_host_keys = sorted(set(loot_data["host_loot"].keys())
+                            | {k for k in existing_sections if k != "Campaign-Level"})
+    for host_key in all_host_keys:
+        rows = _build_cred_rows(loot_data["host_loot"].get(host_key, []))
+        orphan_rows = _orphan_raw_rows(host_key, {r["username"].lower() for r in rows})
+        if not rows and not orphan_rows:
+            continue
+        has_content = True
+        total_creds += len(rows) + len(orphan_rows)
+        host_stem = host_stem_map.get(host_key, safe_filename(host_key))
+        host_display = (host_display_map or {}).get(host_key, host_key)
+        host_row_notes = existing_row_notes.get(host_key, {})
+        body_lines.append(f"## [[Hosts/{host_stem}|{host_display}]]")
+        body_lines.append("")
+        body_lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
+        body_lines.append("|----------|----------|------|-----------|--------|-------|")
+        for r in rows[:50]:
+            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
+            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
+            ht = r["hash_type"] or "—"
+            note = host_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
+            body_lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
+        body_lines.extend(orphan_rows)
+        body_lines.append("")
+
+        body_lines.append(_CRED_NOTES_SENTINEL)
+        body_lines.append(_CRED_NOTES_HINT)
+        existing_notes = existing_annotations.get(host_key, "")
+        if existing_notes:
+            body_lines.append("")
+            body_lines.append(existing_notes)
+        body_lines.append("")
+
+    campaign_rows = _build_cred_rows(loot_data.get("campaign_loot", []))
+    campaign_orphans = _orphan_raw_rows("Campaign-Level", {r["username"].lower() for r in campaign_rows})
+    if campaign_rows or campaign_orphans:
+        has_content = True
+        total_creds += len(campaign_rows) + len(campaign_orphans)
+        campaign_row_notes = existing_row_notes.get("Campaign-Level", {})
+        body_lines.append("## Campaign-Level")
+        body_lines.append("")
+        body_lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
+        body_lines.append("|----------|----------|------|-----------|--------|-------|")
+        for r in campaign_rows[:50]:
+            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
+            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
+            ht = r["hash_type"] or "—"
+            note = campaign_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
+            body_lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
+        body_lines.extend(campaign_orphans)
+        body_lines.append("")
+
+        body_lines.append(_CRED_NOTES_SENTINEL)
+        body_lines.append(_CRED_NOTES_HINT)
+        existing_notes = existing_annotations.get("Campaign-Level", "")
+        if existing_notes:
+            body_lines.append("")
+            body_lines.append(existing_notes)
+        body_lines.append("")
 
     lines: list[str] = [
         "# Credentials & Users",
         "",
         f"_Last updated: {loot_data['parsed_at']}_",
         "",
+        f"**Total credential entries:** {total_creds}",
+        "",
     ]
-
-    total_creds = loot_data["summary"].get("total_credentials", 0)
-    lines.append(f"**Total credential entries:** {total_creds}")
-    lines.append("")
-
-    has_content = False
-
-    for host_key, loot_files in sorted(loot_data["host_loot"].items()):
-        rows = _build_cred_rows(loot_files)
-        if not rows:
-            continue
-        has_content = True
-        host_stem = host_stem_map.get(host_key, safe_filename(host_key))
-        host_display = (host_display_map or {}).get(host_key, host_key)
-        host_row_notes = existing_row_notes.get(host_key, {})
-        lines.append(f"## [[Hosts/{host_stem}|{host_display}]]")
-        lines.append("")
-        lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
-        lines.append("|----------|----------|------|-----------|--------|-------|")
-        for r in rows[:50]:
-            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
-            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
-            ht = r["hash_type"] or "—"
-            note = host_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
-            lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
-        lines.append("")
-
-        lines.append(_CRED_NOTES_SENTINEL)
-        lines.append(_CRED_NOTES_HINT)
-        existing_notes = existing_annotations.get(host_key, "")
-        if existing_notes:
-            lines.append("")
-            lines.append(existing_notes)
-        lines.append("")
-
-    campaign_rows = _build_cred_rows(loot_data.get("campaign_loot", []))
-    if campaign_rows:
-        has_content = True
-        campaign_row_notes = existing_row_notes.get("Campaign-Level", {})
-        lines.append("## Campaign-Level")
-        lines.append("")
-        lines.append("| Username | Password | Hash | Hash Type | Source | Notes |")
-        lines.append("|----------|----------|------|-----------|--------|-------|")
-        for r in campaign_rows[:50]:
-            pw = f"`{r['password'][:50]}`" if r["password"] else "—"
-            hsh = f"`{r['hash'][:40]}...`" if len(r.get("hash", "")) > 40 else (f"`{r['hash']}`" if r["hash"] else "—")
-            ht = r["hash_type"] or "—"
-            note = campaign_row_notes.get(r["username"], "") or r.get("inline_note", "") or "—"
-            lines.append(f"| `{r['username']}` | {pw} | {hsh} | {ht} | {r['source']} | {note} |")
-        lines.append("")
-
-        lines.append(_CRED_NOTES_SENTINEL)
-        lines.append(_CRED_NOTES_HINT)
-        existing_notes = existing_annotations.get("Campaign-Level", "")
-        if existing_notes:
-            lines.append("")
-            lines.append(existing_notes)
-        lines.append("")
-
+    lines.extend(body_lines)
     if not has_content:
         lines.append("_No credentials or users found._")
 
@@ -8759,6 +9247,8 @@ under a signed Rules of Engagement. Accuracy matters more than completeness.
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English. Do not use any other language.
 - NEVER fabricate, invent, or hallucinate data. If the provided data is insufficient, say so explicitly rather than making up examples.
+- Do NOT explain what a well-known service, protocol, or tool is, or restate generic textbook risk commentary (e.g. skip "SMB allows file sharing which could expose data"). Assume the reader is an experienced pentester.
+- Keep bullets to ONE line each — no multi-sentence paragraphs. Omit a section entirely rather than padding it with obvious or trivial filler.
 - Only reference ports, services, CVEs, and findings that are explicitly present
   in the data provided. Do not invent or infer CVE IDs, version numbers, or
   service details not shown.
@@ -8776,6 +9266,9 @@ Each entry must be a single line in this exact format:
   N. <hostname or IP> [TAG] — <primary evidence: CVE ID / finding name / service>; <brief impact>
 
 Base your ranking on:
+- A host line marked "CONFIRMED VULNERABILITIES (Nmap NSE)" is a tool-verified
+  positive result (e.g. MS17-010/EternalBlue), not an inference -- rank that
+  host at or near #1 and tag it [CONFIRMED], regardless of its port count.
 - CVEs with confirmed plugin output and known weaponized exploits ([MSF] first)
 - CVSS scores (critical ≥ 9.0, high ≥ 7.0) — but only when plugin_output:yes
 - Exposed management interfaces with evidence of weak auth (RDP, WinRM, SSH)
@@ -8827,7 +9320,11 @@ Maximum 10 entries.
         ar_writable    = bool(ar_section and ("READ/WRITE" in ar_section or "read/write" in ar_section))
         ar_users       = len(re.findall(r"`(\w+)`", ar_section)) if ar_section else 0
 
+        critical_flags = fm.get("critical_flags", [])
+
         parts = [f"{display} (IP: {ip})"]
+        if critical_flags:
+            parts.append(f"CONFIRMED VULNERABILITIES (Nmap NSE): {'; '.join(critical_flags)}")
         if tags:
             parts.append(f"services: {', '.join(tags)}")
         parts.append(f"open-ports: {port_count}")
@@ -8888,9 +9385,10 @@ Maximum 10 entries.
 
 def _build_priority_targets_fallback(vault_dir: Path) -> str:
     """
-    Build a static Priority Targets list (no AI) sorted by Nessus severity,
-    Burp high count, and open port count.  Used when Ollama is skipped or
-    no analyses have been generated yet.
+    Build a static Priority Targets list (no AI), sorted first by confirmed
+    Nmap NSE vulnerabilities (frontmatter `critical_flags`), then Nessus
+    severity, Burp high count, and open port count. Used when Ollama is
+    skipped or no analyses have been generated yet.
     """
     hosts_dir  = vault_dir / "Hosts"
     host_notes = sorted(hosts_dir.glob("*.md")) if hosts_dir.exists() else []
@@ -8907,6 +9405,7 @@ def _build_priority_targets_fallback(vault_dir: Path) -> str:
         hostnames = fm.get("hostnames", [])
         display   = hostnames[0] if hostnames else (ip or hp.stem)
         tags      = fm.get("tags", [])
+        critical_flags = fm.get("critical_flags", [])
         nessus_max = fm.get("nessus_max_severity", 0)
         try:
             nessus_max = int(nessus_max)
@@ -8923,6 +9422,8 @@ def _build_priority_targets_fallback(vault_dir: Path) -> str:
         burp_high      = burp_section.count("[High") if burp_section else 0
 
         reasons: list[str] = []
+        if critical_flags:
+            reasons.append(f"CONFIRMED: {'; '.join(critical_flags[:2])}")
         if cves:
             reasons.append(", ".join(cves))
         if "domain-controller" in tags:
@@ -8944,7 +9445,7 @@ def _build_priority_targets_fallback(vault_dir: Path) -> str:
 
         entries.append({
             "display":  display,
-            "sort_key": (-nessus_max, -burp_high, -port_count),
+            "sort_key": (0 if critical_flags else 1, -nessus_max, -burp_high, -port_count),
             "reason":   "; ".join(reasons) if reasons else "no notable findings",
         })
 
@@ -8959,10 +9460,50 @@ def _build_priority_targets_fallback(vault_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_next_steps(all_analyses: list[tuple[str, str]], max_items: int = 14) -> str:
+_NEXT_STEPS_HOWTO = """\
+# Next Steps
+
+_Fills in from AI analysis of your scans. None has been run yet._
+
+**Interactive** (`python mAIpper.py -i`)
+- `/analyze-full`: analyze every scan and host
+- or tick `Analyze:` / `Investigate:` boxes in Obsidian, then `/analyze`
+- `/deepdive`: correlate all sources per host
+- `/refresh`: redraw this canvas with the results
+
+**Batch**
+- `python mAIpper.py --reanalyze`: analyze every scan, including ones already processed by `-i` or `--no-ollama` (a plain run skips those)
+
+_Needs Ollama running (`ollama serve`). Remote or other model: `--ollama-url`, `--model`._"""
+
+_NEXT_STEPS_FOOTER = (
+    "_From AI analysis in Scans/. Update: `/analyze` then `/refresh` (interactive), "
+    "or `python mAIpper.py --reanalyze`._"
+)
+
+
+def _build_next_steps(
+    all_analyses: list[tuple[str, str]],
+    vault_dir: Path | None = None,
+    max_items: int = 14,
+) -> str:
+    """Canvas Next Steps panel. Pulls attack-path/enumeration bullets from
+    this run's analyses, then from analysis already saved in Scans/ notes --
+    without the latter, results from interactive /analyze never reached the
+    canvas, and a batch re-run with no changed scans blanked the panel."""
     items: list[str] = []
 
-    for _scan_display, text in all_analyses:
+    texts = [text for _, text in all_analyses]
+    scans_dir = vault_dir / "Scans" if vault_dir else None
+    if scans_dir and scans_dir.exists():
+        notes = sorted(scans_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for note in notes:
+            try:
+                texts.append(note.read_text(encoding="utf-8"))
+            except OSError as exc:
+                logging.debug(f"Next Steps: could not read {note.name}: {exc}")
+
+    for text in texts:
         for section in (
             "Potential Attack Paths",
             "Enumeration Suggestions",
@@ -8988,11 +9529,12 @@ def _build_next_steps(all_analyses: list[tuple[str, str]], max_items: int = 14) 
                 break
 
     if not items:
-        return "# Next Steps\n\n_Run scans with AI analysis enabled to populate next steps._"
+        return _NEXT_STEPS_HOWTO
 
     lines = ["# Next Steps", ""]
     for item in items[:max_items]:
         lines.append(f"- {item}")
+    lines += ["", _NEXT_STEPS_FOOTER]
     return "\n".join(lines)
 
 
@@ -9292,9 +9834,10 @@ def detect_kiwi_secretsdump(text: str) -> str | None:
     """Detect kiwi/mimikatz/secretsdump format. Returns format tag or None.
 
     Format tags:
-      'sam'          — secretsdump/hashdump: user:RID:LM:NTLM:::
-      'kiwi_sekurlsa'— sekurlsa::logonpasswords: * Username / * NTLM blocks
-      'kiwi_lsa_dump'— meterpreter lsa_dump_sam:  User: / Hash NTLM: blocks
+      'sam'             — secretsdump/hashdump: user:RID:LM:NTLM:::
+      'kiwi_sekurlsa'   — sekurlsa::logonpasswords: * Username / * NTLM blocks
+      'kiwi_lsa_dump'   — meterpreter lsa_dump_sam:  User: / Hash NTLM: blocks
+      'kiwi_lsa_secrets'— meterpreter lsa_dump_secrets: Secret: / cur/text: blocks
     """
     if SAM_DUMP_LINE_RE.search(text):
         return "sam"
@@ -9303,19 +9846,28 @@ def detect_kiwi_secretsdump(text: str) -> str | None:
     if (KIWI_HASH_LINE_RE.search(text)
             and re.search(r"^\s*User\s*:", text, re.MULTILINE)):
         return "kiwi_lsa_dump"
+    if LSA_SECRET_LINE_RE.search(text) and LSA_SECRET_VALUE_RE.search(text):
+        return "kiwi_lsa_secrets"
     return None
 
 
 def parse_kiwi_secretsdump(text: str, host: str = "") -> dict:
     """Parse kiwi / secretsdump / mimikatz output into structured credentials.
 
-    Handles three formats:
+    Handles four formats:
     1. secretsdump / hashdump SAM lines:  Administrator:500:LM32:NTLM32:::
     2. kiwi sekurlsa::logonpasswords:     * Username / * NTLM / * Password blocks
     3. kiwi lsa_dump_sam (meterpreter):   RID / User / Hash NTLM block structure
+    4. kiwi lsa_dump_secrets (meterpreter): Secret: <name> / cur/text: <value> blocks
+       (DefaultPassword, service account passwords, etc.; hex-only secrets like
+       DPAPI_SYSTEM are skipped — that blob is DPAPI key material, not a crackable
+       password hash, so no credential is fabricated for it). The secret's *name*
+       is not a username -- this format never reveals the associated account, so
+       the row is recorded as username "LSA Secret: <name>" with a note prompting
+       manual correlation, rather than fabricating a fake identity.
 
     Returns {"credentials": [...]} — each entry compatible with
-    _append_injestor_to_credentials_md (username, password, hash, hash_type, host, source, notes).
+    _append_injestor_to_credentials_md (username, password, cred_type, host, source, notes).
     """
     creds: list[dict] = []
     seen: set[str] = set()
@@ -9327,11 +9879,22 @@ def parse_kiwi_secretsdump(text: str, host: str = "") -> dict:
         if key in seen:
             return
         seen.add(key)
+        # Unified cred schema (matches _parse_cred_table_rows / _parse_injestor_creds_with_host):
+        # a single 'password' field holds either the cleartext value or the hash, and 'cred_type'
+        # says which ("cleartext" or "<TYPE>_hash") — NOT separate hash/hash_type keys.
+        if h:
+            cred_type = f"{htype}_hash" if htype else "hash"
+            value = h
+            if password:
+                extra = f"cleartext password: {password}"
+                notes = f"{notes}; {extra}".strip("; ") if notes else extra
+        else:
+            cred_type = "cleartext"
+            value = password
         creds.append({
             "username": username,
-            "password": password,
-            "hash": h,
-            "hash_type": htype,
+            "password": value,
+            "cred_type": cred_type,
             "host": h_host or host,
             "source": "Injestor (kiwi/secretsdump)",
             "notes": notes,
@@ -9424,6 +9987,41 @@ def parse_kiwi_secretsdump(text: str, host: str = "") -> dict:
                 if ntlm != empty_ntlm:
                     notes = f"domain: {domain_ctx}" if domain_ctx else ""
                     _add(cur_user, "", ntlm, "NTLM", host, notes)
+
+    # ── Format 4: meterpreter lsa_dump_secrets  Secret: <name> / cur/text: <value> ──
+    # Only secrets with a decoded cur/text value become credentials (e.g. DefaultPassword,
+    # service account passwords). Secrets that only ever show cur/hex/full (e.g.
+    # DPAPI_SYSTEM) are DPAPI key material, not a password hash — skipped rather than
+    # fabricated into a fake username/hash pair.
+    if LSA_SECRET_LINE_RE.search(text) and LSA_SECRET_VALUE_RE.search(text):
+        _secret_name_re = re.compile(r"^\s*Secret\s*:\s*(\S.*?)\s*$")
+        _secret_curtext_re = re.compile(r"^\s*cur/text\s*:\s*(.*)$", re.IGNORECASE)
+
+        cur_secret = None
+        for line in text.splitlines():
+            nm = _secret_name_re.match(line)
+            if nm:
+                cur_secret = nm.group(1).strip()
+                continue
+            tm = _secret_curtext_re.match(line)
+            if tm and cur_secret:
+                value = tm.group(1).strip()
+                if value:
+                    # The LSA secret NAME (e.g. "DefaultPassword", "_SC_<Service>")
+                    # identifies which secret slot this is -- it is not a username,
+                    # and secretsdump/mimikatz do not decode the associated account
+                    # from this output. Recording it as a fake "username" silently
+                    # loses the real credential's identity, so surface it as a named
+                    # secret needing manual correlation instead.
+                    note = f"LSA secret '{cur_secret}' decoded value"
+                    if cur_secret.lower() == "defaultpassword":
+                        note += (
+                            " -- likely the autologon/local account password; "
+                            "confirm the account name via HKLM\\SOFTWARE\\Microsoft\\"
+                            "Windows NT\\CurrentVersion\\Winlogon\\DefaultUserName"
+                        )
+                    _add(f"LSA Secret: {cur_secret}", value, "", "", host, notes=note)
+                cur_secret = None
 
     return {"credentials": creds}
 
@@ -9647,7 +10245,7 @@ def build_canvas(
     next_y = cur_y + 40
     our_nodes.append(_text_node(
         next_id,
-        _build_next_steps(all_analyses),
+        _build_next_steps(all_analyses, vault_dir),
         next_x, next_y, NEXT_STEPS_W, NEXT_STEPS_H,
         color="5",
     ))
@@ -9655,6 +10253,16 @@ def build_canvas(
     preserved   = [n for n in existing_canvas.get("nodes", []) if n.get("id") not in managed_ids]
     final_nodes = preserved + our_nodes
     final_edges = our_edges
+
+    # 5. Pivot overlay (edges + Pivot Paths panel). Its stale nodes ride in
+    # via `preserved`; _add_pivots_to_canvas drops them before re-adding.
+    try:
+        pivot_index = _build_pivot_host_index(vault_dir)
+        overlay = {"nodes": final_nodes, "edges": final_edges}
+        _add_pivots_to_canvas(overlay, _read_pivots(vault_dir, pivot_index), pivot_index)
+        final_nodes, final_edges = overlay["nodes"], overlay["edges"]
+    except Exception as exc:  # never lose the canvas over the overlay
+        logging.warning(f"Canvas pivot overlay failed: {exc}")
 
     _atomic_write_text(
         canvas_path,
@@ -9711,11 +10319,27 @@ _Processed automatically into ## Access sections in host notes._
 
 """
 
+# Appended to the template (and to pre-existing Injestor pages that lack it).
+_INJESTOR_PIVOTS_BLOCK = """\
+---
+
+## Pivots
+
+_One pivot per line, in plain words. Name hosts by IP or by a name from Hosts/; targets can be hosts or subnets (CIDR or 172.16.2.x)._
+_e.g. `ligolo agent on web01 gives access to 172.16.2.0/24` / `pivot from 10.10.10.5 to 172.16.2.10 with chisel` / `web01 -> dc02 -> 10.10.20.0/24`_
+_Saved to Pivots.md, shown in each host's ## Pivots section and as purple edges on the Assessment Canvas._
+
+
+"""
+_INJESTOR_TEMPLATE += _INJESTOR_PIVOTS_BLOCK
+
 _INJESTOR_NOTES_HEADERS       = {"notes", "notes / tool output", "paste here", "free-text"}
 _INJESTOR_TOOL_OUTPUT_HEADERS = {"tool output", "raw output", "tool output / raw data"}
 _INJESTOR_CRED_HEADERS        = {"credentials", "creds", "credentials / users"}
 _INJESTOR_ACCESS_HEADERS      = {"access", "access gained", "shells", "access / shells"}
+_INJESTOR_PIVOT_HEADERS       = {"pivots", "pivot", "pivoting", "tunnels"}
 _INJESTOR_TEMPLATE_HINTS = {
+    "_one pivot per line", "_e.g. `ligolo", "_saved to pivots.md",
     "_processed on", "_each section", "_free-text observations", "_only ips and hostnames",
     "_paste raw tool output", "_supported:", "_the llm identifies", "_low-confidence items",
     "_record shells", "_privilege examples", "_method examples", "_processed automatically",
@@ -9745,6 +10369,8 @@ def _parse_injestor_sections(raw: str) -> dict:
         "has_credential_section": False,
         "has_tool_output_section": False,
         "has_access_section": False,
+        "pivots": [],                   # ## Pivots — freeform pivot lines
+        "has_pivot_section": False,
         # Legacy: populated when no template sections found (plain freeform paste)
         "freeform": "",
     }
@@ -9752,8 +10378,9 @@ def _parse_injestor_sections(raw: str) -> dict:
     tool_output_lines: list[str] = []
     cred_host_lines: dict[str, list[str]] = collections.defaultdict(list)
     access_lines: list[str] = []
+    pivot_lines: list[str] = []
 
-    in_section: str | None = None   # "notes" | "tool_output" | "credentials" | "access" | None
+    in_section: str | None = None   # "notes" | "tool_output" | "credentials" | "access" | "pivots" | None
     current_host = "Campaign-Level"
     found_any_section = False
 
@@ -9798,6 +10425,9 @@ def _parse_injestor_sections(raw: str) -> dict:
             elif header_name in _INJESTOR_ACCESS_HEADERS:
                 in_section = "access"
                 result["has_access_section"] = True
+            elif header_name in _INJESTOR_PIVOT_HEADERS:
+                in_section = "pivots"
+                result["has_pivot_section"] = True
             else:
                 # Unknown section — treat as notes
                 in_section = "notes"
@@ -9828,6 +10458,9 @@ def _parse_injestor_sections(raw: str) -> dict:
         elif in_section == "access":
             if stripped:
                 access_lines.append(stripped)
+        elif in_section == "pivots":
+            if stripped:
+                pivot_lines.append(stripped)
         else:
             # Notes section or pre-header freeform
             notes_lines.append(line)
@@ -9836,6 +10469,7 @@ def _parse_injestor_sections(raw: str) -> dict:
     result["tool_output"] = "\n".join(tool_output_lines).strip()
     result["credentials"] = {k: "\n".join(v) for k, v in cred_host_lines.items() if v}
     result["access"] = access_lines
+    result["pivots"] = pivot_lines
 
     # Legacy freeform: if no template sections were found, treat everything as notes
     if not found_any_section:
@@ -9869,8 +10503,11 @@ _Lines beginning with _ (italics) are treated as hints and ignored by the parser
 You are an experienced penetration tester conducting a professional engagement
 under a signed Rules of Engagement.
 
-Your job is to produce practical, concise, operator-focused analysis.
-Accuracy matters more than completeness. When in doubt, say so explicitly.
+Your job is to produce short, command-first, operator-focused analysis.
+Assume the reader is an experienced pentester: never explain what a
+well-known service, protocol, or tool is, and never restate generic
+textbook risk commentary. Accuracy matters more than completeness. When in
+doubt, say so explicitly.
 
 GROUNDING RULES — follow these strictly:
 - Respond ONLY in English.
@@ -9886,7 +10523,11 @@ GROUNDING RULES — follow these strictly:
     [ASSUMED]    — requires verification; state why
 - Do not suggest an attack path is viable unless the data supports each step.
 - Do not repeat data verbatim — synthesize and prioritize.
-- Keep responses concise and operator-focused.
+- Keep every bullet to ONE line — no multi-sentence paragraphs. Omit a section
+  entirely rather than padding it with obvious or trivial filler.
+- Lead with commands, not explanation. If a finding is trivial or obvious
+  (e.g. "one credential was found"), skip the commentary and go straight to
+  the next command to try.
 
 ---
 
@@ -10011,11 +10652,24 @@ def _load_assessment_config(vault_dir: Path) -> dict:
 
 
 def _install_injestor(vault_dir: Path) -> None:
-    """Create the Injestor page if it doesn't exist."""
+    """Create the Injestor page (and Pivots.md) if they don't exist, and add
+    the ## Pivots section to an Injestor page created before it existed --
+    appended, so anything already typed into the page is kept."""
     injestor_path = vault_dir / "Injestor.md"
     if not injestor_path.exists():
         _atomic_write_text(injestor_path, _INJESTOR_TEMPLATE)
         logging.info("Created Injestor page")
+    else:
+        try:
+            text = injestor_path.read_text(encoding="utf-8")
+            if not re.search(r"(?mi)^##\s+(?:pivots?|pivoting|tunnels)\s*$", text):
+                _atomic_write_text(injestor_path,
+                                   text.rstrip("\n") + "\n\n" + _INJESTOR_PIVOTS_BLOCK)
+                logging.info("Added ## Pivots section to Injestor page")
+        except (OSError, FileLockedError) as exc:
+            logging.warning(f"Could not add ## Pivots to Injestor page: {exc}")
+    if not (vault_dir / PIVOTS_FILENAME).exists():
+        _write_pivots_table(vault_dir, [])
 
 
 def _parse_credentials_md_sections(text: str) -> dict:
@@ -10104,7 +10758,7 @@ def _parse_credentials_md_sections(text: str) -> dict:
             current["table_header"] = [line]
             continue
 
-        if in_table and stripped.startswith("|---"):
+        if in_table and _is_markdown_table_separator_row(line):
             current["table_header"].append(line)
             continue
 
@@ -10153,11 +10807,17 @@ def _sections_to_text(parsed: dict) -> str:
         out.append(sec["header"])
         out.append("")
         if not sec["is_aggregate"]:
-            th = sec["table_header"] if sec["table_header"] else table_header_default
+            th = list(sec["table_header"]) if sec["table_header"] else list(table_header_default)
+            if len(th) < 2 or not _is_markdown_table_separator_row(th[1]):
+                # Self-heal a table whose separator was lost or misfiled by an
+                # earlier parse (e.g. after Obsidian reformatted the row with
+                # padded dashes) instead of re-emitting a table Obsidian can't render.
+                th = [th[0] if th else table_header_default[0], table_header_default[1]]
             out.extend(th)
+            trailing = [l for l in sec.get("trailing", []) if not _is_markdown_table_separator_row(l)]
             for row in sec["rows"]:
                 out.append(row["raw"])
-            out.extend(sec.get("trailing", []))
+            out.extend(trailing)
             out.append("")
             out.append(_CRED_NOTES_SENTINEL)
             out.append(_CRED_NOTES_HINT)
@@ -10239,11 +10899,16 @@ def _append_injestor_to_credentials_md(
     creds: list[dict],
     usernames: list[str],
     source_label: str,
+    host_stems: dict[str, str] | None = None,
 ) -> int:
     """Upsert Injestor credentials into Loot/Credentials.md.
 
     Supports per-host sections (creds with a 'host' key), cross-host note updates,
     and campaign-level fallback. Regenerates aggregate lists at the end.
+
+    host_stems maps a host key to its host-note stem; a section created for a
+    key in it gets a linked '## [[Hosts/<stem>|<key>]]' header (the format
+    _write_loot_credentials_page emits) instead of a bare '## <key>'.
 
     Returns count of new rows added.
     """
@@ -10289,7 +10954,8 @@ def _append_injestor_to_credentials_md(
             return sec
         new_sec = {
             "key": key,
-            "header": f"## {key}",
+            "header": (f"## [[Hosts/{host_stems[key]}|{key}]]"
+                       if host_stems and key in host_stems else f"## {key}"),
             "table_header": list(table_header_default),
             "rows": [],
             "operator_notes": "",
@@ -10336,7 +11002,7 @@ def _append_injestor_to_credentials_md(
                 continue
 
             existing_usernames[uname_lower] = {"username": c["username"]}
-            is_hash = c["cred_type"].endswith("hash") or c["cred_type"] == "hash"
+            is_hash = _cred_type_is_hash(c["cred_type"])
             new_row = {
                 "username": c["username"],
                 "password": "" if is_hash else c["password"],
@@ -10378,6 +11044,697 @@ def _append_injestor_to_credentials_md(
     _atomic_write_text(page_path, _sections_to_text(parsed))
     _rebuild_campaign_aggregates(page_path)
     return added
+
+
+# ============================================================
+# Per-host ## Creds entry table
+# ============================================================
+
+_UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+
+def _split_md_table_row(line: str) -> list[str] | None:
+    """Split one '| a | b | c |' line into stripped cells, or None if the
+    line is not a table row. Honours Obsidian's '\\|' escape for a literal
+    pipe inside a cell (passwords can contain '|')."""
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    inner = s[1:]
+    if inner.endswith("|") and not inner.endswith("\\|"):
+        inner = inner[:-1]
+    return [c.strip().replace("\\|", "|") for c in _UNESCAPED_PIPE_RE.split(inner)]
+
+
+def _parse_host_creds_table(section: str) -> list[dict]:
+    """Read the filled-in rows of a host note's ## Creds table.
+
+    Returns [{"username", "password", "notes", "raw"}] for every row with a
+    username; the header, separator and blank template rows are skipped.
+    Surrounding backticks are stripped so `user` and user mean the same.
+    """
+    rows: list[dict] = []
+    for line in section.splitlines():
+        cells = _split_md_table_row(line)
+        if not cells or _is_markdown_table_separator_row(line):
+            continue
+        cells = [c.strip("`").strip() for c in cells] + ["", "", ""]
+        username, password, notes = cells[0], cells[1], cells[2]
+        if not username or username.lower() == "username":
+            continue
+        rows.append({"username": username, "password": password,
+                     "notes": notes, "raw": line.strip()})
+    return rows
+
+
+def _merge_creds_sections(keep: str, other: str) -> str:
+    """Union two ## Creds sections into one table for /merge.
+
+    Rows are deduplicated on (username, password) case-insensitively for the
+    username, so the same credential recorded on both notes appears once but
+    two different passwords for one account are both kept.
+    """
+    seen: set[tuple[str, str]] = set()
+    rows: list[str] = []
+    for row in _parse_host_creds_table(keep) + _parse_host_creds_table(other):
+        key = (row["username"].lower(), row["password"])
+        if key not in seen:
+            seen.add(key)
+            rows.append(row["raw"])
+    if not rows:
+        return CREDS_DEFAULT_CONTENT
+    return "\n".join([CREDS_HINT, "", CREDS_TABLE_HEADER, CREDS_TABLE_SEP, *rows])
+
+
+def _ensure_host_creds_section(text: str) -> str | None:
+    """Return the note text with a default ## Creds table inserted, or None
+    if it already has one. Placed per BODY_SECTION_ORDER: right after
+    ## Critical Findings if present, otherwise before the first '## ' heading
+    (a note with no headings at all gets it appended)."""
+    lines = text.splitlines()
+    if _find_section_bounds(lines, CREDS_SECTION) is not None:
+        return None
+    block = [CREDS_SECTION, *CREDS_DEFAULT_CONTENT.splitlines(), ""]
+
+    crit = _find_section_bounds(lines, "## Critical Findings")
+    if crit is not None:
+        insert_at = crit[1]
+    else:
+        fm_end = 0
+        if lines and lines[0].strip() == "---":
+            fm_end = next((i + 1 for i in range(1, len(lines))
+                           if lines[i].strip() == "---"), 0)
+        insert_at = next((i for i in range(fm_end, len(lines))
+                          if lines[i].startswith("## ")), None)
+        if insert_at is None:
+            return text.rstrip("\n") + "\n\n" + "\n".join(block)
+    if insert_at > 0 and lines[insert_at - 1].strip():
+        block.insert(0, "")
+    lines[insert_at:insert_at] = block
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def _host_creds_section_key(fm: dict, stem: str, existing_keys: list[str],
+                            existing_headers: list[str]) -> str:
+    """Pick the Loot/Credentials.md section key for a host note.
+
+    Reuses whichever section already belongs to this host -- loot-generated
+    sections are keyed by display name (often a hostname), Injestor ones by
+    IP -- so a host never ends up with two sections. Falls back to the note
+    stem, which _write_loot_credentials_page links back to the right note.
+    """
+    hostnames = fm.get("hostnames") or []
+    if isinstance(hostnames, str):
+        hostnames = [hostnames]
+    ips = fm.get("ips") or []
+    if isinstance(ips, str):
+        ips = [ips]
+    candidates = {c.lower() for c in [stem, fm.get("ip", ""), *ips, *hostnames] if c}
+    for key, header in zip(existing_keys, existing_headers):
+        if key.lower() in candidates or f"[[hosts/{stem.lower()}|" in header.lower():
+            return key
+    return stem
+
+
+def _sync_host_creds_tables(vault_dir: Path) -> int:
+    """Push every host note's ## Creds rows into Loot/Credentials.md.
+
+    One way and idempotent: a username already present in that host's
+    Credentials.md section is not added again, so rows simply stay in the
+    host table as its record. Notes without a ## Creds section get the empty
+    template inserted (existing vaults predate the section and their notes
+    are not rewritten until a scan touches them). Returns rows added.
+    """
+    hosts_dir = vault_dir / "Hosts"
+    if not hosts_dir.exists():
+        return 0
+
+    creds_page = vault_dir / "Loot" / "Credentials.md"
+    existing_keys: list[str] = []
+    existing_headers: list[str] = []
+    if creds_page.exists():
+        try:
+            for sec in _parse_credentials_md_sections(
+                    creds_page.read_text(encoding="utf-8"))["sections"]:
+                if not sec["is_aggregate"]:
+                    existing_keys.append(sec["key"])
+                    existing_headers.append(sec["header"])
+        except Exception as exc:
+            logging.warning(f"Creds sync: could not read {creds_page.name}: {exc}")
+
+    creds: list[dict] = []
+    host_stems: dict[str, str] = {}
+    for host_path in sorted(hosts_dir.glob("*.md")):
+        if host_path.stem.startswith("_"):
+            continue  # _Campaign Targets etc.
+        try:
+            text = host_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logging.warning(f"Creds sync: could not read {host_path.name}: {exc}")
+            continue
+
+        with_section = _ensure_host_creds_section(text)
+        if with_section is not None:
+            try:
+                _atomic_write_text(host_path, with_section)
+            except FileLockedError as exc:
+                logging.warning(f"Skipping Creds table insert — {exc}")
+            continue  # freshly inserted table is empty; nothing to sync
+
+        fm, body = read_frontmatter(text)
+        rows = _parse_host_creds_table(extract_body_section(body, CREDS_SECTION))
+        if not rows:
+            continue
+        key = _host_creds_section_key(fm, host_path.stem, existing_keys, existing_headers)
+        host_stems[key] = host_path.stem
+        for row in rows:
+            pw, cred_type, extra = _split_cred_value(row["password"]) if row["password"] \
+                else ("", "", "")
+            notes = "; ".join(n for n in (row["notes"], extra) if n)
+            creds.append({"username": row["username"], "password": pw,
+                          "cred_type": cred_type, "notes": notes, "host": key})
+
+    if not creds:
+        return 0
+    added = _append_injestor_to_credentials_md(
+        vault_dir, creds, [], "Host note", host_stems=host_stems,
+    )
+    if added:
+        logging.info(f"Creds sync: added {added} credential(s) from host Creds tables")
+    return added
+
+
+# ============================================================
+# Pivots — which hosts give access to which hosts/subnets
+# ============================================================
+#
+# An entity is ("host", <note stem>) | ("subnet", <CIDR>) | ("ip", <IP with no
+# host note>). Pivots.md stores one row per (from, to) edge; everything else
+# (host-note sections, canvas edges, the Pivot Paths panel) is derived from it
+# and re-resolved on every read, so an IP becomes a host link as soon as its
+# note exists and a /merge'd stem resolves to the surviving note.
+
+_PIVOTS_PAGE_HINT = (
+    "_One row per pivot: **From** is the host you pivot through, **To** is the "
+    "host or subnet it gives access to. Edit rows here directly or write them in "
+    "plain words in the Injestor's ## Pivots section. Host notes and the "
+    "Assessment Canvas update from this page._"
+)
+_PIVOTS_TABLE_HEADER = "| From | To | Method | Notes | Source |"
+_PIVOTS_TABLE_SEP    = "|------|----|--------|-------|--------|"
+
+# First match wins, so specific tools precede generic ones (ssh tunnel > ssh).
+_PIVOT_METHODS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bligolo(?:-ng)?\b", re.I), "ligolo"),
+    (re.compile(r"\bchisel\b", re.I), "chisel"),
+    (re.compile(r"\bsshuttle\b", re.I), "sshuttle"),
+    (re.compile(r"\bautoroute\b|\bmeterpreter\b|\bmetasploit\b|\bmsf\b", re.I), "meterpreter autoroute"),
+    (re.compile(r"\bportfwd\b|\bport[- ]?forward", re.I), "port forward"),
+    (re.compile(r"\bnetsh\b|\bportproxy\b", re.I), "netsh portproxy"),
+    (re.compile(r"\bplink\b", re.I), "plink"),
+    (re.compile(r"\bsocat\b", re.I), "socat"),
+    (re.compile(r"\brpivot\b", re.I), "rpivot"),
+    (re.compile(r"\bfrpc?\b", re.I), "frp"),
+    (re.compile(r"\bsliver\b", re.I), "sliver"),
+    (re.compile(r"\bcobalt\s*strike\b|\bbeacon\b", re.I), "cobalt strike"),
+    (re.compile(r"\bssh\b.*\s-[DLR]\b|\bssh\s+(?:dynamic|local|remote|tunnel)", re.I), "ssh tunnel"),
+    (re.compile(r"\bssh\b", re.I), "ssh"),
+    (re.compile(r"\bsocks\d?\b|\bproxychains\b", re.I), "socks proxy"),
+]
+
+_PIVOT_ARROW_RE   = re.compile(r"\s*(?:-+>|=+>|→|⇒|⟶)\s*")
+_PIVOT_FROM_TO_RE = re.compile(r"\bfrom\b(?P<src>.*?)\bto\b(?P<dst>.*)", re.I)
+_PIVOT_VIA_RE     = re.compile(r"\b(?:via|through|thru|behind|from)\b", re.I)
+_CIDR_RE          = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})(?!\d)")
+_SUBNET_WILDCARD_RE = re.compile(r"(?<![\d.])(\d{1,3}\.\d{1,3}\.\d{1,3})\.(?:x|\*)(?![\w.])", re.I)
+_HOST_LINK_RE     = re.compile(r"\[\[Hosts/([^\]|\\]+?)(?:\.md)?(?:\\?\|[^\]]*)?\]\]")
+_HOST_TOKEN_RE    = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*")
+
+
+def _build_pivot_host_index(vault_dir: Path) -> dict:
+    """{"by_id": {identifier_lower: stem}, "info": {stem: {"ips", "hostnames"}}}.
+
+    Identifiers are the note stem, every IP (ip + ips), every hostname and its
+    short form (>= 4 chars, as _build_known_hosts_lookup does). Keyed by note
+    stem, not host_key, because pivots link to notes.
+    """
+    by_id: dict[str, str] = {}
+    info: dict[str, dict] = {}
+    hosts_dir = vault_dir / "Hosts"
+    if not hosts_dir.exists():
+        return {"by_id": by_id, "info": info}
+    notes = sorted(p for p in hosts_dir.glob("*.md") if not p.stem.startswith("_"))
+    for hp in notes:  # stems first, so a stem always resolves to its own note
+        by_id.setdefault(hp.stem.lower(), hp.stem)
+    for hp in notes:
+        try:
+            fm, _ = read_frontmatter(hp.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.debug(f"Pivots: could not read {hp.name}: {exc}")
+            continue
+        extra_ips = fm.get("ips") or []
+        if isinstance(extra_ips, str):
+            extra_ips = [extra_ips]
+        ips = [str(i).strip() for i in [fm.get("ip") or "", *extra_ips]
+               if i and is_ipv4(str(i).strip())]
+        hostnames = fm.get("hostnames") or []
+        if isinstance(hostnames, str):
+            hostnames = [hostnames]
+        hostnames = [str(h).strip() for h in hostnames if h]
+        info[hp.stem] = {"ips": ips, "hostnames": hostnames}
+        shorts = [h.split(".")[0] for h in hostnames if len(h.split(".")[0]) >= 4]
+        for ident in [*ips, *hostnames, *shorts]:
+            by_id.setdefault(ident.lower(), hp.stem)
+    return {"by_id": by_id, "info": info}
+
+
+def _find_pivot_entities(text: str, index: dict) -> list[tuple[str, str]]:
+    """Hosts, IPs and subnets mentioned in text, in order of appearance."""
+    found: list[tuple[int, tuple[str, str]]] = []
+    spans: list[tuple[int, int]] = []
+
+    def taken(a: int, b: int) -> bool:
+        return any(a < e and s < b for s, e in spans)
+
+    def add(m: re.Match, ent: tuple[str, str]) -> None:
+        spans.append(m.span())
+        found.append((m.start(), ent))
+
+    by_id = index["by_id"]
+    for m in _HOST_LINK_RE.finditer(text):
+        stem = m.group(1).strip()
+        add(m, ("host", by_id.get(stem.lower(), stem)))
+    for m in _CIDR_RE.finditer(text):
+        if taken(*m.span()):
+            continue
+        try:
+            add(m, ("subnet", str(ipaddress.ip_network(f"{m.group(1)}/{m.group(2)}", strict=False))))
+        except ValueError:
+            continue
+    for m in _SUBNET_WILDCARD_RE.finditer(text):
+        if taken(*m.span()):
+            continue
+        try:
+            add(m, ("subnet", str(ipaddress.ip_network(f"{m.group(1)}.0/24"))))
+        except ValueError:
+            continue
+    for m in IP_IN_TEXT_RE.finditer(text):
+        if taken(*m.span()):
+            continue
+        try:
+            ip = str(ipaddress.ip_address(m.group(0)))
+        except ValueError:
+            continue
+        stem = by_id.get(ip)
+        add(m, ("host", stem) if stem else ("ip", ip))
+    for m in _HOST_TOKEN_RE.finditer(text):
+        if taken(*m.span()):
+            continue
+        stem = by_id.get(m.group(0).rstrip(".-_").lower())
+        if stem:
+            add(m, ("host", stem))
+
+    out: list[tuple[str, str]] = []
+    for _, ent in sorted(found, key=lambda f: f[0]):
+        if not out or out[-1] != ent:
+            out.append(ent)
+    return out
+
+
+def _parse_pivot_line(line: str, index: dict) -> tuple[list[dict], str | None]:
+    """Turn one plain-words pivot line into pivot dicts, or explain why not.
+
+    Direction, in order of precedence:
+      A -> B -> C            chain: A reaches B, B reaches C
+      from A to B            A is the pivot
+      B via/through/from A   A is the pivot (entities on both sides required)
+      otherwise              first host named is the pivot, the rest targets
+                             ("ligolo on A gives access to B and 172.16.2.0/24")
+    Python only, no LLM: a line it cannot resolve is reported, not guessed.
+    """
+    text = re.sub(r"^\s*(?:[-*+•]|\d+[.)])\s+", "", line).strip()
+    text = re.sub(r"^\[[ xX/]\]\s*", "", text).strip()
+    if not text:
+        return [], None
+    method = next((label for rx, label in _PIVOT_METHODS if rx.search(text)), "")
+
+    def ents(s: str) -> list[tuple[str, str]]:
+        return _find_pivot_entities(s, index)
+
+    pairs: list[tuple[tuple[str, str], tuple[str, str]]] = []
+    parts = _PIVOT_ARROW_RE.split(text)
+    if len(parts) >= 2:
+        hops = [ents(p) for p in parts]
+        if any(not h for h in hops):
+            return [], "each side of an arrow needs a host, IP or subnet"
+        for a, b in zip(hops, hops[1:]):
+            pairs += [(a[0], t) for t in b]
+    else:
+        ft = _PIVOT_FROM_TO_RE.search(text)
+        if ft and ents(ft["src"]) and ents(ft["dst"]):
+            src = ents(ft["src"])[0]
+            pairs = [(src, t) for t in ents(ft["dst"])]
+        else:
+            via = next((m for m in _PIVOT_VIA_RE.finditer(text)
+                        if ents(text[:m.start()]) and ents(text[m.end():])), None)
+            if via:
+                pivot = ents(text[via.end():])[0]
+                pairs = [(pivot, t) for t in ents(text[:via.start()])]
+            else:
+                found = ents(text)
+                if len(found) < 2:
+                    return [], (
+                        f"found {len(found)} host/subnet reference(s) -- need the pivot host "
+                        "and what it reaches. Use IPs, CIDRs (172.16.2.0/24) or names that "
+                        "already exist in Hosts/"
+                    )
+                pairs = [(found[0], t) for t in found[1:]]
+
+    pivots: list[dict] = []
+    for frm, to in pairs:
+        if frm[0] == "subnet":
+            return [], f"the pivot side ({frm[1]}) is a subnet -- it must be a single host"
+        if frm != to:
+            pivots.append({"from": frm, "to": to, "method": method, "notes": text})
+    if not pivots:
+        return [], "the pivot and its target are the same host"
+    return pivots, None
+
+
+def _pivot_cell(ent: tuple[str, str]) -> str:
+    """Pivots.md cell text. Host links escape the alias pipe, as Obsidian
+    requires inside a table."""
+    kind, val = ent
+    return f"[[Hosts/{val}\\|{val}]]" if kind == "host" else val
+
+
+def _pivot_link(ent: tuple[str, str]) -> str:
+    """Markdown for an entity outside a table (host-note sections)."""
+    kind, val = ent
+    return f"[[Hosts/{val}|{val}]]" if kind == "host" else f"`{val}`"
+
+
+def _read_pivots(vault_dir: Path, index: dict) -> list[dict]:
+    path = vault_dir / PIVOTS_FILENAME
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logging.warning(f"Pivots: could not read {path.name}: {exc}")
+        return []
+    rows: list[dict] = []
+    for line in text.splitlines():
+        cells = _split_md_table_row(line)
+        if not cells or _is_markdown_table_separator_row(line):
+            continue
+        cells = cells + [""] * 5
+        if cells[0].strip().lower() == "from":
+            continue
+        frm = _find_pivot_entities(cells[0], index)
+        to = _find_pivot_entities(cells[1], index)
+        if not frm or not to:
+            if cells[0] or cells[1]:
+                logging.warning(f"Pivots: skipping row it can't resolve: {line.strip()}")
+            continue
+        rows.append({"from": frm[0], "to": to[0], "method": cells[2],
+                     "notes": cells[3], "source": cells[4]})
+    return rows
+
+
+def _write_pivots_table(vault_dir: Path, rows: list[dict]) -> bool:
+    """Write rows as the Pivots.md table, keeping any operator text outside
+    the table. Returns True if the file changed."""
+    path = vault_dir / PIVOTS_FILENAME
+
+    def esc(v: str) -> str:
+        return (v or "").replace("\n", " ").replace("|", "\\|")
+
+    table = [_PIVOTS_TABLE_HEADER, _PIVOTS_TABLE_SEP] + [
+        "| " + " | ".join([_pivot_cell(r["from"]), _pivot_cell(r["to"]),
+                           esc(r.get("method", "")), esc(r.get("notes", "")),
+                           esc(r.get("source", ""))]) + " |"
+        for r in rows
+    ]
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = old.splitlines()
+    hi = next((i for i, l in enumerate(lines)
+               if l.strip().lower().replace(" ", "").startswith("|from|to|")), None)
+    if hi is None:
+        if old.strip():
+            lines += ["", *table]
+        else:
+            lines = ["# Pivots", "", _PIVOTS_PAGE_HINT, "", *table]
+    else:
+        end = hi
+        while end < len(lines) and lines[end].strip().startswith("|"):
+            end += 1
+        lines[hi:end] = table
+    new = "\n".join(lines) + "\n"
+    if new == old:
+        return False
+    _atomic_write_text(path, new)
+    return True
+
+
+def _add_pivots(vault_dir: Path, new: list[dict], source: str, index: dict) -> int:
+    """Append pivots to Pivots.md, deduplicated on (from, to). A duplicate
+    with a method fills in a blank Method on the existing row."""
+    rows = _read_pivots(vault_dir, index)
+    by_key = {(r["from"], r["to"]): r for r in rows}
+    added = 0
+    for p in new:
+        key = (p["from"], p["to"])
+        if key in by_key:
+            if p.get("method") and not by_key[key].get("method"):
+                by_key[key]["method"] = p["method"]
+            continue
+        row = {**p, "source": source}
+        rows.append(row)
+        by_key[key] = row
+        added += 1
+    _write_pivots_table(vault_dir, rows)
+    return added
+
+
+def _pivot_target_hosts(to: tuple[str, str], index: dict) -> list[str]:
+    """Host-note stems a pivot target covers: the host itself, or every
+    known host with an IP inside the target subnet."""
+    kind, val = to
+    if kind == "host":
+        return [val]
+    if kind != "subnet":
+        return []
+    net = ipaddress.ip_network(val)
+    return [stem for stem, inf in index["info"].items()
+            if any(ipaddress.ip_address(ip) in net for ip in inf["ips"])]
+
+
+def _render_host_pivot_section(stem: str, rows: list[dict], index: dict) -> str | None:
+    me = ("host", stem)
+    gives = [r for r in rows if r["from"] == me]
+    reached = [r for r in rows
+               if r["from"] != me and stem in _pivot_target_hosts(r["to"], index)]
+    if not gives and not reached:
+        return None
+
+    def via(r: dict) -> str:
+        return f" via {r['method']}" if r.get("method") else ""
+
+    lines = ["_Generated from [[Pivots]] -- edit there, or add a line to the "
+             "Injestor's ## Pivots section._", ""]
+    if gives:
+        lines.append("**Pivot point -- gives access to:**")
+        for r in gives:
+            line = f"- {_pivot_link(r['to'])}{via(r)}"
+            if r["to"][0] == "subnet":
+                hosts = [h for h in _pivot_target_hosts(r["to"], index) if h != stem]
+                if hosts:
+                    shown = ", ".join(_pivot_link(("host", h)) for h in hosts[:10])
+                    more = f" +{len(hosts) - 10} more" if len(hosts) > 10 else ""
+                    line += f" -- known hosts: {shown}{more}"
+                else:
+                    line += " -- no known hosts there yet"
+            lines.append(line)
+        lines.append("")
+    if reached:
+        lines.append("**Reached through:**")
+        for r in reached:
+            sub = f" (subnet `{r['to'][1]}`)" if r["to"][0] == "subnet" else ""
+            lines.append(f"- {_pivot_link(r['from'])}{via(r)}{sub}")
+    return "\n".join(lines).rstrip()
+
+
+def _set_host_section_ordered(text: str, header: str, content: str | None) -> str:
+    """Replace a host-note section, insert it at its BODY_SECTION_ORDER
+    position, or (content=None) remove it. Unlike _set_body_section, a new
+    section lands where the writers would render it, not at the end."""
+    lines = text.splitlines()
+    bounds = _find_section_bounds(lines, header)
+    if bounds is not None:
+        start, end = bounds
+        if content is None:
+            lo = start - 1
+            if lo > 0 and not lines[lo - 1].strip():
+                lo -= 1
+            del lines[lo:end]
+        else:
+            tail = [""] if end < len(lines) else []
+            lines[start:end] = [*content.splitlines(), *tail]
+    elif content is not None:
+        later = BODY_SECTION_ORDER[BODY_SECTION_ORDER.index(header) + 1:]
+        insert_at = next((b[0] - 1 for h in later
+                          if (b := _find_section_bounds(lines, h)) is not None), None)
+        block = [header, *content.splitlines()]
+        if insert_at is None:
+            lines += ["", *block]
+        else:
+            if insert_at > 0 and lines[insert_at - 1].strip():
+                block.insert(0, "")
+            lines[insert_at:insert_at] = [*block, ""]
+    out = "\n".join(lines)
+    return out + "\n" if text.endswith("\n") and not out.endswith("\n") else out
+
+
+def _build_pivot_paths_text(rows: list[dict], index: dict) -> str:
+    """Pivot chains for the canvas panel, e.g.
+    **web01** --ligolo--> 172.16.2.0/24 (dc02) --chisel--> 10.10.20.0/24"""
+    by_from: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
+    for r in rows:
+        by_from[r["from"]].append(r)
+    pivots = set(by_from)
+
+    def next_pivots(to: tuple[str, str]) -> list[tuple[str, str]]:
+        covered = set(_pivot_target_hosts(to, index))
+        return sorted(p for p in pivots
+                      if p == to or (p[0] == "host" and p[1] in covered))
+
+    reached = {q for r in rows for q in next_pivots(r["to"]) if q != r["from"]}
+    roots = sorted(pivots - reached) or sorted(pivots)
+
+    paths: list[str] = []
+
+    def walk(p: tuple[str, str], text: str, seen: set) -> None:
+        for r in by_from[p]:
+            seg = f"{text} --{r.get('method') or 'pivot'}--> {r['to'][1]}"
+            nxt = [q for q in next_pivots(r["to"]) if q not in seen]
+            if not nxt:
+                paths.append(seg)
+            for q in nxt:
+                walk(q, seg if q == r["to"] else f"{seg} ({q[1]})", seen | {q})
+
+    for root in roots:
+        walk(root, f"**{root[1]}**", {root})
+
+    lines = ["## Pivot Paths", "",
+             "_Purple edges = pivots. Source: [[Pivots]] (add lines in the Injestor's ## Pivots section)._",
+             ""]
+    lines += [f"- {p}" for p in paths[:40]]
+    if len(paths) > 40:
+        lines.append(f"- _+{len(paths) - 40} more -- see [[Pivots]]_")
+    return "\n".join(lines)
+
+
+def _add_pivots_to_canvas(data: dict, rows: list[dict], index: dict) -> None:
+    """Overlay pivots on canvas data in place: purple edges from each pivot
+    host's card to its target's card or subnet group, a Pivot Paths panel,
+    and cards for targets not on the canvas yet. Everything it adds carries
+    PIVOT_ID_PREFIX and is removed first, so re-applying is idempotent and
+    a deleted pivot disappears."""
+    nodes = [n for n in data.get("nodes", []) if not str(n.get("id", "")).startswith(PIVOT_ID_PREFIX)]
+    edges = [e for e in data.get("edges", []) if not str(e.get("id", "")).startswith(PIVOT_ID_PREFIX)]
+    data["nodes"], data["edges"] = nodes, edges
+    if not rows:
+        return
+
+    by_file = {n.get("file"): n["id"] for n in nodes if n.get("type") == "file"}
+    by_group = {n.get("label"): n["id"] for n in nodes if n.get("type") == "group"}
+    if nodes:
+        area_x = max(int(n.get("x", 0)) + int(n.get("width", 0)) for n in nodes) + 240
+        area_y = min(int(n.get("y", 0)) for n in nodes)
+    else:
+        area_x, area_y = 0, 0
+
+    summary = _build_pivot_paths_text(rows, index)
+    summary_h = min(900, max(220, 90 + 30 * summary.count("\n")))
+    nodes.append(_text_node(PIVOT_ID_PREFIX + stable_id("pivot_paths"), summary,
+                            area_x, area_y, 640, summary_h, color=PIVOT_CANVAS_COLOR))
+    cur_y = area_y + summary_h + 80
+
+    def node_for(ent: tuple[str, str]) -> str:
+        nonlocal cur_y
+        kind, val = ent
+        existing = (by_file.get(f"Hosts/{ensure_md_suffix(val)}") if kind == "host"
+                    else by_group.get(val) if kind == "subnet" else None)
+        if existing:
+            return existing
+        nid = PIVOT_ID_PREFIX + stable_id(f"pivot_node_{kind}_{val}")
+        if not any(n["id"] == nid for n in nodes):
+            if kind == "host" and val in index["info"]:
+                nodes.append(_file_node(nid, f"Hosts/{ensure_md_suffix(val)}",
+                                        area_x, cur_y, CARD_W, CARD_H, PIVOT_CANVAS_COLOR))
+                cur_y += CARD_H + 60
+            else:
+                what = "Subnet" if kind == "subnet" else "Host"
+                nodes.append(_text_node(
+                    nid, f"**{val}**\n\n_{what} reached via pivot -- not scanned yet_",
+                    area_x, cur_y, CARD_W, 140, PIVOT_CANVAS_COLOR))
+                cur_y += 140 + 60
+        return nid
+
+    for r in rows:
+        a, b = node_for(r["from"]), node_for(r["to"])
+        edge = {
+            "id": PIVOT_ID_PREFIX + stable_id(f"pivot_edge_{r['from']}_{r['to']}"),
+            "fromNode": a, "toNode": b, "color": PIVOT_CANVAS_COLOR,
+            "label": f"pivot · {r['method']}" if r.get("method") else "pivot",
+        }
+        if not any(e["id"] == edge["id"] for e in edges):
+            edges.append(edge)
+
+
+def _refresh_pivots(vault_dir: Path, canvas_name: str | None = None) -> int:
+    """Re-derive everything from Pivots.md: normalise its cells (an IP whose
+    host note now exists becomes a link; a merged-away stem resolves to the
+    survivor), rewrite each host's ## Pivots section (removing it where no
+    pivot applies), and, given canvas_name, re-overlay the canvas without a
+    full rebuild. Returns the number of host notes changed."""
+    index = _build_pivot_host_index(vault_dir)
+    rows = _read_pivots(vault_dir, index)
+    if (vault_dir / PIVOTS_FILENAME).exists():
+        try:
+            _write_pivots_table(vault_dir, rows)
+        except FileLockedError as exc:
+            logging.warning(f"Skipping Pivots.md normalisation — {exc}")
+
+    changed = 0
+    for stem in index["info"]:
+        path = vault_dir / "Hosts" / ensure_md_suffix(stem)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        new = _set_host_section_ordered(
+            text, PIVOT_SECTION, _render_host_pivot_section(stem, rows, index))
+        if new != text:
+            try:
+                _atomic_write_text(path, new)
+                changed += 1
+            except FileLockedError as exc:
+                logging.warning(f"Skipping ## Pivots update — {exc}")
+
+    if canvas_name:
+        canvas_path = vault_dir / canvas_name
+        if canvas_path.exists():
+            try:
+                data = json.loads(canvas_path.read_text(encoding="utf-8"))
+                _add_pivots_to_canvas(data, rows, index)
+                _atomic_write_text(canvas_path, json.dumps(data, indent=2))
+            except FileLockedError as exc:
+                logging.warning(f"Skipping canvas pivot update — {exc}")
+            except (OSError, ValueError) as exc:
+                logging.warning(f"Canvas pivot update failed: {exc}")
+    return changed
 
 
 # ============================================================
@@ -10565,7 +11922,7 @@ def _link_injestor_creds_to_host_note(
     except Exception:
         return
 
-    fm_text, body = split_frontmatter(text)
+    fm, body = read_frontmatter(text)
     existing_loot = extract_body_section(body, "## Loot")
     tag = f"Injestor ({source_label})"
     cred_line = (
@@ -10612,7 +11969,7 @@ def _link_injestor_creds_to_host_note(
     else:
         new_body = body_without_loot.rstrip() + "\n\n## Loot\n\n" + new_loot + "\n"
 
-    _atomic_write_text(host_note, fm_text + "\n" + new_body)
+    _atomic_write_text(host_note, write_frontmatter(fm) + "\n" + new_body)
     logging.debug(f"Updated Loot section in {host_note.name} with {cred_count} Injestor credentials")
 
 
@@ -10626,7 +11983,7 @@ def _parse_cred_table_rows(text: str) -> list[dict]:
     creds: list[dict] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("|---"):
+        if not stripped or _is_markdown_table_separator_row(line):
             continue
         if stripped.startswith("|"):
             # Table row
@@ -10767,6 +12124,38 @@ def _llm_extract_tool_output(content: str, args) -> dict:
         "tool": data.get("tool", "unknown"),
         "credentials": data.get("credentials", []),
         "usernames": data.get("usernames", []),
+    }
+
+
+def _normalize_llm_extracted_cred(c: dict) -> dict:
+    """Convert _llm_extract_tool_output's schema (separate password/hash/
+    hash_type fields) into the unified schema _append_injestor_to_credentials_md
+    expects: a single 'password' field plus 'cred_type' saying which kind it
+    is. When both a hash and its cracked plaintext are present, the hash is
+    kept as the primary value and the cracked password goes in notes --
+    matching the convention used everywhere else (parse_kiwi_secretsdump's
+    _add(), _split_cred_value).
+    """
+    username = (c.get("username") or "").strip()
+    password = (c.get("password") or "").strip()
+    hash_val = (c.get("hash") or "").strip()
+    hash_type = (c.get("hash_type") or "").strip()
+    notes = (c.get("notes") or "").strip()
+    if hash_val:
+        cred_type = hash_type if (hash_type and hash_type.lower() != "plaintext") else _classify_hash(hash_val)
+        value = hash_val
+        if password:
+            extra = f"cracked password: {password}"
+            notes = f"{notes}; {extra}".strip("; ") if notes else extra
+    else:
+        cred_type = "cleartext"
+        value = password
+    return {
+        "username": username,
+        "password": value,
+        "cred_type": cred_type,
+        "host": (c.get("host") or "").strip() or None,
+        "notes": notes,
     }
 
 
@@ -11000,6 +12389,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
 
     # Parse structured template sections or fall back to freeform
     injestor_parsed = _parse_injestor_sections(raw)
+    known_hosts_lookup = _build_known_hosts_lookup(vault_dir)
 
     # Determine what content is available in each section
     notes_content   = injestor_parsed.get("notes", "") or injestor_parsed.get("freeform", "")
@@ -11011,7 +12401,9 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
     # For legacy freeform (no template sections found), treat everything as notes
     is_legacy = not (injestor_parsed.get("has_credential_section") or
                      injestor_parsed.get("has_tool_output_section") or
-                     injestor_parsed.get("has_access_section"))
+                     injestor_parsed.get("has_access_section") or
+                     injestor_parsed.get("has_pivot_section"))
+    pivot_lines: list[str] = injestor_parsed.get("pivots", [])
     if is_legacy:
         # Strip template boilerplate if user left it in
         raw_stripped = raw
@@ -11024,7 +12416,8 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         notes_content = raw_stripped.strip()
         has_notes = bool(notes_content)
 
-    if not has_notes and not has_cred_content and not has_tool_output and not injestor_parsed.get("access"):
+    if (not has_notes and not has_cred_content and not has_tool_output
+            and not injestor_parsed.get("access") and not pivot_lines):
         return None
 
     logging.info(
@@ -11095,9 +12488,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
 
     def _run_kiwi_fastpath(content: str, label: str) -> None:
         nonlocal _kiwi_fast_pathed
-        host_hint = next(
-            (ip for ip in IP_IN_TEXT_RE.findall(content) if _is_target_ip(ip)), ""
-        )
+        host_hint = _infer_host_from_pasted_text(content, known_hosts_lookup)
         kiwi_result = parse_kiwi_secretsdump(content, host=host_hint)
         kiwi_creds = kiwi_result["credentials"]
         if kiwi_creds:
@@ -11109,6 +12500,34 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             )
             print(f"  [+] Kiwi/secretsdump parsed from {label}: "
                   f"{len(kiwi_creds)} entries → Loot/Credentials.md (no review needed)")
+
+    def _run_explicit_cred_fastpath(content: str, label: str) -> bool:
+        """Explicit 'user:pass', 'user:hash:crackedpass', 'for HOST user:pass'
+        and 'user:pass on HOST' lines are unambiguous syntax -- try them before
+        any word-count gate or LLM call, in both Notes and Tool Output. A
+        short, precise one-line credential (e.g. a single cracked password)
+        has too few words to trip the LLM-queueing threshold below, so without
+        this fast-path it was silently dropped with no feedback.
+        """
+        explicit_creds = _parse_injestor_creds_with_host(content)
+        if not explicit_creds:
+            return False
+        if any(c.get("host") is None for c in explicit_creds):
+            # No "for HOST"/"on HOST" qualifier on some line(s) -- fall back to
+            # a hostname/IP mentioned anywhere else in the same paste before
+            # giving up and filing under Campaign-Level.
+            fallback_host = _infer_host_from_pasted_text(content, known_hosts_lookup) or None
+            for c in explicit_creds:
+                if c.get("host") is None:
+                    c["host"] = fallback_host
+        discovered_creds.extend(explicit_creds)
+        logging.info(
+            f"Injestor: explicit credential syntax detected in {label} — "
+            f"{len(explicit_creds)} credential(s) extracted"
+        )
+        print(f"  [+] Explicit credential(s) parsed from {label}: "
+              f"{len(explicit_creds)} entries → Loot/Credentials.md (no review needed)")
+        return True
 
     if notes_content:
         # Legacy mode: explicit user:pass pairs and bare username lists are unambiguous
@@ -11132,6 +12551,11 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         # Kiwi/secretsdump fast-path
         elif detect_kiwi_secretsdump(notes_content):
             _run_kiwi_fastpath(notes_content, "Notes")
+        # Explicit credential syntax fast-path -- legacy mode already ran this
+        # above; this covers the same syntax when the structured template is
+        # in use, which previously never tried it at all for ## Notes.
+        elif not is_legacy and _run_explicit_cred_fastpath(notes_content, "Notes"):
+            pass
         else:
             # Check if Notes has substantive content beyond bare IP/hostname lists
             non_ip_words = [
@@ -11160,6 +12584,8 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             )
         elif not _kiwi_fast_pathed and detect_kiwi_secretsdump(tool_output):
             _run_kiwi_fastpath(tool_output, "Tool Output")
+        elif _run_explicit_cred_fastpath(tool_output, "Tool Output"):
+            pass
         else:
             # Non-fast-path tool output goes to LLM
             notes_for_llm = "\n\n".join(filter(None, [notes_for_llm, tool_output]))
@@ -11184,10 +12610,26 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
     if not discovered_ips and not discovered_hostnames and not discovered_creds and not has_llm_extractions:
         logging.info("Injestor: no structured data found, saving as misc")
 
+    # ── Pivots: an IP named as a pivot or target gets a host note like any
+    # other new IP (subnets don't). Lines are parsed again after the notes
+    # exist so those IPs resolve to host links.
+    if pivot_lines:
+        pre_index = _build_pivot_host_index(vault_dir)
+        for line in pivot_lines:
+            for p in _parse_pivot_line(line, pre_index)[0]:
+                for kind, val in (p["from"], p["to"]):
+                    if kind == "ip" and _is_target_ip(val):
+                        discovered_ips.add(val)
+
     # ── Create host notes for new IPs ──
     hosts_dir = vault_dir / "Hosts"
     hosts_dir.mkdir(exist_ok=True)
     new_hosts: list[str] = []
+
+    # Text searched for "hostname near IP" pairs. (This used to read an
+    # undefined `content`, so any paste holding both a new IP and a hostname
+    # raised NameError after creating notes -- before the archive and reset.)
+    injestor_text = "\n".join(filter(None, [notes_content, tool_output]))
 
     for ip in sorted(discovered_ips):
         existing = _find_host_note_by_ip(hosts_dir, ip)
@@ -11206,7 +12648,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             # Check if hostname appears near this IP in the content
             for m in re.finditer(
                 rf"(?:{re.escape(hn)}.*?{re.escape(ip)}|{re.escape(ip)}.*?{re.escape(hn)})",
-                content[:5000],
+                injestor_text[:5000],
             ):
                 associated_hostnames.append(hn)
                 break
@@ -11232,6 +12674,9 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
 
         body_lines += [
             "",
+            CREDS_SECTION,
+            CREDS_DEFAULT_CONTENT,
+            "",
             "## Next Steps",
             "",
             f"- [ ] Port scan: `nmap -sC -sV -oX scans/nmap/{ip}.xml {ip}`",
@@ -11252,6 +12697,17 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         body = "\n".join(body_lines)
         _atomic_write_text(host_path, write_frontmatter(fm) + "\n" + body)
         logging.info(f"Injestor: created host note for {ip}")
+
+    parsed_pivots: list[dict] = []
+    unparsed_pivots: list[tuple[str, str]] = []
+    pivot_index: dict | None = None
+    if pivot_lines:
+        pivot_index = _build_pivot_host_index(vault_dir)
+        for line in pivot_lines:
+            pv, err = _parse_pivot_line(line, pivot_index)
+            parsed_pivots += pv
+            if err:
+                unparsed_pivots.append((line, err))
 
     # ── NXC enrichment (adds shares, signing, vuln flags to existing/new notes) ──
     if _nxc_injestor_data:
@@ -11294,7 +12750,9 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
     if not content_label:
         content_label = "Notes"
         arp_lines = len(_ARP_LINE_RE.findall(notes_content))
-        if arp_lines >= 3:
+        if pivot_lines and not notes_content and not has_tool_output and not discovered_creds:
+            content_label = "Pivots"
+        elif arp_lines >= 3:
             content_label = "ARP Table"
         elif has_tool_output:
             tool_type, _ = _detect_misc_tool("injestor", tool_output)
@@ -11325,6 +12783,7 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
     scan_lines = [
         f"# {scan_display}",
         "",
+        f"- **Source:** Injestor",
         f"- **Processed:** {dt.datetime.now().isoformat(timespec='seconds')}",
         f"- **IPs found:** {len(discovered_ips)}",
         f"- **New hosts created:** {len(new_hosts)}",
@@ -11378,6 +12837,23 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             scan_lines.append(f"- `{u}`")
         scan_lines.append("")
 
+    if pivot_lines:
+        scan_lines += ["## Pivots", ""]
+        if parsed_pivots:
+            scan_lines.append("_Recorded in [[Pivots]]._")
+            scan_lines.append("")
+            for p in parsed_pivots:
+                via = f" via {p['method']}" if p["method"] else ""
+                scan_lines.append(f"- {_pivot_link(p['from'])} → {_pivot_link(p['to'])}{via}")
+            scan_lines.append("")
+        if unparsed_pivots:
+            scan_lines.append("_Not understood -- fix the wording and re-enter in the Injestor, "
+                              "or add the row to [[Pivots]] directly:_")
+            scan_lines.append("")
+            for line, err in unparsed_pivots:
+                scan_lines.append(f"- `{line}` -- {err}")
+            scan_lines.append("")
+
     if injestor_parsed.get("access"):
         scan_lines += ["## Access Entries", ""]
         scan_lines.append("_These access entries were added to host notes._")
@@ -11423,6 +12899,13 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
             "",
             "</details>",
         ]
+
+    # Operator commentary on this specific archive note. Re-checking
+    # "Analyze: Misc" on this note re-runs credential extraction with this
+    # text as guidance -- e.g. "it missed the cleartext password in a
+    # comment in that LDAP dump, look again" -- so a correction actually
+    # reaches Loot/Credentials.md instead of only being noted in prose.
+    scan_lines = _preserve_scan_note_operator_notes(scan_path, scan_lines)
 
     _atomic_write_text(scan_path, "\n".join(scan_lines))
     logging.info(f"Injestor: wrote scan note {scan_path.name}")
@@ -11472,6 +12955,17 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
     if access_added:
         logging.info(f"Injestor: recorded {access_added} access entr(ies) in host notes")
 
+    # ── Pivots → Pivots.md, then regenerate host ## Pivots sections ──
+    pivots_added = 0
+    if parsed_pivots:
+        pivots_added = _add_pivots(vault_dir, parsed_pivots, scan_display, pivot_index)
+        _refresh_pivots(vault_dir)
+        print(f"  [+] {pivots_added} pivot(s) → {PIVOTS_FILENAME}"
+              + (f" ({len(parsed_pivots) - pivots_added} already recorded)"
+                 if len(parsed_pivots) > pivots_added else ""))
+    for line, err in unparsed_pivots:
+        print(f"  [!] Pivot line not understood: {line!r} -- {err}")
+
     # ── Reset the Injestor page ──
     _atomic_write_text(injestor_path, _INJESTOR_TEMPLATE)
     logging.info("Injestor: page reset for next use")
@@ -11485,6 +12979,8 @@ def _process_injestor(vault_dir: Path, args=None) -> dict | None:
         "discovered_creds": discovered_creds,
         "discovered_usernames": discovered_usernames,
         "host_stems": [safe_filename(ip) for ip in new_hosts],
+        "pivots_added": pivots_added,
+        "pivots_unparsed": unparsed_pivots,
     }
 
 
@@ -12846,12 +14342,12 @@ def _snapshot_vault_files(vault_dir: Path) -> dict[str, float]:
         except OSError:
             pass
 
-    creds = vault_dir / "Loot" / "Credentials.md"
-    if creds.exists():
-        try:
-            snapshot[str(creds)] = creds.stat().st_mtime
-        except OSError:
-            pass
+    for watched in (vault_dir / "Loot" / "Credentials.md", vault_dir / PIVOTS_FILENAME):
+        if watched.exists():
+            try:
+                snapshot[str(watched)] = watched.stat().st_mtime
+            except OSError:
+                pass
 
     config_md = vault_dir / _ASSESSMENT_CONFIG_FILENAME
     if config_md.exists():
@@ -13233,6 +14729,7 @@ def _process_vault_changes(
     any_action = False
 
     # ── Injestor ──
+    injestor_result2: dict | None = None
     if injestor_path in changed_files:
         injestor_result2 = _process_injestor(vault_dir, args=args)
         if injestor_result2:
@@ -13247,6 +14744,20 @@ def _process_vault_changes(
                 print(f"  [Vault] Injestor: found {len(injestor_result2['discovered_creds'])} credential(s)")
             print(f"  [Vault] Injestor: saved to Scans/{injestor_result2['scan_stem']}.md")
 
+    # ── Pivots: Injestor added some, or Pivots.md edited by hand ──
+    pivots_path = str(vault_dir / PIVOTS_FILENAME)
+    injestor_pivots = bool(injestor_path in changed_files and injestor_result2
+                           and injestor_result2.get("pivots_added"))
+    if injestor_pivots or pivots_path in changed_files:
+        any_action = True
+        try:
+            canvas = None if args.no_canvas else args.canvas_name
+            n = _refresh_pivots(vault_dir, canvas_name=canvas)
+            print(f"  [Pivots] Updated {n} host note(s)"
+                  + ("" if args.no_canvas else " and the canvas"))
+        except Exception as exc:
+            logging.warning(f"Pivot refresh failed: {exc}")
+
     # ── Host notes: check for operator notes + investigation boxes ──
     host_files_changed = [
         f for f in changed_files
@@ -13258,6 +14769,15 @@ def _process_vault_changes(
         changed_names = [Path(f).stem for f in host_files_changed]
         print(f"  [Vault] Host notes changed: {', '.join(changed_names[:5])}"
               + (f" +{len(changed_names) - 5} more" if len(changed_names) > 5 else ""))
+
+        try:
+            creds_synced = _sync_host_creds_tables(vault_dir)
+            if creds_synced:
+                any_action = True
+                print(f"  [Creds] {creds_synced} credential(s) from host Creds tables "
+                      "→ Loot/Credentials.md")
+        except FileLockedError as exc:
+            logging.warning(f"Skipping host Creds sync — {exc}")
 
         # Count pending investigation checkboxes (don't auto-run — user runs /analyze)
         pending = 0
@@ -14428,6 +15948,16 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
     # Injestor — process operator drop zone first                          #
     # ------------------------------------------------------------------ #
     injestor_result = _process_injestor(vault_dir, args=args)
+
+    # Per-host ## Creds tables → Loot/Credentials.md. Before the loot
+    # pipeline, whose Credentials.md rebuild carries these rows forward.
+    try:
+        creds_synced = _sync_host_creds_tables(vault_dir)
+        if creds_synced:
+            print(f"  [+] {creds_synced} credential(s) from host Creds tables → Loot/Credentials.md")
+    except FileLockedError as exc:
+        logging.warning(f"Skipping host Creds sync — {exc}")
+
     if injestor_result:
         scan_host_map[injestor_result["scan_stem"]] = injestor_result["host_stems"]
         if injestor_result["new_hosts"]:
@@ -14464,7 +15994,18 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
             logging.info(f"Nmap → {xml_path.name} (unchanged, skipping)")
             continue
         logging.info(f"Nmap → {xml_path.name}")
-        scan_data = parse_nmap_xml(xml_path)
+        try:
+            scan_data = parse_nmap_xml(xml_path)
+        except Exception as exc:
+            # Interrupted scans (Ctrl+C, dropped VPN) and files copied mid-write
+            # leave truncated XML. One bad file must not abort the run before
+            # the canvas/targets/state writes at the end. Not marked analyzed,
+            # so it is retried once the file is complete.
+            logging.warning(
+                f"Skipping {xml_path.name}: could not parse Nmap XML ({exc}) "
+                "— the scan may be incomplete or still being written"
+            )
+            continue
 
         if not scan_data["hosts"]:
             logging.info(f"Skipping {xml_path.name}: no hosts with open ports")
@@ -14532,7 +16073,15 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
                 logging.info(f"Nessus → {nessus_path.name} (unchanged, skipping)")
                 continue
             logging.info(f"Nessus → {nessus_path.name}")
-            nessus_data = parse_nessus_xml(nessus_path)
+            try:
+                nessus_data = parse_nessus_xml(nessus_path)
+            except Exception as exc:
+                # Same as Nmap: a truncated/partial export must not abort the run.
+                logging.warning(
+                    f"Skipping {nessus_path.name}: could not parse Nessus XML ({exc}) "
+                    "— the export may be incomplete or still being written"
+                )
+                continue
 
             if not nessus_data["hosts"]:
                 logging.info(f"Skipping {nessus_path.name}: no hosts with actionable findings")
@@ -15100,6 +16649,13 @@ def _run_processing(args, base: Path, *, skip_llm: bool = False) -> None:
         )
         if dd_count:
             logging.info(f"Processed {dd_count} analysis result(s)")
+
+    # Host ## Pivots sections — after every writer, so hosts a scan just
+    # added inside a pivoted subnet show the pivot that reaches them.
+    try:
+        _refresh_pivots(vault_dir)
+    except Exception as exc:
+        logging.warning(f"Pivot refresh failed: {exc}")
 
     # ------------------------------------------------------------------ #
     # Canvas                                                               #

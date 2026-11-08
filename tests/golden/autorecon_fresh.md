@@ -12,6 +12,13 @@ autorecon_tools_run: 9
 **IP:** 10.10.10.5
 **Hostname:** dc01.corp.local
 
+## Creds
+_One row per credential for this host. Password takes a cleartext password or a hash. Synced to [[Loot/Credentials|Credentials]] on the next run (or Enter in interactive mode)._
+
+| Username | Password | Notes |
+|----------|----------|-------|
+|  |  |  |
+
 ## AutoRecon Enumeration
 **AutoRecon target:** 10.10.10.5 | **Tools run:** 9 | **With findings:** 1
 
